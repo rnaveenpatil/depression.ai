@@ -1,0 +1,195 @@
+"""
+Process Tool - Start, list, and manage long-running background processes.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import os
+import signal
+import time
+import uuid
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional
+
+from agent.tools.registry import BaseTool
+from agent.utils.logging import get_logger
+
+logger = get_logger(__name__)
+
+
+@dataclass
+class ManagedProcess:
+    id: str
+    command: str
+    pid: int
+    proc: asyncio.subprocess.Process
+    started_at: float = field(default_factory=time.time)
+    stdout: List[str] = field(default_factory=list)
+    stderr: List[str] = field(default_factory=list)
+    _pumps: List[asyncio.Task] = field(default_factory=list)
+
+
+class ProcessTool(BaseTool):
+    name = "process"
+    description = "Start, list, inspect, and stop background processes (dev servers, watchers, etc.)."
+    parameters = {
+        "type": "object",
+        "properties": {
+            "action": {
+                "type": "string",
+                "enum": ["start", "list", "status", "stop", "kill", "logs", "wait"],
+            },
+            "command": {"type": "string", "description": "For start"},
+            "cwd": {"type": "string"},
+            "process_id": {"type": "string"},
+            "lines": {"type": "integer", "default": 100},
+            "timeout": {"type": "number", "default": 30},
+        },
+        "required": ["action"],
+    }
+    timeout = 300.0
+
+    def __init__(self, workspace: Any = None):
+        self.workspace = workspace
+        self.cwd = str(workspace.get_project_dir()) if workspace else os.getcwd()
+        self.processes: Dict[str, ManagedProcess] = {}
+
+    async def execute(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        action = params.get("action", "")
+        if action == "start":
+            return await self._start(params)
+        if action == "list":
+            return self._list()
+        if action == "status":
+            return self._status(params)
+        if action in ("stop", "kill"):
+            return await self._stop(params, force=(action == "kill"))
+        if action == "logs":
+            return self._logs(params)
+        if action == "wait":
+            return await self._wait(params)
+        return {"success": False, "error": f"Unknown action: {action}"}
+
+    async def _start(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        command = params.get("command")
+        if not command:
+            return {"success": False, "error": "start requires 'command'"}
+
+        cwd = params.get("cwd") or self.cwd
+        proc = await asyncio.create_subprocess_shell(
+            command,
+            cwd=cwd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+
+        pid = str(uuid.uuid4())[:8]
+        mp = ManagedProcess(id=pid, command=command, pid=proc.pid or 0, proc=proc)
+        self.processes[pid] = mp
+
+        async def pump(stream, buf, tag):
+            try:
+                while True:
+                    line = await stream.readline()
+                    if not line:
+                        break
+                    text = line.decode(errors="replace").rstrip()
+                    buf.append(text)
+                    if len(buf) > 5000:
+                        del buf[:1000]
+            except asyncio.CancelledError:
+                pass
+            except Exception as e:
+                logger.debug(f"process pump {tag} error: {e}")
+
+        mp._pumps = [
+            asyncio.create_task(pump(proc.stdout, mp.stdout, "out")),
+            asyncio.create_task(pump(proc.stderr, mp.stderr, "err")),
+        ]
+
+        return {"success": True, "process_id": pid, "pid": proc.pid, "command": command}
+
+    def _list(self) -> Dict[str, Any]:
+        return {
+            "success": True,
+            "processes": [
+                {
+                    "id": mp.id,
+                    "pid": mp.pid,
+                    "command": mp.command,
+                    "running": mp.proc.returncode is None,
+                    "started_at": mp.started_at,
+                }
+                for mp in self.processes.values()
+            ],
+        }
+
+    def _status(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        pid = params.get("process_id")
+        mp = self.processes.get(pid)
+        if not mp:
+            return {"success": False, "error": f"Process {pid} not found"}
+        return {
+            "success": True,
+            "id": mp.id,
+            "pid": mp.pid,
+            "running": mp.proc.returncode is None,
+            "returncode": mp.proc.returncode,
+            "uptime": time.time() - mp.started_at,
+            "stdout_lines": len(mp.stdout),
+            "stderr_lines": len(mp.stderr),
+        }
+
+    async def _stop(self, params: Dict[str, Any], force: bool = False) -> Dict[str, Any]:
+        pid = params.get("process_id")
+        mp = self.processes.get(pid)
+        if not mp:
+            return {"success": False, "error": f"Process {pid} not found"}
+        if mp.proc.returncode is None:
+            try:
+                if force:
+                    mp.proc.kill()
+                else:
+                    mp.proc.terminate()
+            except ProcessLookupError:
+                pass
+            try:
+                await asyncio.wait_for(mp.proc.wait(), timeout=5)
+            except asyncio.TimeoutError:
+                mp.proc.kill()
+        for t in mp._pumps:
+            t.cancel()
+        return {"success": True, "id": pid, "killed": force}
+
+    def _logs(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        pid = params.get("process_id")
+        mp = self.processes.get(pid)
+        if not mp:
+            return {"success": False, "error": f"Process {pid} not found"}
+        n = int(params.get("lines", 100))
+        return {
+            "success": True,
+            "id": pid,
+            "stdout": "\n".join(mp.stdout[-n:]),
+            "stderr": "\n".join(mp.stderr[-n:]),
+        }
+
+    async def _wait(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        pid = params.get("process_id")
+        mp = self.processes.get(pid)
+        if not mp:
+            return {"success": False, "error": f"Process {pid} not found"}
+        timeout = float(params.get("timeout", 30))
+        try:
+            code = await asyncio.wait_for(mp.proc.wait(), timeout=timeout)
+            return {"success": True, "id": pid, "returncode": code}
+        except asyncio.TimeoutError:
+            return {"success": False, "error": "still running", "id": pid}
+
+    async def shutdown(self) -> None:
+        for mp in list(self.processes.values()):
+            try:
+                await self._stop({"process_id": mp.id}, force=True)
+            except Exception:
+                pass
