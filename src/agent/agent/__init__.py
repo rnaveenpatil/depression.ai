@@ -13,7 +13,15 @@ Exports:
 from agent.agent.agent import Agent, AgentStatus, AgentContext
 from agent.agent.planner import Planner, Plan, Task, TaskStatus, Priority
 from agent.agent.loop import AgentLoop, LoopState, LoopContext
-from agent.agent.subagent import SubAgentManager, SubAgent, SubAgentTask, SubAgentType, SubAgentStatus
+from agent.agent.subagent import SubAgentManager, SubAgent, SubAgentRole, SubAgentConfig, BUILTIN_SUBAGENTS
+
+# Backcompat aliases for legacy imports
+try:
+    from agent.agent.subagent import SubAgentTask, SubAgentType, SubAgentStatus
+except ImportError:
+    SubAgentTask = SubAgent  # type: ignore
+    SubAgentType = SubAgentRole  # type: ignore
+    SubAgentStatus = str  # type: ignore
 
 __all__ = [
     "Agent",
@@ -29,6 +37,9 @@ __all__ = [
     "LoopContext",
     "SubAgentManager",
     "SubAgent",
+    "SubAgentRole",
+    "SubAgentConfig",
+    "BUILTIN_SUBAGENTS",
     "SubAgentTask",
     "SubAgentType",
     "SubAgentStatus",

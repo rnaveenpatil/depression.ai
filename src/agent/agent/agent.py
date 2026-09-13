@@ -30,6 +30,7 @@ from agent.utils.errors import (
     handle_exception, format_error, is_retryable,
 )
 from agent.utils.platform import get_platform
+from agent.agent.subagent import SubAgentRole
 
 logger = get_logger(__name__)
 
@@ -149,6 +150,16 @@ class Agent:
             from agent.llm.provider import get_llm_registry
             self.llm = get_llm_registry()
 
+            # Apply API keys from config so registry providers use them
+            llm_cfg = self.config.get("llm", {}) or {}
+            keys = dict(llm_cfg.get("api_keys") or {})
+            if llm_cfg.get("api_key"):
+                target = llm_cfg.get("provider") or "groq"
+                keys.setdefault(target, llm_cfg["api_key"])
+            for provider_name, key in keys.items():
+                if key:
+                    self.llm.set_api_key(provider_name, key)
+
             # Resolve provider + model from config (may auto-select)
             cfg_obj = self._get_config_object()
             if cfg_obj and hasattr(cfg_obj, "resolve_llm"):
@@ -163,28 +174,45 @@ class Agent:
                     if first:
                         self.llm.set_model(first["id"])
 
-            # 2. Tools
+            # 2. Tools (includes opencode-compatible aliases)
             from agent.tools.registry import ToolRegistry
             from agent.tools import (
                 TerminalTool, FileSystemTool, SearchTool, GitTool,
                 ProcessTool, PatchTool, WebTool, BrowserTool, TaskTool,
                 MCPTool, DiagnosticsTool, TodoTool,
+                BashTool, ReadTool, WriteTool, EditTool, ApplyPatchTool,
+                GrepTool, GlobTool, WebFetchTool, WebSearchTool,
+                TodoWriteTool, TodoReadTool, SkillTool, QuestionTool, LspTool,
             )
             self.tool_registry = ToolRegistry(agent=self)
 
             tools_cfg = self.config.get("tools", {})
             tool_instances = [
                 TerminalTool(self.workspace, tools_cfg),
+                BashTool(self.workspace, tools_cfg),
                 FileSystemTool(self.workspace),
+                ReadTool(self.workspace),
+                WriteTool(self.workspace),
+                EditTool(self.workspace),
+                ApplyPatchTool(self.workspace),
                 SearchTool(self.workspace),
+                GrepTool(self.workspace),
+                GlobTool(self.workspace),
                 GitTool(self.workspace),
                 ProcessTool(self.workspace),
                 PatchTool(self.workspace),
                 WebTool(tools_cfg),
+                WebFetchTool(tools_cfg),
+                WebSearchTool(tools_cfg),
                 BrowserTool(tools_cfg.get("browser", {})),
                 TaskTool(self),
                 DiagnosticsTool(self.workspace),
                 TodoTool(self.session),
+                TodoWriteTool(self.session),
+                TodoReadTool(self.session),
+                SkillTool(self.workspace),
+                QuestionTool(self.input_handler),
+                LspTool(self.workspace, tools_cfg),
             ]
             if self.mcp_client is not None:
                 tool_instances.append(MCPTool(self.mcp_client))
@@ -215,6 +243,7 @@ class Agent:
                 llm=self.llm,
                 tool_registry=self.tool_registry,
                 config=self.config.get("planner", {}),
+                fallback_chain=getattr(self, '_fallback_chain', None),
             )
 
             # 5. Loop
@@ -227,11 +256,12 @@ class Agent:
                 config=self.config.get("loop", {}),
             )
 
-            # 6. Subagents
+            # 6. Subagents (OpenCode style)
             from agent.agent.subagent import SubAgentManager
             self.subagent_manager = SubAgentManager(
                 agent=self, config=self.config.get("subagent", {}),
             )
+            await self.subagent_manager.initialize()
 
             # 7. Plugins
             from agent.plugins.loader import get_plugin_loader
@@ -276,9 +306,15 @@ class Agent:
         query: str,
         context: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
-        """Process a user query through the full agentic pipeline."""
+        """Process a user query through the full agentic pipeline with subagent support."""
         if self.is_shutting_down:
             return {"success": False, "error": "Agent shutting down"}
+
+        # Check for @subagent invocations (OpenCode style)
+        if self.subagent_manager:
+            subagent_calls = self.subagent_manager.parse_subagent_invocation(query)
+            if subagent_calls:
+                return await self._handle_subagent_invocations(subagent_calls, context, query)
 
         async with self._thinking_lock:
             start = time.time()
@@ -327,6 +363,8 @@ class Agent:
                 # Update metrics
                 elapsed = time.time() - start
                 tokens = result.get("context", {}).get("tokens_used", 0)
+                input_tokens = result.get("context", {}).get("input_tokens", 0)
+                output_tokens = result.get("context", {}).get("output_tokens", 0)
                 self.context.tokens_used += tokens
                 self.metrics["total_tokens"] += tokens
                 self.context.tool_calls += result.get("tool_calls", 0)
@@ -366,6 +404,137 @@ class Agent:
                 self.context.errors.append(str(e))
                 logger.error(f"Query failed: {e}", exc_info=True)
                 return {"success": False, "error": format_error(e)}
+    
+    async def _handle_subagent_invocations(
+        self,
+        subagent_calls: List[tuple],
+        context: Optional[Dict[str, Any]],
+        original_query: str
+    ) -> Dict[str, Any]:
+        """Handle @subagent_name invocations in query"""
+        from agent.agent.subagent import SubAgentRole
+        
+        results = []
+        remaining_query = original_query
+        
+        for agent_name, sub_query in subagent_calls:
+            # Map agent name to role
+            role_map = {
+                "general": SubAgentRole.GENERAL,
+                "explore": SubAgentRole.EXPLORE,
+                "scout": SubAgentRole.SCOUT,
+            }
+            
+            role = role_map.get(agent_name.lower())
+            if not role:
+                results.append({
+                    "subagent": agent_name,
+                    "success": False,
+                    "error": f"Unknown subagent: {agent_name}. Available: {', '.join(role_map.keys())}"
+                })
+                continue
+            
+            # Remove this invocation from remaining query
+            remaining_query = remaining_query.replace(f"@{agent_name} {sub_query}", "").strip()
+            
+            # Invoke subagent
+            result = await self.subagent_manager.invoke_subagent(
+                role=role,
+                query=sub_query,
+                context=context,
+            )
+            results.append(result)
+        
+        # If there's remaining query after subagent invocations, process it normally
+        if remaining_query:
+            main_result = await self._process_main_query(remaining_query, context)
+            results.append({"main": main_result})
+        
+        # Combine results
+        combined_response = "\n\n".join([
+            f"--- @{r.get('subagent', 'main')} ---\n{r.get('result', r.get('error', str(r.get('main', {}))))}"
+            for r in results
+        ])
+        
+        return {
+            "success": all(r.get("success", True) for r in results),
+            "response": combined_response,
+            "subagent_results": results,
+            "iteration": 1,
+            "tool_calls": sum(r.get("tool_calls", 0) for r in results if isinstance(r, dict)),
+            "context": {"tokens_used": 0},
+        }
+    
+    async def _process_main_query(
+        self,
+        query: str,
+        context: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Process the main query after subagent invocations"""
+        async with self._thinking_lock:
+            start = time.time()
+            try:
+                self.status = AgentStatus.THINKING
+                self.context.turn_count += 1
+                self.context.last_active = time.time()
+                self.metrics["total_queries"] += 1
+                
+                if self.context_manager:
+                    await self.context_manager.add_user_message(query, context)
+                if self.session:
+                    self.session.add_user_message(query)
+                
+                if self.context_manager and await self.context_manager.needs_compaction():
+                    await self.context_manager.compact()
+                
+                live_context = {}
+                if self.context_manager:
+                    live_context = await self.context_manager.get_context()
+                
+                temperature = self._resolve_temperature(query)
+                
+                result = await self.loop.run(
+                    query=query,
+                    context=live_context,
+                    tool_outputs=(
+                        self.context_manager.get_recent_tool_outputs(5)
+                        if self.context_manager else []
+                    ),
+                    max_turns=self.max_turns,
+                )
+                
+                response_text = result.get("response", "")
+                if self.context_manager and response_text:
+                    await self.context_manager.add_assistant_message(response_text)
+                if self.session and response_text:
+                    self.session.add_assistant_message(response_text)
+                
+                elapsed = time.time() - start
+                tokens = result.get("context", {}).get("tokens_used", 0)
+                self.context.tokens_used += tokens
+                self.metrics["total_tokens"] += tokens
+                self.metrics["total_tool_calls"] += result.get("tool_calls", 0)
+                
+                n = self.metrics["total_queries"]
+                self.metrics["avg_response_time"] = (
+                    (self.metrics["avg_response_time"] * (n - 1) + elapsed) / n
+                )
+                
+                self.context.tasks_completed += 1 if result.get("success") else 0
+                self.status = AgentStatus.IDLE
+                
+                return {
+                    "success": result.get("success", True),
+                    "response": response_text,
+                    "iteration": result.get("iteration", 0),
+                    "tool_calls": result.get("tool_calls", 0),
+                    "duration": elapsed,
+                    "context": result.get("context", {}),
+                }
+                
+            except Exception as e:
+                logger.error(f"Main query failed: {e}", exc_info=True)
+                return {"success": False, "error": str(e)}
 
     # ------------------------------------------------------------------
     # TOOL EXECUTION (called by the loop)
@@ -384,12 +553,24 @@ class Agent:
         # Permission gate
         if require_permission and self.permission_manager:
             action = self._infer_action(tool_name, params)
-            allowed, reason = await self.permission_manager.check_permission(
-                tool_name=tool_name,
-                params=params,
-                context={"action": action},
-            )
+            logger.debug(f"Permission check: tool={tool_name}, action={action}, params={params}")
+            try:
+                allowed, reason = await self.permission_manager.check_permission(
+                    tool_name=tool_name,
+                    params=params,
+                    context={"action": action},
+                )
+                logger.debug(f"Permission result: allowed={allowed}, reason={reason}")
+            except PermissionDeniedError as e:
+                logger.warning(f"Permission denied for {tool_name}: {e}")
+                return {
+                    "success": False,
+                    "error": str(e),
+                    "permission_denied": True,
+                    "tool": tool_name,
+                }
             if not allowed:
+                logger.warning(f"Permission denied for {tool_name}: {reason}")
                 return {
                     "success": False,
                     "error": reason or "permission denied",
@@ -399,9 +580,12 @@ class Agent:
 
         # Execute
         try:
+            logger.debug(f"Executing tool: {tool_name} with params: {params}")
             result = await self.tool_registry.execute(tool_name, params)
+            logger.debug(f"Tool {tool_name} result: success={result.get('success', True)}, keys={list(result.keys())}")
         except Exception as e:
             wrapped = handle_exception(e, reraise=False)
+            logger.error(f"Tool {tool_name} execution failed: {e}", exc_info=True)
             return {
                 "success": False,
                 "error": format_error(wrapped),

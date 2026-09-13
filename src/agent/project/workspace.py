@@ -230,6 +230,10 @@ class WorkspaceManager:
         name = path.name
         rel = self.relative(path)
 
+        # .ignore negations take precedence: if matches negation → do not ignore
+        if self.respect_gitignore and self._is_negated(rel, name):
+            return False
+
         # Hard-coded ignore patterns
         for pattern in self.ignore_patterns:
             if self._fnmatch(name, pattern) or self._fnmatch(rel, pattern):
@@ -248,6 +252,7 @@ class WorkspaceManager:
             return self._gitignore_cache
 
         patterns: List[str] = []
+        negated: List[str] = []
         gi = self.project_dir / ".gitignore"
         if gi.exists():
             try:
@@ -258,8 +263,35 @@ class WorkspaceManager:
             except Exception as e:
                 logger.debug(f"Failed to read .gitignore: {e}")
 
+        # opencode .ignore override: lines starting with ! un-ignore
+        ignore_file = self.project_dir / ".ignore"
+        if ignore_file.exists():
+            try:
+                for line in ignore_file.read_text(encoding="utf-8").splitlines():
+                    line = line.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    if line.startswith("!"):
+                        neg = line[1:].strip().rstrip("/")
+                        negated.append(neg)
+                        # remove from patterns if present
+                        patterns = [p for p in patterns if p != neg and p != neg.lstrip("/") and p.lstrip("/") != neg]
+                    else:
+                        patterns.append(line.rstrip("/"))
+            except Exception as e:
+                logger.debug(f"Failed to read .ignore: {e}")
+
+        # store tuple as (patterns, negated) in cache attribute
+        self._gitignore_negated = negated  # type: ignore
         self._gitignore_cache = patterns
         return patterns
+
+    def _is_negated(self, rel: str, name: str) -> bool:
+        negated = getattr(self, "_gitignore_negated", [])
+        for pat in negated:
+            if self._fnmatch(name, pat) or self._fnmatch(rel, pat):
+                return True
+        return False
 
     @staticmethod
     def _fnmatch(name: str, pattern: str) -> bool:

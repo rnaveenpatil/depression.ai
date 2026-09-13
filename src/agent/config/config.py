@@ -456,6 +456,11 @@ class PermissionsConfig:
     blocked_paths: List[str] = field(default_factory=lambda: [
         "/etc/", "/sys/", "/proc/", "~/.ssh/", "~/.aws/"
     ])
+    # opencode-compatible: permission dict supports string "allow/ask/deny" or
+    # granular object {"*":"ask","git status*":"allow"} per tool. Keys:
+    # read, edit, glob, grep, bash, task, external_directory, todowrite,
+    # webfetch, websearch, lsp, skill, question, doom_loop
+    permission: Dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass

@@ -46,9 +46,26 @@ class TodoTool(BaseTool):
     }
     timeout = 10.0
 
+    # Shared store so todowrite/todoread/todo see same data per session
+    _shared_stores: Dict[Any, Dict[str, TodoItem]] = {}
+
+    @staticmethod
+    def _session_key(session: Any) -> Any:
+        if session is None:
+            return 0
+        # Prefer stable session.id if available (persists across reloads)
+        sid = getattr(session, "id", None)
+        if isinstance(sid, str) and sid:
+            return sid
+        return id(session)
+
     def __init__(self, session: Any = None):
         self.session = session
-        self.items: Dict[str, TodoItem] = {}
+        sid = self._session_key(session)
+        if sid not in self._shared_stores:
+            self._shared_stores[sid] = {}
+        # self.items is a reference to the shared dict for this session
+        self.items: Dict[str, TodoItem] = self._shared_stores[sid]
 
     async def execute(self, params: Dict[str, Any]) -> Dict[str, Any]:
         action = params.get("action", "")

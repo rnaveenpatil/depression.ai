@@ -63,7 +63,7 @@ from agent.context.manager import ContextManager
 from agent.permissions.manager import PermissionManager
 from agent.project.workspace import WorkspaceManager
 from agent.mcp.client import MCPClient
-from agent.agent.agent import Agent
+from agent.agent.dual_agent import create_dual_agent_system, AgentCoordinator
 
 
 logger = get_logger(__name__)
@@ -117,9 +117,9 @@ class CLIAgent:
         if self.ui:
             self.ui.print_warning(f"\nReceived signal {signum}, shutting down...")
         self.running = False
-        if self.agent:
+        if self.agent_coordinator:
             try:
-                asyncio.create_task(self.agent.shutdown())
+                asyncio.create_task(self.agent_coordinator.shutdown())
             except RuntimeError:
                 pass
 
@@ -189,7 +189,8 @@ Examples:
         parser.add_argument("--init-config", action="store_true", help="Write a default config and exit")
 
         # Limits
-        parser.add_argument("--max-turns", type=int, default=50, help="Max iterations per query")
+        parser.add_argument("--max-turns", type=int, default=50, help="Max iterations per query (agent loop)")
+        parser.add_argument("--max-iterations", type=int, default=3, help="Max plan-execute iterations (coordinator)")
         parser.add_argument("--timeout", type=int, default=300, help="Timeout in seconds")
 
         # Extras
@@ -327,12 +328,23 @@ Examples:
             self.ui.print_success(f"Session: {self.session.id[:8]}  ({self.session.name})")
 
         # 7. Permissions ----------------------------------------------
+        # Support both "permission" (opencode) and "permissions" (legacy)
         perm_cfg = dict(self.config_dict.get("permissions", {}) or {})
+        opencode_perm = self.config_dict.get("permission")
+        if isinstance(opencode_perm, dict):
+            # merge opencode permission map under `permission` key for RulesPolicy
+            perm_cfg["permission"] = {**perm_cfg.get("permission", {}), **opencode_perm}
+        elif isinstance(opencode_perm, str):
+            perm_cfg["permission"] = {"*": opencode_perm}
+        # opencode global permission string shorthand {"permission":"allow"}
         if args.no_permissions or args.yolo:
             perm_cfg["auto_approve"] = True
             perm_cfg["mode"] = "auto"
         if args.permission_mode:
             perm_cfg["mode"] = args.permission_mode
+        # pass workspace root for external_directory checks
+        perm_cfg.setdefault("cwd", str(self.workspace.get_project_dir()) if self.workspace else os.getcwd())
+        perm_cfg.setdefault("workspace_dir", str(self.workspace.get_project_dir()) if self.workspace else os.getcwd())
 
         self.permission_manager = PermissionManager(
             config=perm_cfg,
@@ -384,9 +396,9 @@ Examples:
 
         # 11. Agent ----------------------------------------------------
         if not args.quiet:
-            self.ui.print_status("Initializing agent…")
+            self.ui.print_status("Initializing dual agent system (Plan + Build)…")
 
-        self.agent = Agent(
+        self.agent_coordinator = await create_dual_agent_system(
             config=self.config_dict,
             session=self.session,
             context_manager=self.context_manager,
@@ -400,7 +412,8 @@ Examples:
             max_turns=args.max_turns,
             timeout=args.timeout,
         )
-        await self.agent.initialize()
+        # For backwards compatibility, expose plan_agent as self.agent
+        self.agent = self.agent_coordinator.plan_agent
 
         # 12. Command processor ---------------------------------------
         self.command_processor = CommandProcessor(
@@ -475,11 +488,16 @@ Examples:
         self.ui.print_user_message(query)
         spinner = None
         if not self.args.quiet:
-            spinner = self.ui.start_spinner("Thinking…")
+            spinner = self.ui.start_spinner("Processing…")
 
         try:
+            # Use auto mode for backward compatibility, but allow mode selection
             result = await asyncio.wait_for(
-                self.agent.process_query(query),
+                self.agent_coordinator.process_query(
+                    query, 
+                    mode="auto",  # Use automatic Plan -> Build loop for CLI
+                    max_iterations=self.args.max_iterations,
+                ),
                 timeout=self.args.timeout,
             )
         except asyncio.TimeoutError:
@@ -492,17 +510,20 @@ Examples:
             spinner.stop()
 
         if result.get("success"):
-            self.ui.print_agent_message(result.get("response", ""))
+            if result.get("plan"):
+                self.ui.print_info("📋 Plan created, executing...")
+            self.ui.print_agent_message(result.get("execution") or result.get("response", ""))
         else:
             self.ui.print_error(result.get("error", "unknown error"))
 
         # Update status
-        status = self.agent.get_status()
+        status = self.agent_coordinator.get_status()
+        current_mode = status.get("current_mode", "build")
         self.ui.set_status(
-            model=status.get("model") or "—",
-            tokens=status.get("tokens_used", 0),
-            cost=status.get("cost", 0.0),
-            session=(status.get("session_id") or "")[:8],
+            model=f"Mode: {current_mode} | Plan: {status['plan_agent']['model']} | Build: {status['build_agent']['model']}",
+            tokens=0,
+            cost=0.0,
+            session=(self.session.id if self.session else "")[:8],
         )
 
     async def _run_interactive(self) -> None:
@@ -513,10 +534,14 @@ Examples:
             model=status.get("model") or "—",
         )
         self.ui.print_shortcuts()
+        self.ui.print_info("Press Ctrl+P to switch between Plan/Build mode, or use /plan and /build commands")
 
         while self.running:
             try:
-                user_input = await self.input_handler.get_input(prompt="🧠 ")
+                # Show current mode in prompt
+                mode = self.agent_coordinator.current_mode
+                prompt = f"🧠 [{mode}] "
+                user_input = await self.input_handler.get_input(prompt=prompt)
             except EOFError:
                 self.ui.print_info("\n👋 Goodbye!")
                 break
@@ -529,6 +554,24 @@ Examples:
 
             text = user_input.strip()
             if not text:
+                continue
+
+            # Handle mode switching commands
+            if text == "/plan":
+                self.agent_coordinator.set_mode("plan")
+                self.ui.print_info("Switched to Plan mode (read-only analysis)")
+                self._refresh_status_bar()
+                continue
+            elif text == "/build":
+                self.agent_coordinator.set_mode("build")
+                self.ui.print_info("Switched to Build mode (full execution)")
+                self._refresh_status_bar()
+                continue
+            elif text == "/auto":
+                self.ui.print_info("Auto mode: Plan -> Build loop")
+                # In auto mode, we process with auto_execute=True
+                # The actual processing happens in _handle_query
+                self._refresh_status_bar()
                 continue
 
             # Slash command
@@ -553,12 +596,18 @@ Examples:
 
         spinner = None
         if not self.args.quiet:
-            spinner = self.ui.start_spinner("Thinking…")
+            mode = self.agent_coordinator.current_mode
+            spinner = self.ui.start_spinner(f"Processing ({mode})...")
 
         start = time.time()
         try:
+            # Use current mode for processing
             result = await asyncio.wait_for(
-                self.agent.process_query(text),
+                self.agent_coordinator.process_query(
+                    text, 
+                    mode=self.agent_coordinator.current_mode,
+                    auto_execute=True,  # Auto-execute plan if in plan mode
+                ),
                 timeout=self.args.timeout,
             )
         except asyncio.TimeoutError:
@@ -576,24 +625,26 @@ Examples:
             spinner.stop()
 
         if result.get("success"):
-            self.ui.print_agent_message(result.get("response", ""))
-            if self.args.verbose and result.get("tool_calls"):
+            if result.get("plan"):
+                self.ui.print_info("📋 Plan created, executing...")
+            self.ui.print_agent_message(result.get("execution") or result.get("response", ""))
+            if self.args.verbose:
+                iterations = result.get("iterations", 1)
                 self.ui.print_status(
-                    f"{result['tool_calls']} tool call(s) • "
-                    f"{time.time() - start:.2f}s"
+                    f"Plan + Execute ({iterations} iteration{'s' if iterations > 1 else ''}) • {time.time() - start:.2f}s"
                 )
         else:
             self.ui.print_error(result.get("error", "unknown error"))
 
     def _refresh_status_bar(self) -> None:
-        if not self.agent:
+        if not self.agent_coordinator:
             return
-        status = self.agent.get_status()
+        status = self.agent_coordinator.get_status()
         self.ui.set_status(
-            model=status.get("model") or "—",
-            tokens=status.get("tokens_used", 0),
-            cost=status.get("cost", 0.0),
-            session=(status.get("session_id") or "")[:8],
+            model=f"Plan: {status['plan_agent']['model']} | Build: {status['build_agent']['model']}",
+            tokens=0,
+            cost=0.0,
+            session=(self.session.id if self.session else "")[:8],
         )
 
     # ------------------------------------------------------------------
@@ -611,11 +662,11 @@ Examples:
             logger.debug(f"Session save failed during shutdown: {e}")
 
         # Agent shutdown (own tools, MCP, plugins)
-        if self.agent:
+        if self.agent_coordinator:
             try:
-                await self.agent.shutdown()
+                await self.agent_coordinator.shutdown()
             except Exception as e:
-                logger.debug(f"Agent shutdown failed: {e}")
+                logger.debug(f"Agent coordinator shutdown failed: {e}")
 
         # MCP
         if self.mcp_client:

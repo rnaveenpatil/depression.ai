@@ -18,6 +18,22 @@ from agent.tools.task import TaskTool
 from agent.tools.mcp import MCPTool
 from agent.tools.diagnostics import DiagnosticsTool
 from agent.tools.todo import TodoTool
+from agent.tools.compat import (
+    BashTool,
+    ReadTool,
+    WriteTool,
+    EditTool,
+    ApplyPatchTool,
+    GrepTool,
+    GlobTool,
+    WebFetchTool,
+    WebSearchTool,
+    TodoWriteTool,
+    TodoReadTool,
+    SkillTool,
+    QuestionTool,
+    LspTool,
+)
 
 
 __all__ = [
@@ -35,4 +51,18 @@ __all__ = [
     "MCPTool",
     "DiagnosticsTool",
     "TodoTool",
+    "BashTool",
+    "ReadTool",
+    "WriteTool",
+    "EditTool",
+    "ApplyPatchTool",
+    "GrepTool",
+    "GlobTool",
+    "WebFetchTool",
+    "WebSearchTool",
+    "TodoWriteTool",
+    "TodoReadTool",
+    "SkillTool",
+    "QuestionTool",
+    "LspTool",
 ]
