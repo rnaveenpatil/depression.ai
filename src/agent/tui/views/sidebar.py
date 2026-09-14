@@ -1,4 +1,9 @@
-"""Compact right-side workspace rail for Depression.AI."""
+"""Optional contextual workspace rail for Depression.AI.
+
+The transcript is the primary interface. The rail stays hidden until the user
+explicitly asks for it with F2, so the application behaves like a terminal
+agent rather than a dashboard.
+"""
 from __future__ import annotations
 from typing import Callable, Dict, List, Optional
 from textual.app import ComposeResult
@@ -23,7 +28,7 @@ class SessionItem(ListItem):
             self.add_class("active")
 
     def compose(self) -> ComposeResult:
-        yield Label(f"{self.session_name}", classes="session-name")
+        yield Label(self.session_name, classes="session-name")
         yield Label("●", classes="session-state")
 
 
@@ -34,7 +39,6 @@ class ToolItem(ListItem):
     .tool-name { width: 1fr; color: $text; }
     .tool-status { width: 2; color: $success; }
     """
-
     def __init__(self, name: str, enabled: bool = True, **kwargs):
         super().__init__(**kwargs)
         self.tool_name, self.tool_enabled = name, enabled
@@ -45,7 +49,7 @@ class ToolItem(ListItem):
 
 
 class Sidebar(Widget):
-    """A narrow terminal rail. It is intentionally not a web-app dashboard."""
+    """Optional rail shown only when explicitly requested (F2)."""
     DEFAULT_CSS = """
     Sidebar { width: 34; min-width: 30; background: $panel; border-left: solid $border; layout: vertical; }
     #rail-title { height: 3; padding: 1 1 0 1; color: $text; text-style: bold; border-bottom: solid $border; }
@@ -85,6 +89,15 @@ class Sidebar(Widget):
         self._populate_sessions()
         self._populate_tools()
         self._populate_files()
+        # The app currently initializes the legacy rail as visible. Hide it on
+        # the first refresh; F2 can then explicitly reveal it.
+        self.call_after_refresh(self._hide_initial_rail)
+
+    def _hide_initial_rail(self) -> None:
+        try:
+            self.display = False
+        except Exception:
+            pass
 
     @on(Button.Pressed, ".rail-tab")
     def _on_tab(self, event: Button.Pressed) -> None:
@@ -98,7 +111,6 @@ class Sidebar(Widget):
             self.query_one(f"#tab-{tab}", Button).add_class("active")
         except Exception:
             pass
-
         content = self.query_one("#sidebar-content")
         for child in content.children:
             child.display = False
@@ -112,9 +124,7 @@ class Sidebar(Widget):
     def _init_llm_panel(self) -> None:
         try:
             container = self.query_one("#sidebar-llm")
-            self._llm_panel = LLMProviderPanel(
-                id="llm-panel", on_connect=self._on_llm_connect
-            )
+            self._llm_panel = LLMProviderPanel(id="llm-panel", on_connect=self._on_llm_connect)
             container.mount(self._llm_panel)
         except Exception:
             pass
@@ -124,14 +134,7 @@ class Sidebar(Widget):
             view = self.query_one("#sidebar-sessions", ListView)
             view.clear()
             for s in self.sessions:
-                view.append(
-                    SessionItem(
-                        s.get("id", ""),
-                        s.get("name", "Unnamed"),
-                        s.get("time", ""),
-                        s.get("active", False),
-                    )
-                )
+                view.append(SessionItem(s.get("id", ""), s.get("name", "Unnamed"), s.get("time", ""), s.get("active", False)))
         except Exception:
             pass
 
