@@ -193,6 +193,9 @@ Examples:
         parser.add_argument("--max-iterations", type=int, default=3, help="Max plan-execute iterations (coordinator)")
         parser.add_argument("--timeout", type=int, default=300, help="Timeout in seconds")
 
+        # TUI options
+        parser.add_argument("--no-sidebar", action="store_true", help="Hide sidebar in TUI")
+
         # Extras
         parser.add_argument("--plugins", nargs="*", help="Plugin names to load")
         parser.add_argument("--no-mcp", action="store_true", help="Disable MCP")
@@ -363,7 +366,7 @@ Examples:
         ctx_cfg = self.config_dict.get("context", {}) or {}
         # Pass LLM registry through so the compactor can summarize
         from agent.llm.provider import get_llm_registry
-        llm_registry = get_llm_registry(config=self.config_dict)
+        llm_registry = get_llm_registry()
 
         self.context_manager = ContextManager(
             workspace=self.workspace,
@@ -716,52 +719,56 @@ Examples:
         )
 
 
+
+# ======================================================================
+# TUI LAUNCHER
+# ======================================================================
+
+def _launch_tui() -> int:
+    """Launch the futuristic TUI interface."""
+    try:
+        from agent.tui.app import DepressionTUI
+    except ImportError as e:
+        print(
+            f"❌ TUI requires 'textual' package. Install with:\n"
+            f"   pip install 'depression[tui]'\n"
+            f"   or: pip install textual\n"
+            f"\nError: {e}",
+            file=sys.stderr,
+        )
+        return 1
+
+    # Parse CLI args for TUI
+    from agent.main import CLIAgent
+    app_cli = CLIAgent()
+    args = app_cli.parse_arguments()
+
+    # Build TUI kwargs from CLI args
+    tui_kwargs = {}
+    if hasattr(args, "project") and args.project:
+        tui_kwargs["project_dir"] = args.project
+    if hasattr(args, "model") and args.model:
+        tui_kwargs["model_override"] = args.model
+    if hasattr(args, "provider") and args.provider:
+        tui_kwargs["provider_override"] = args.provider
+    if hasattr(args, "yolo") and args.yolo:
+        tui_kwargs["yolo"] = True
+    if hasattr(args, "no_sidebar") and args.no_sidebar:
+        tui_kwargs["no_sidebar"] = True
+
+    # Run the TUI directly in-process
+    app = DepressionTUI(**tui_kwargs)
+    app.run()
+    return 0
+
+
 # ======================================================================
 # MAIN
 # ======================================================================
 
 def main() -> int:
-    """Entry point."""
-    app = CLIAgent()
-
-    try:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-
-        args = app.parse_arguments()
-
-        loop.run_until_complete(app.initialize(args))
-        loop.run_until_complete(app.run())
-        loop.run_until_complete(app.shutdown())
-
-    except KeyboardInterrupt:
-        print("\n👋 Interrupted.")
-        return 130
-    except ConfigError as e:
-        print(f"❌ Config error: {e}", file=sys.stderr)
-        return 2
-    except AgentError as e:
-        print(f"❌ {format_error(e)}", file=sys.stderr)
-        return 1
-    except Exception as e:
-        print(f"❌ Fatal error: {format_error(e)}", file=sys.stderr)
-        if app.args and getattr(app.args, "verbose", 0) >= 1:
-            import traceback
-            traceback.print_exc()
-        return 1
-    finally:
-        try:
-            loop = asyncio.get_event_loop()
-            pending = asyncio.all_tasks(loop)
-            for task in pending:
-                task.cancel()
-            if pending:
-                loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
-            loop.close()
-        except Exception:
-            pass
-
-    return 0
+    """Entry point - launches the TUI by default."""
+    return _launch_tui()
 
 
 if __name__ == "__main__":
