@@ -158,7 +158,11 @@ class ToolRegistry:
 
         tool = self.tools.get(name)
         if not tool:
-            raise ToolNotFoundError(f"Tool not found: {name}")
+            # Suggest closest match for UX (opencode does)
+            from difflib import get_close_matches
+            suggestion = get_close_matches(name, list(self.tools.keys()), n=1)
+            hint = f" Did you mean '{suggestion[0]}'?" if suggestion else ""
+            raise ToolNotFoundError(f"Tool not found: {name}.{hint} Available: {', '.join(sorted(self.tools.keys()))}")
 
         if not getattr(tool, "enabled", True):
             return {"success": False, "error": f"Tool '{name}' is disabled"}
@@ -180,14 +184,16 @@ class ToolRegistry:
                 stats.failures += 1
                 stats.last_error = str(result.get("error", ""))
             stats.total_time += time.time() - t0
-
+            # Normalize result shape (opencode always returns success flag)
+            if "success" not in result:
+                result["success"] = True
             return result
 
         except asyncio.TimeoutError:
             self.stats[name].calls += 1
             self.stats[name].failures += 1
             self.stats[name].last_error = "timeout"
-            return {"success": False, "error": f"Tool '{name}' timed out"}
+            return {"success": False, "error": f"Tool '{name}' timed out after {timeout or getattr(tool,'timeout',60.0)}s"}
 
         except Exception as e:
             self.stats[name].calls += 1
@@ -195,6 +201,26 @@ class ToolRegistry:
             self.stats[name].last_error = str(e)
             logger.error(f"Tool '{name}' failed: {e}", exc_info=True)
             return {"success": False, "error": str(e)}
+
+    async def execute_parallel(
+        self,
+        calls: List[Dict[str, Any]],
+        timeout: Optional[float] = None,
+    ) -> List[Dict[str, Any]]:
+        """Execute multiple tool calls concurrently — up to 5 at a time (OpenCode style)."""
+        semaphore = asyncio.Semaphore(5)
+
+        async def _run(c: Dict[str, Any]) -> Dict[str, Any]:
+            async with semaphore:
+                name = c.get("name") or c.get("tool")
+                params = c.get("params") or c.get("arguments") or {}
+                try:
+                    res = await self.execute(name, params, timeout=timeout)
+                    return {"tool": name, **res}
+                except Exception as e:
+                    return {"tool": name, "success": False, "error": str(e)}
+
+        return await asyncio.gather(*[_run(c) for c in calls])
 
     async def _execute_external(
         self, name: str, params: Dict[str, Any], timeout: Optional[float]

@@ -86,12 +86,13 @@ class WorkspaceManager:
         self.scan_depth: int = cfg.get("scan_depth", 5)
         self.max_file_size: int = cfg.get("max_file_size", 1024 * 1024)
 
-        # Ignore patterns
+        # Ignore patterns — include noisy demo dirs for efficiency (opencode watcher ignore style)
         self.ignore_patterns: List[str] = list(cfg.get("ignore_patterns", [
             ".git", "node_modules", "__pycache__", "*.pyc",
             ".venv", "venv", "env", "dist", "build", ".next",
             ".DS_Store", "*.log", "*.tmp", ".cache", ".idea",
             ".vscode", "target", "coverage", ".pytest_cache",
+            "kiddo_app", "kids_app", "m", ".dart_tool", ".agent",
         ]))
         self.respect_gitignore: bool = cfg.get("respect_gitignore", True)
 
@@ -483,3 +484,40 @@ class WorkspaceManager:
         """Full scan: refresh metadata and return info dict."""
         await self.scan_metadata()
         return await self.get_info()
+
+    # ------------------------------------------------------------------
+    # SNAPSHOT / UNDO (OpenCode-style)
+    # ------------------------------------------------------------------
+
+    async def create_snapshot(self, message: str = "auto") -> Dict[str, Any]:
+        """Create a snapshot using git stash (efficient, matches OpenCode snapshot)."""
+        if not (self.project_dir / ".git").exists():
+            return {"success": False, "error": "not a git repo, snapshot requires git"}
+        import asyncio
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "git", "stash", "push", "-m", f"opencode-snapshot:{message}",
+                "--keep-index", "--include-untracked",
+                cwd=str(self.project_dir),
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=10)
+            return {"success": proc.returncode == 0, "message": message, "stdout": stdout.decode(errors="replace")}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    async def undo_snapshot(self) -> Dict[str, Any]:
+        """Undo last snapshot (git stash pop)."""
+        if not (self.project_dir / ".git").exists():
+            return {"success": False, "error": "not a git repo"}
+        import asyncio
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "git", "stash", "pop",
+                cwd=str(self.project_dir),
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=10)
+            return {"success": proc.returncode == 0, "stdout": stdout.decode(errors="replace"), "stderr": stderr.decode(errors="replace")}
+        except Exception as e:
+            return {"success": False, "error": str(e)}

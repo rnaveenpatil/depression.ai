@@ -1,0 +1,11 @@
+{
+  "llm": {
+    "api_keys": {
+      "nvidia": "",
+      "google": ""
+    },
+    "provider": "google",
+    "model": "google/gemini-2.5-flash-lite",
+    "auto_select_model": false
+  }
+}

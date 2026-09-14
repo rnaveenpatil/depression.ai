@@ -68,7 +68,7 @@ from agent.agent.dual_agent import create_dual_agent_system, AgentCoordinator
 
 logger = get_logger(__name__)
 
-APP_NAME = "cli-agent"
+APP_NAME = "depression"
 APP_VERSION = "1.0.0"
 
 
@@ -134,16 +134,16 @@ class CLIAgent:
             formatter_class=argparse.RawDescriptionHelpFormatter,
             epilog="""
 Examples:
-  cli-agent                          Start interactive mode
-  cli-agent "fix the login bug"      Run a single query
-  cli-agent -p /path/to/project      Use a specific project
-  cli-agent --model gpt-4o           Override the model
-  cli-agent --provider groq          Use a specific provider
-  cli-agent --yolo                   Auto-approve everything (careful!)
-  cli-agent --session <id>           Resume a session
-  cli-agent --new-session            Force a fresh session
-  cli-agent --verbose                Increase verbosity
-  cli-agent --init-config            Write a default config file
+  depression                          Start interactive mode
+  depression "fix the login bug"      Run a single query
+  depression -p /path/to/project      Use a specific project
+  depression --model gpt-4o           Override the model
+  depression --provider groq          Use a specific provider
+  depression --yolo                   Auto-approve everything (careful!)
+  depression --session <id>           Resume a session
+  depression --new-session            Force a fresh session
+  depression --verbose                Increase verbosity
+  depression --init-config            Write a default config file
 """,
         )
 
@@ -363,7 +363,7 @@ Examples:
         ctx_cfg = self.config_dict.get("context", {}) or {}
         # Pass LLM registry through so the compactor can summarize
         from agent.llm.provider import get_llm_registry
-        llm_registry = get_llm_registry()
+        llm_registry = get_llm_registry(config=self.config_dict)
 
         self.context_manager = ContextManager(
             workspace=self.workspace,
@@ -433,7 +433,26 @@ Examples:
             except Exception as e:
                 self.ui.print_warning(f"Plugin load failed: {e}")
 
-        # 14. Update status bar ---------------------------------------
+        # 14. Wire live output rendering (OpenCode: stream + tool live + permission cards + status)
+        for agent in (self.agent_coordinator.plan_agent, self.agent_coordinator.build_agent):
+            if hasattr(agent, 'loop') and agent.loop:
+                # Live tool render — matches opencode tool call live view
+                async def _on_tool(data, _ui=self.ui):
+                    try:
+                        _ui.print_tool_call(
+                            tool_name=data.get('tool', 'tool'),
+                            params=data.get('params'),
+                            result=data.get('result'),
+                            success=data.get('result', {}).get('success', True) if isinstance(data.get('result'), dict) else True,
+                            duration=data.get('execution_time')
+                        )
+                        # Update status bar per tool call (tokens/cost live)
+                        st = agent.get_status()
+                        _ui.set_status(model=st.get('model') or '—', tokens=st.get('tokens_used', 0), cost=st.get('cost', 0.0), session=st.get('session_id','')[:8])
+                    except Exception:
+                        pass
+                agent.loop.add_event_handler('on_tool_executed', _on_tool)
+                # Permission risk rendering is handled via PermissionManager._render_prompt -> UI box
         status = self.agent.get_status()
         self.ui.set_status(
             model=status.get("model") or "—",
@@ -482,7 +501,7 @@ Examples:
             await self._run_interactive()
         else:
             # Non-interactive with no query → nothing to do
-            self.ui.print_info("No query provided. Use `cli-agent --help`.")
+            self.ui.print_info("No query provided. Use `depression --help`.")
 
     async def _run_single_query(self, query: str) -> None:
         self.ui.print_user_message(query)
@@ -494,11 +513,12 @@ Examples:
             # Use auto mode for backward compatibility, but allow mode selection
             result = await asyncio.wait_for(
                 self.agent_coordinator.process_query(
-                    query, 
-                    mode="auto",  # Use automatic Plan -> Build loop for CLI
+                    query,
+                    mode="auto",
+                    auto_execute=True,  # Execute plan automatically in auto mode
                     max_iterations=self.args.max_iterations,
                 ),
-                timeout=self.args.timeout,
+                timeout=120,  # Reduced timeout: 2 minutes instead of 5
             )
         except asyncio.TimeoutError:
             if spinner:

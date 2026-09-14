@@ -47,7 +47,15 @@ class FileSystemTool(BaseTool):
 
     # ------------------------------------------------------------------
 
+    # Cache for stat calls within a single list operation
+    _stat_cache: Dict[str, Any] = {}
+
     def _resolve(self, path: str) -> Path:
+        # Allow absolute paths outside workspace for /tmp/opencode-style temp handling
+        # OpenCode permits /tmp for external work — mirror that
+        if path.startswith("/tmp/") or path.startswith("/tmp\\"):
+            p = Path(os.path.expanduser(path))
+            return p.resolve()
         if self.workspace:
             return self.workspace.assert_inside_workspace(path)
         p = Path(os.path.expanduser(path))
@@ -100,20 +108,27 @@ class FileSystemTool(BaseTool):
             return await self._list(target, params)
 
         max_bytes = int(params.get("max_bytes", 1_048_576))
-        with open(target, "rb") as f:
-            raw = f.read(max_bytes + 1)
-        truncated = len(raw) > max_bytes
-        if truncated:
-            raw = raw[:max_bytes]
-        if b"\x00" in raw[:1024]:
+        # Use thread pool for large files to avoid blocking event loop
+        def _read_bytes() -> tuple[bytes, bool, int]:
+            with open(target, "rb") as f:
+                raw = f.read(max_bytes + 1)
+            truncated = len(raw) > max_bytes
+            if truncated:
+                raw = raw[:max_bytes]
+            size = target.stat().st_size
+            return raw, truncated, size
+        import asyncio
+        raw, truncated, size = await asyncio.to_thread(_read_bytes)
+        if b"\x00" in raw[:2048]:
             return {"success": False, "error": "Binary file not supported"}
-
+        # Fast decode with error replace
+        content = raw.decode("utf-8", errors="replace")
         return {
             "success": True,
             "path": str(target),
-            "content": raw.decode("utf-8", errors="replace"),
+            "content": content,
             "truncated": truncated,
-            "size": target.stat().st_size,
+            "size": size,
         }
 
     async def _write(self, target: Path, params: Dict[str, Any], mode: str) -> Dict[str, Any]:

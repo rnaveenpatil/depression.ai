@@ -27,7 +27,7 @@ import sys
 import threading
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple, Callable
+from typing import Any, Dict, List, Optional, Tuple, Callable, Union
 
 from agent.utils.logging import get_logger
 from agent.utils.errors import ConfigError
@@ -37,16 +37,28 @@ logger = get_logger(__name__)
 
 
 # ======================================================================
-# CONSTANTS
+# CONSTANTS — OpenCode compatible
 # ======================================================================
 
 ENV_PREFIX = "AGENT_"
 USER_CONFIG_PATH = Path.home() / ".agent" / "config.json"
 USER_CONFIG_DIR = Path.home() / ".agent"
+# OpenCode primary locations
+OPENCODE_USER_CONFIG = Path.home() / ".config" / "opencode" / "opencode.json"
+OPENCODE_USER_CONFIGC = Path.home() / ".config" / "opencode" / "opencode.jsonc"
 PROJECT_CONFIG_NAME = ".agent/config.json"
 DEFAULT_CONFIG_NAME = "config.json"
 
-SUPPORTED_FORMATS = (".json", ".yaml", ".yml", ".toml")
+# OpenCode file precedence (later overrides earlier):
+# 1 remote (.well-known/opencode) — skip (handled externally)
+# 2 global (~/.config/opencode/opencode.json + ~/.agent/config.json)
+# 3 custom (OPENCODE_CONFIG)
+# 4 project (opencode.json + .agent/config.json)
+# 5 .opencode dirs — agents/commands/plugins
+# 6 inline (OPENCODE_CONFIG_CONTENT)
+# 7 managed (/etc/opencode) — handled if present
+
+SUPPORTED_FORMATS = (".json", ".jsonc", ".yaml", ".yml", ".toml")
 
 
 # ======================================================================
@@ -60,10 +72,13 @@ _ENV_PATTERN = re.compile(
 
 def interpolate_env(value: Any) -> Any:
     """
-    Recursively interpolate ${VAR} and ${VAR:-default} in strings.
-    Also supports $VAR (bare form) for simple cases.
+    Recursively interpolate env/file vars:
+      ${VAR} / ${VAR:-default}  (docker-compose style)
+      {env:VAR}                (OpenCode style)
+      {file:path}              (OpenCode style — file contents)
     """
     if isinstance(value, str):
+        # 1. ${VAR} style
         def repl(match: re.Match) -> str:
             var = match.group(1)
             default = match.group(2)
@@ -74,7 +89,27 @@ def interpolate_env(value: Any) -> Any:
                 return default
             logger.warning(f"Unresolved env var in config: ${{{var}}}")
             return match.group(0)
-        return _ENV_PATTERN.sub(repl, value)
+        value = _ENV_PATTERN.sub(repl, value)
+        # 2. {env:VAR} OpenCode style
+        def repl_env(m: re.Match) -> str:
+            var = m.group(1)
+            return os.environ.get(var, "")
+        value = re.sub(r"\{env:([A-Za-z_][A-Za-z0-9_]*)\}", repl_env, value)
+        # 3. {file:path} OpenCode style
+        def repl_file(m: re.Match) -> str:
+            fpath = m.group(1).strip()
+            try:
+                p = Path(os.path.expanduser(fpath))
+                if not p.is_absolute():
+                    # relative to cwd (or project dir if known)
+                    p = Path.cwd() / p
+                if p.exists():
+                    return p.read_text(encoding="utf-8", errors="replace").strip()
+            except Exception as e:
+                logger.debug(f"{{file:{fpath}}} read failed: {e}")
+            return ""
+        value = re.sub(r"\{file:([^}]+)\}", repl_file, value)
+        return value
     if isinstance(value, dict):
         return {k: interpolate_env(v) for k, v in value.items()}
     if isinstance(value, list):
@@ -86,9 +121,58 @@ def interpolate_env(value: Any) -> Any:
 # FILE LOADING
 # ======================================================================
 
+def _strip_jsonc_comments(text: str) -> str:
+    """Strip // and /* */ comments for JSONC compatibility — handles inline // outside strings."""
+    # Remove /* block comments */
+    text = re.sub(r"/\*.*?\*/", "", text, flags=re.DOTALL)
+    # Remove trailing commas before } or ]
+    text = re.sub(r",\s*([}\]])", r"\1", text)
+    # Remove // line comments (inline) — naive but handles most configs: ignore // inside URLs (http://)
+    out_lines = []
+    for line in text.splitlines():
+        # If line contains //, check if before // there's an odd number of quotes (inside string) -> keep
+        # Simple: if // appears inside a quoted string, preserve
+        idx = line.find("//")
+        while idx != -1:
+            # Check if // is inside string: count unescaped quotes before it
+            before = line[:idx]
+            # Count quotes not escaped
+            dq = before.count('"') - before.count('\\"')
+            # If even number, // is outside string → treat as comment
+            if dq % 2 == 0:
+                # But ignore http:// and https://
+                if idx > 0 and line[idx-1] == ":":
+                    # find next // after this
+                    nxt = line.find("//", idx+2)
+                    if nxt == -1:
+                        break
+                    idx = nxt
+                    continue
+                line = line[:idx]
+                break
+            else:
+                nxt = line.find("//", idx+2)
+                if nxt == -1:
+                    break
+                idx = nxt
+        out_lines.append(line)
+    return "\n".join(out_lines)
+
 def _load_json(path: Path) -> Dict[str, Any]:
     with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
+        raw = f.read()
+    # Handle JSONC
+    if path.suffix.lower() == ".jsonc":
+        raw = _strip_jsonc_comments(raw)
+        if not raw.strip():
+            return {}
+        return json.loads(raw)
+    # Also tolerate JSONC in .json (comments) — resilient
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        cleaned = _strip_jsonc_comments(raw)
+        return json.loads(cleaned)
 
 
 def _load_yaml(path: Path) -> Dict[str, Any]:
@@ -119,22 +203,78 @@ def _load_toml(path: Path) -> Dict[str, Any]:
 
 
 def load_file(path: Path) -> Dict[str, Any]:
-    """Load a config file based on its extension"""
+    """Load a config file based on its extension — handles JSONC via stripping."""
     if not path.exists():
         return {}
     suffix = path.suffix.lower()
     try:
-        if suffix == ".json":
-            return _load_json(path)
+        if suffix in (".json", ".jsonc"):
+            data = _load_json(path)
+            # Strip $schema keys (OpenCode style) — not part of our schema
+            if isinstance(data, dict) and "$schema" in data:
+                data = {k: v for k, v in data.items() if k != "$schema"}
+            # Map OpenCode top-level keys to internal schema
+            data = _normalize_opencode_config(data)
+            return data if isinstance(data, dict) else {}
         elif suffix in (".yaml", ".yml"):
             return _load_yaml(path)
         elif suffix == ".toml":
             return _load_toml(path)
         else:
-            # Try JSON as fallback
             return _load_json(path)
     except Exception as e:
         raise ConfigError(f"Failed to load config from {path}: {e}")
+
+
+def _normalize_opencode_config(data: Dict[str, Any]) -> Dict[str, Any]:
+    """Translate OpenCode opencode.json keys into depression internal schema."""
+    if not isinstance(data, dict):
+        return data
+    out = dict(data)
+    # model -> llm.model / llm.provider split
+    if "model" in out and isinstance(out["model"], str):
+        model_str = out["model"]
+        out.setdefault("llm", {})
+        if isinstance(out["llm"], dict):
+            out["llm"].setdefault("model", model_str)
+            if "/" in model_str and "provider" not in out["llm"]:
+                out["llm"]["provider"] = model_str.split("/")[0]
+    if "small_model" in out:
+        out.setdefault("llm", {})
+        if isinstance(out["llm"], dict):
+            out["llm"]["small_model"] = out.pop("small_model")
+    # permission (opencode) -> permissions.permission
+    if "permission" in out and isinstance(out["permission"], dict):
+        out.setdefault("permissions", {})
+        if isinstance(out["permissions"], dict):
+            out["permissions"].setdefault("permission", out["permission"])
+    # instructions -> context.instructions
+    if "instructions" in out:
+        out.setdefault("context", {})
+        if isinstance(out["context"], dict):
+            out["context"]["instructions"] = out["instructions"]
+    # watcher -> workspace.watcher
+    if "watcher" in out:
+        out.setdefault("workspace", {})
+        if isinstance(out["workspace"], dict):
+            out["workspace"]["watcher"] = out["watcher"]
+    # formatter -> tools.formatter
+    if "formatter" in out:
+        out.setdefault("tools", {})
+        if isinstance(out["tools"], dict):
+            out["tools"]["formatter"] = out["formatter"]
+    # lsp -> tools.lsp
+    if "lsp" in out:
+        out.setdefault("tools", {})
+        if isinstance(out["tools"], dict):
+            out["tools"]["lsp"] = out["lsp"]
+    # mcp -> mcp (already compatible)
+    # provider -> llm.provider_options
+    if "provider" in out and isinstance(out["provider"], dict):
+        out.setdefault("llm", {})
+        if isinstance(out["llm"], dict):
+            out["llm"].setdefault("provider_options", out["provider"])
+    return out
 
 
 # ======================================================================
@@ -257,48 +397,72 @@ class ConfigLoader:
         validate: bool = True,
     ) -> Config:
         """
-        Load configuration from all sources.
+        Load configuration from all sources — OpenCode precedence:
 
-        Args:
-            config_path: Optional explicit config file path (highest priority).
-            extra: Optional dict of overrides (e.g., CLI args).
-            init_if_missing: Create a default config file if none exists.
-            validate: Validate the final config.
-
-        Returns:
-            A fully-merged Config object.
+        1. Package defaults
+        2. Global: ~/.config/opencode/opencode.json(c) + ~/.agent/config.json
+        3. Custom: OPENCODE_CONFIG env var
+        4. Project: ./opencode.json(c) + ./.agent/config.json (ancestors walk)
+        5. Inline: OPENCODE_CONFIG_CONTENT
+        6. Managed: /etc/opencode/opencode.json (if present)
+        7. Env vars: AGENT_* / OPENCODE_*
+        8. Extra (CLI overrides) — highest
         """
         self._sources = []
-
-        # Start with defaults
         merged: Dict[str, Any] = {}
-
-        # 1. Package defaults (from config.py dataclass defaults)
         default_config = Config()
         merged = deep_merge(merged, default_config.to_dict(include_secrets=True))
 
-        # 2. User config (~/.agent/config.json)
-        if USER_CONFIG_PATH.exists():
-            try:
-                user_data = load_file(USER_CONFIG_PATH)
-                merged = deep_merge(merged, user_data)
-                self._sources.append(("user", USER_CONFIG_PATH))
-                logger.debug(f"Loaded user config: {USER_CONFIG_PATH}")
-            except Exception as e:
-                logger.warning(f"Failed to load user config: {e}")
+        # 2. Global configs
+        for gpath, label in [
+            (OPENCODE_USER_CONFIG, "global-opencode"),
+            (OPENCODE_USER_CONFIGC, "global-opencode-jsonc"),
+            (USER_CONFIG_PATH, "global-agent"),
+            (USER_CONFIG_DIR / "opencode.json", "global-agent-opencode"),
+            (USER_CONFIG_DIR / "opencode.jsonc", "global-agent-opencode-jsonc"),
+        ]:
+            if gpath.exists():
+                try:
+                    gdata = load_file(gpath)
+                    merged = deep_merge(merged, gdata)
+                    self._sources.append((label, gpath))
+                    logger.debug(f"Loaded {label}: {gpath}")
+                except Exception as e:
+                    logger.warning(f"Failed to load {label} {gpath}: {e}")
 
-        # 3. Project config (.agent/config.json in cwd or ancestors)
-        project_path = self._find_project_config()
-        if project_path:
-            try:
-                project_data = load_file(project_path)
-                merged = deep_merge(merged, project_data)
-                self._sources.append(("project", project_path))
-                logger.debug(f"Loaded project config: {project_path}")
-            except Exception as e:
-                logger.warning(f"Failed to load project config: {e}")
+        # Managed (/etc/opencode/opencode.json) — low priority but above user project
+        for mpath in [Path("/etc/opencode/opencode.json"), Path("/etc/opencode/opencode.jsonc")]:
+            if mpath.exists():
+                try:
+                    mdata = load_file(mpath)
+                    merged = deep_merge(merged, mdata)
+                    self._sources.append(("managed", mpath))
+                except Exception as e:
+                    logger.debug(f"Managed config failed: {e}")
 
-        # 4. Explicit path (highest file priority)
+        # 3. Custom via OPENCODE_CONFIG
+        opencode_custom = os.environ.get("OPENCODE_CONFIG")
+        if opencode_custom:
+            cp = Path(opencode_custom).expanduser()
+            if cp.exists():
+                try:
+                    cdata = load_file(cp)
+                    merged = deep_merge(merged, cdata)
+                    self._sources.append(("custom-opencode", cp))
+                except Exception as e:
+                    logger.warning(f"OPENCODE_CONFIG load failed: {e}")
+
+        # 4. Project configs (walk ancestors for both opencode.json and .agent)
+        for proj_path, label in self._find_all_project_configs():
+            try:
+                pdata = load_file(proj_path)
+                merged = deep_merge(merged, pdata)
+                self._sources.append((label, proj_path))
+                logger.debug(f"Loaded {label}: {proj_path}")
+            except Exception as e:
+                logger.warning(f"Failed to load {label} {proj_path}: {e}")
+
+        # 4b. Explicit path (highest file priority)
         if config_path:
             path = Path(config_path).expanduser()
             if not path.exists():
@@ -312,20 +476,38 @@ class ConfigLoader:
                 self._sources.append(("explicit", path))
                 logger.debug(f"Loaded explicit config: {path}")
 
-        # 5. Environment variables
+        # 5. Inline OPENCODE_CONFIG_CONTENT
+        inline = os.environ.get("OPENCODE_CONFIG_CONTENT")
+        if inline:
+            try:
+                j = json.loads(_strip_jsonc_comments(inline))
+                if isinstance(j, dict):
+                    j = _normalize_opencode_config(j)
+                    merged = deep_merge(merged, j)
+                    logger.debug("Loaded OPENCODE_CONFIG_CONTENT")
+            except Exception as e:
+                logger.warning(f"OPENCODE_CONFIG_CONTENT parse failed: {e}")
+
+        # 6. Environment variables (AGENT_* + OPENCODE_*)
         env_data = load_env_vars()
+        # Also support OPENCODE_ prefix mapped to same structure
+        opencode_env = load_env_vars(prefix="OPENCODE_")
+        if opencode_env:
+            # normalize opencode env keys: OPENCODE_MODEL -> llm.model etc.
+            if "model" in opencode_env and "llm" not in opencode_env:
+                opencode_env.setdefault("llm", {})["model"] = opencode_env.pop("model")
+            env_data = deep_merge(env_data, opencode_env)
         if env_data:
             merged = deep_merge(merged, env_data)
             logger.debug(f"Loaded env vars: {list(env_data.keys())}")
 
-        # 6. Interpolate ${VAR} references
+        # 7. Interpolate ${VAR} / {env:} / {file:} references
         merged = interpolate_env(merged)
 
-        # 7. Extra overrides (CLI args) — highest priority
+        # 8. Extra overrides (CLI args) — highest priority
         if extra:
             merged = deep_merge(merged, extra)
 
-        # 8. Handle missing user config creation
         if init_if_missing and not USER_CONFIG_PATH.exists():
             self._write_default_config(USER_CONFIG_PATH)
 
@@ -390,13 +572,29 @@ class ConfigLoader:
     # ------------------------------------------------------------------
 
     def _find_project_config(self) -> Optional[Path]:
-        """Walk up from cwd looking for .agent/config.json"""
-        current = Path.cwd()
-        for parent in [current, *current.parents]:
-            candidate = parent / PROJECT_CONFIG_NAME
-            if candidate.exists():
-                return candidate
+        """Walk up from cwd looking for .agent/config.json (legacy helper)."""
+        for p, _ in self._find_all_project_configs():
+            if p.name == "config.json" and ".agent" in str(p):
+                return p
         return None
+
+    def _find_all_project_configs(self) -> List[Tuple[Path, str]]:
+        """Find all project configs walking up — returns in ancestor order (root→cwd so cwd wins)."""
+        found: List[Tuple[Path, str]] = []
+        current = Path.cwd()
+        # Walk from root down so deeper overrides shallower (apply in order)
+        ancestors = list(reversed([current, *current.parents]))
+        for parent in ancestors:
+            for name, label in [
+                ("opencode.json", "project-opencode"),
+                ("opencode.jsonc", "project-opencode-jsonc"),
+                (".agent/config.json", "project-agent"),
+                (".agent/opencode.json", "project-agent-opencode"),
+            ]:
+                cand = parent / name
+                if cand.exists():
+                    found.append((cand, label))
+        return found
 
     def _write_default_config(self, path: Path) -> None:
         """Write a default config file to the given path"""

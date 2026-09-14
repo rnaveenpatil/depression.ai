@@ -65,7 +65,7 @@ class SearchTool(BaseTool):
     async def _ripgrep(
         self, query: str, root: str, params: Dict[str, Any]
     ) -> Dict[str, Any]:
-        args = ["rg", "--line-number", "--no-heading", "--color=never"]
+        args = ["rg", "--line-number", "--no-heading", "--color=never", "--hidden", "--glob", "!.git"]
         if not params.get("case_sensitive"):
             args.append("-i")
         if not params.get("regex"):
@@ -75,6 +75,8 @@ class SearchTool(BaseTool):
         glob = params.get("glob")
         if glob and glob != "*":
             args.extend(["--glob", glob])
+        # Respect .gitignore already via rg defaults; cap results
+        args.extend(["--max-count", str(int(params.get("max_results", 100)))])
         args.extend([query, root])
 
         try:
@@ -84,6 +86,9 @@ class SearchTool(BaseTool):
                 stderr=asyncio.subprocess.PIPE,
             )
             stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=30)
+            # If rg succeeded, parse
+            if proc.returncode not in (0, 1):  # 1 = no matches, still success
+                return await self._python_search(query, root, params)
         except Exception:
             return await self._python_search(query, root, params)
 

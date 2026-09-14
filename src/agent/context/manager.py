@@ -370,10 +370,16 @@ class ContextManager:
         return min(1.0, self.total_tokens() / self.max_tokens)
 
     def _estimate_tokens(self, text: str) -> int:
-        """Rough token estimate: ~4 chars per token."""
+        """Accurate token estimate via tiktoken if available (OpenCode parity), else ~4 chars."""
         if not text:
             return 0
-        return max(1, len(text) // 4)
+        try:
+            from agent.llm.rate_limiter import TokenCounter
+            # Use default encoding; if model known, use it
+            model = getattr(self.llm, 'get_current_model', lambda: 'default')() if self.llm and hasattr(self.llm, 'get_current_model') else 'default'
+            return TokenCounter.count_tokens(text, model or 'default')
+        except Exception:
+            return max(1, len(text) // 4)
 
     # ------------------------------------------------------------------
     # COMPACTION

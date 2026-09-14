@@ -524,6 +524,32 @@ class CommandProcessor:
             handler=self.cmd_import,
         ))
 
+        # ===== SNAPSHOT / UNDO (OpenCode-style) =====
+        self._add_command(Command(
+            name="snapshot",
+            description="Create a snapshot of current changes (git stash)",
+            usage="/snapshot [message]",
+            aliases=["snap"],
+            category=CommandCategory.PROJECT,
+            handler=self.cmd_snapshot,
+            examples=["/snapshot", "/snapshot \"before refactor\""],
+        ))
+        self._add_command(Command(
+            name="undo",
+            description="Undo last snapshot (git stash pop)",
+            usage="/undo",
+            aliases=["redo"],
+            category=CommandCategory.PROJECT,
+            handler=self.cmd_undo,
+        ))
+        self._add_command(Command(
+            name="import",
+            description="Import session or config",
+            usage="/import <session|config> <path>",
+            category=CommandCategory.SESSION,
+            handler=self.cmd_import,
+        ))
+
     def _add_command(self, command: Command) -> None:
         """Add a command to the registry"""
         self.commands[command.name] = command
@@ -1795,6 +1821,35 @@ class CommandProcessor:
             self.ui.print_success(f"Imported {what} from {path}")
         except Exception as e:
             self.ui.print_error(f"Import failed: {e}")
+
+    async def cmd_snapshot(self, args: List[str]) -> None:
+        """Create a snapshot of current changes using git stash."""
+        message = " ".join(args) if args else "auto"
+        if not self.agent or not hasattr(self.agent, 'workspace'):
+            self.ui.print_error("No workspace available")
+            return
+        result = await self.agent.workspace.create_snapshot(message)
+        if result.get("success"):
+            self.ui.print_success(f"Snapshot created: {result.get('message', message)}")
+            if result.get("stdout"):
+                self.ui.print_info(result["stdout"].strip())
+        else:
+            self.ui.print_error(f"Snapshot failed: {result.get('error', 'unknown error')}")
+
+    async def cmd_undo(self, args: List[str]) -> None:
+        """Undo the last snapshot (git stash pop)."""
+        if not self.agent or not hasattr(self.agent, 'workspace'):
+            self.ui.print_error("No workspace available")
+            return
+        result = await self.agent.workspace.undo_snapshot()
+        if result.get("success"):
+            self.ui.print_success("Snapshot undone")
+            if result.get("stdout"):
+                self.ui.print_info(result["stdout"].strip())
+            if result.get("stderr"):
+                self.ui.print_warning(result["stderr"].strip())
+        else:
+            self.ui.print_error(f"Undo failed: {result.get('error', 'unknown error')}")
 
     # ==================================================================
     # LLM REGISTRY BRIDGE (dynamic — no models defined here)

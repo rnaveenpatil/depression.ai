@@ -12,8 +12,8 @@ TEMPERATURE TABLE:
     Trivial (greetings)     → 0.2
     Simple (short Q)        → 0.3
     Moderate                → 0.5
-    Complex (reasoning)     → 0.4
-    Creative                → 0.9
+    Complex (reasoning)     → 0.2
+    Creative                → 0.8
     Precise (code/math)     → 0.1
     Explanation             → 0.3
 """
@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import os
 import re
-from dataclasses import dataclass, field, asdict, fields
+from dataclasses import dataclass, field, asdict, fields as dc_fields
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from enum import Enum
@@ -85,8 +85,8 @@ class TemperatureResolver:
         Trivial (greetings)     → 0.2
         Simple (short Q)        → 0.3
         Moderate                → 0.5
-        Complex (reasoning)     → 0.4
-        Creative                → 0.9
+        Complex (reasoning)     → 0.2
+        Creative                → 0.8
         Precise (code/math)     → 0.1
         Explanation             → 0.3
 
@@ -97,8 +97,8 @@ class TemperatureResolver:
         TaskComplexity.TRIVIAL.value:      0.2,
         TaskComplexity.SIMPLE.value:       0.3,
         TaskComplexity.MODERATE.value:     0.5,
-        TaskComplexity.COMPLEX.value:      0.4,
-        TaskComplexity.CREATIVE.value:     0.9,
+        TaskComplexity.COMPLEX.value:      0.2,
+        TaskComplexity.CREATIVE.value:     0.8,
         TaskComplexity.PRECISE.value:      0.1,
         TaskComplexity.EXPLANATION.value:  0.3,
     }
@@ -443,24 +443,22 @@ class PermissionRuleConfig:
 
 @dataclass
 class PermissionsConfig:
+    # OpenCode efficient default: allow-all, only ask for external/doom_loop; manual auto handled via manager defaults
     enabled: bool = True
     mode: str = "manual"
     auto_approve: bool = False
     allow_dangerous: bool = False
+    default: str = "allow"
     rules: List[PermissionRuleConfig] = field(default_factory=list)
     allowed_tools: List[str] = field(default_factory=list)
     denied_tools: List[str] = field(default_factory=list)
-    confirm_file_writes: bool = True
-    confirm_shell_commands: bool = True
+    confirm_file_writes: bool = False  # OpenCode: not ask by default
+    confirm_shell_commands: bool = False
+    permission: Dict[str, Any] = field(default_factory=dict)  # opencode granular map
     safe_paths: List[str] = field(default_factory=lambda: ["~/", "./", "/tmp/"])
     blocked_paths: List[str] = field(default_factory=lambda: [
         "/etc/", "/sys/", "/proc/", "~/.ssh/", "~/.aws/"
     ])
-    # opencode-compatible: permission dict supports string "allow/ask/deny" or
-    # granular object {"*":"ask","git status*":"allow"} per tool. Keys:
-    # read, edit, glob, grep, bash, task, external_directory, todowrite,
-    # webfetch, websearch, lsp, skill, question, doom_loop
-    permission: Dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -583,6 +581,22 @@ class PluginsConfig:
 
 
 @dataclass
+class ServerConfig:
+    port: int = 4096
+    hostname: str = "127.0.0.1"
+    mdns: bool = False
+    mdnsDomain: str = "opencode.local"
+    cors: List[str] = field(default_factory=list)
+
+@dataclass
+class SnapshotConfig:
+    enabled: bool = True
+
+@dataclass
+class WatcherConfig:
+    ignore: List[str] = field(default_factory=lambda: ["node_modules/**", "dist/**", ".git/**"])
+
+@dataclass
 class AdvancedConfig:
     enable_streaming: bool = True
     enable_function_calling: bool = True
@@ -591,6 +605,23 @@ class AdvancedConfig:
     enable_computer_use: bool = False
     prompt_cache: bool = False
     beta_features: List[str] = field(default_factory=list)
+    # OpenCode compat
+    snapshot: bool = True
+    share: str = "manual"  # manual|auto|disabled
+    autoupdate: bool = True
+    shell: str = "/bin/bash"
+    formatter: Any = False
+    lsp: Any = False
+    compaction: Dict[str, Any] = field(default_factory=lambda: {"auto": True, "prune": False, "reserved": 10000})
+    watcher: WatcherConfig = field(default_factory=WatcherConfig)
+    instructions: List[str] = field(default_factory=list)
+    disabled_providers: List[str] = field(default_factory=list)
+    enabled_providers: List[str] = field(default_factory=list)
+    model: str = ""  # top-level alias for llm.model
+    small_model: str = ""
+    permission: Dict[str, Any] = field(default_factory=dict)
+    server: ServerConfig = field(default_factory=ServerConfig)
+    snapshot_config: SnapshotConfig = field(default_factory=SnapshotConfig)
 
 
 # ======================================================================
@@ -785,27 +816,23 @@ class Config:
                     continue
                 for m in models:
                     if isinstance(m, str):
-                        mid = m
-                        meta = {}
-                    else:
-                        mid = m.get("id") or m.get("model") or m.get("name")
-                        meta = m
-                    if mid and (not hasattr(registry, "is_model_available") or registry.is_model_available(prov, mid)):
-                        candidates.append((prov, mid, meta))
+                        candidates.append((prov, m, {}))
+                        continue
+                    mid = m.get("id") or m.get("model") or m.get("name")
+                    if mid:
+                        candidates.append((prov, mid, m))
         elif isinstance(all_models, list):
             for m in all_models:
                 if isinstance(m, str):
                     prov = provider_hint or "default"
-                    mid = m
-                    meta = {}
-                else:
-                    prov = m.get("provider", provider_hint or "default")
-                    if provider_hint and prov != provider_hint:
-                        continue
-                    mid = m.get("id") or m.get("model") or m.get("name")
-                    meta = m
-                if mid and (not hasattr(registry, "is_model_available") or registry.is_model_available(prov, mid)):
-                    candidates.append((prov, mid, meta))
+                    candidates.append((prov, m, {}))
+                    continue
+                prov = m.get("provider", provider_hint or "default")
+                if provider_hint and prov != provider_hint:
+                    continue
+                mid = m.get("id") or m.get("model") or m.get("name")
+                if mid:
+                    candidates.append((prov, mid, m))
 
         if not candidates:
             return None
@@ -951,7 +978,7 @@ class Config:
                 return section_cls()
 
             kwargs = {}
-            for f in fields(section_cls):
+            for f in dc_fields(section_cls):
                 if f.name not in section_data:
                     continue
                 val = section_data[f.name]
@@ -980,7 +1007,7 @@ def _mask(value: str) -> str:
 def _resolve_nested_dataclass(parent_cls: Any, field_name: str) -> Optional[type]:
     """Best-effort resolution of a nested dataclass type."""
     try:
-        for f in fields(parent_cls):
+        for f in dc_fields(parent_cls):
             if f.name == field_name:
                 t = f.type
                 if isinstance(t, str):
