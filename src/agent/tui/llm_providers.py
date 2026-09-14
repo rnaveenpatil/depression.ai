@@ -1,38 +1,27 @@
-"""
-LLM Provider Registry & Persistent Config Storage
+"""LLM catalog and persistent user connection settings for the TUI.
 
-Manages:
-- Pre-configured LLM providers with models (from user's table)
-- API key storage (obfuscated on disk)
-- Base URL management
-- Provider selection and switching
-- Persistent configuration at ~/.config/depression/llm.json
+The TUI owns presentation; the runtime provider registry remains responsible
+for actual completions. Keys are stored locally with restrictive permissions
+and are never rendered back into the interface in clear text.
 """
-
 from __future__ import annotations
 
 import json
 import os
-import base64
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional
 
 
-# ======================================================================
-# PROVIDER DATA (from user's table)
-# ======================================================================
-
 @dataclass(frozen=True)
 class LLMModel:
-    """A single LLM model configuration."""
-    name: str                    # Internal name (provider/model)
-    display_name: str           # Human-readable name
-    provider: str               # Provider ID (deepseek, together, groq, nvidia, mistral, google)
-    base_url: str               # OpenAI-compatible base URL
-    context_window: int         # Context window in tokens
-    supports_tools: bool = True # Function calling support
-    rating: int = 4             # 1-5 stars
+    name: str
+    display_name: str
+    provider: str
+    base_url: str
+    context_window: int
+    supports_tools: bool = True
+    rating: int = 4
 
     @property
     def short_name(self) -> str:
@@ -43,317 +32,142 @@ class LLMModel:
         return "★" * self.rating + "☆" * (5 - self.rating)
 
 
-# Exact models from user's table
+# Curated catalog requested for Depression.AI. Provider/model IDs are kept
+# separate from display names so the UI can remain clean and searchable.
 PROVIDER_MODELS: List[LLMModel] = [
-    LLMModel(
-        name="deepseek-ai/DeepSeek-V4.1-Flash",
-        display_name="DeepSeek V4.1 Flash",
-        provider="deepseek",
-        base_url="https://api.deepseek.com",
-        context_window=1_000_000,
-        supports_tools=True,
-        rating=5,
-    ),
-    LLMModel(
-        name="deepseek-ai/DeepSeek-V4-Flash-0731",
-        display_name="DeepSeek V4 Flash 0731",
-        provider="together",
-        base_url="https://api.together.xyz/v1",
-        context_window=1_000_000,
-        supports_tools=True,
-        rating=5,
-    ),
-    LLMModel(
-        name="openai/gpt-oss-120b",
-        display_name="GPT-OSS 120B",
-        provider="groq",
-        base_url="https://api.groq.com/openai/v1",
-        context_window=131_000,
-        supports_tools=True,
-        rating=5,
-    ),
-    LLMModel(
-        name="openai/gpt-oss-20b",
-        display_name="GPT-OSS 20B",
-        provider="groq",
-        base_url="https://api.groq.com/openai/v1",
-        context_window=131_000,
-        supports_tools=True,
-        rating=4,
-    ),
-    LLMModel(
-        name="nvidia/nemotron-3-ultra-550b",
-        display_name="Nemotron 3 Ultra 550B",
-        provider="nvidia",
-        base_url="https://integrate.api.nvidia.com/v1",
-        context_window=1_000_000,
-        supports_tools=True,
-        rating=5,
-    ),
-    LLMModel(
-        name="nvidia/nemotron-3-super-120b",
-        display_name="Nemotron 3 Super 120B",
-        provider="nvidia",
-        base_url="https://integrate.api.nvidia.com/v1",
-        context_window=1_000_000,
-        supports_tools=True,
-        rating=5,
-    ),
-    LLMModel(
-        name="nvidia/nemotron-3-nano-30b",
-        display_name="Nemotron 3 Nano 30B",
-        provider="nvidia",
-        base_url="https://integrate.api.nvidia.com/v1",
-        context_window=1_000_000,
-        supports_tools=True,
-        rating=4,
-    ),
-    LLMModel(
-        name="mistralai/Mistral-Small-4",
-        display_name="Mistral Small 4",
-        provider="mistral",
-        base_url="https://api.mistral.ai/v1",
-        context_window=256_000,
-        supports_tools=True,
-        rating=4,
-    ),
-    LLMModel(
-        name="google/gemini-3.1-flash-lite",
-        display_name="Gemini 3.1 Flash-Lite",
-        provider="google",
-        base_url="https://generativelanguage.googleapis.com/v1beta/openai",
-        context_window=1_000_000,
-        supports_tools=True,
-        rating=4,
-    ),
-    LLMModel(
-        name="meta-llama/llama-3.3-70b-versatile",
-        display_name="Llama 3.3 70B",
-        provider="groq",
-        base_url="https://api.groq.com/openai/v1",
-        context_window=131_000,
-        supports_tools=True,
-        rating=4,
-    ),
-    LLMModel(
-        name="qwen/qwen3-27b",
-        display_name="Qwen 3.6 27B",
-        provider="groq",
-        base_url="https://api.groq.com/openai/v1",
-        context_window=131_000,
-        supports_tools=True,
-        rating=4,
-    ),
-    LLMModel(
-        name="minimax/minimax-m2.7",
-        display_name="MiniMax M2.7",
-        provider="groq",
-        base_url="https://api.groq.com/openai/v1",
-        context_window=131_000,
-        supports_tools=True,
-        rating=4,
-    ),
+    LLMModel("nvidia/nemotron-3-ultra-550b-a55b", "Nemotron 3 Ultra 550B A55B", "nvidia", "https://integrate.api.nvidia.com/v1", 1_000_000, rating=5),
+    LLMModel("deepseek/DeepSeek-V4-Pro", "DeepSeek V4 Pro", "deepseek", "https://api.deepseek.com", 1_000_000, rating=5),
+    LLMModel("deepseek/DeepSeek-V4-Flash", "DeepSeek V4 Flash", "deepseek", "https://api.deepseek.com", 1_000_000, rating=5),
+    LLMModel("nvidia/nemotron-3-super-120b-a12b", "Nemotron 3 Super 120B A12B", "nvidia", "https://integrate.api.nvidia.com/v1", 1_000_000, rating=5),
+    LLMModel("nvidia/nemotron-3.5-lightning-30b-a3b", "Nemotron 3.5 Lightning 30B A3B", "nvidia", "https://integrate.api.nvidia.com/v1", 1_000_000, rating=5),
+    LLMModel("nvidia/nemotron-3-nano-30b-a3b", "Nemotron 3 Nano 30B A3B", "nvidia", "https://integrate.api.nvidia.com/v1", 1_000_000, rating=4),
+    LLMModel("minimax/MiniMax-M2.5", "MiniMax M2.5", "minimax", "https://api.minimax.io/v1", 200_000, rating=5),
+    LLMModel("mistral/mistral-medium-3.5", "Mistral Medium 3.5", "mistral", "https://api.mistral.ai/v1", 256_000, rating=5),
+    LLMModel("mistral/devstral", "Devstral", "mistral", "https://api.mistral.ai/v1", 256_000, rating=5),
+    LLMModel("anthropic/claude-sonnet", "Claude Sonnet", "anthropic", "https://api.anthropic.com", 200_000, rating=5),
+    LLMModel("anthropic/claude-opus", "Claude Opus", "anthropic", "https://api.anthropic.com", 200_000, rating=5),
+    LLMModel("google/gemini-flash", "Gemini Flash", "google", "https://generativelanguage.googleapis.com/v1beta/openai", 1_000_000, rating=5),
+    LLMModel("google/gemini-pro", "Gemini Pro", "google", "https://generativelanguage.googleapis.com/v1beta/openai", 1_000_000, rating=5),
+    LLMModel("openai/gpt-5.x", "GPT-5.x", "openai", "https://api.openai.com/v1", 400_000, rating=5),
+    LLMModel("openai/gpt-oss-120b", "GPT-OSS 120B", "groq", "https://api.groq.com/openai/v1", 131_000, rating=5),
+    LLMModel("openai/gpt-oss-20b", "GPT-OSS 20B", "groq", "https://api.groq.com/openai/v1", 131_000, rating=4),
+    LLMModel("moonshot/kimi-k2", "Kimi K2.x", "moonshot", "https://api.moonshot.ai/v1", 200_000, rating=5),
+    LLMModel("moonshot/kimi-k3", "Kimi K3", "moonshot", "https://api.moonshot.ai/v1", 200_000, rating=5),
+    LLMModel("zai/glm-5.x", "GLM-5.x", "zai", "https://api.z.ai/api/paas/v4", 200_000, rating=5),
+    LLMModel("qwen/qwen-coder", "Qwen Coder", "qwen", "", 200_000, rating=5),
+    LLMModel("meta/llama-4", "Llama 4 / latest Llama", "meta", "", 200_000, rating=4),
+    LLMModel("alibaba/qwen-3.x", "Qwen 3.x", "alibaba", "", 200_000, rating=4),
+    LLMModel("openrouter/coding-agent", "OpenRouter Coding / Agent Models", "openrouter", "https://openrouter.ai/api/v1", 200_000, rating=5),
 ]
 
-
-# Provider-specific info
 PROVIDER_INFO: Dict[str, Dict] = {
-    "deepseek": {
-        "name": "DeepSeek",
-        "color": "#00c8ff",
-        "icon": "◆",
-        "api_key_env": "DEEPSEEK_API_KEY",
-        "api_key_url": "https://platform.deepseek.com/api_keys",
-    },
-    "together": {
-        "name": "Together AI",
-        "color": "#b464ff",
-        "icon": "⟡",
-        "api_key_env": "TOGETHER_API_KEY",
-        "api_key_url": "https://api.together.xyz/settings/api-keys",
-    },
-    "groq": {
-        "name": "Groq",
-        "color": "#f55036",
-        "icon": "⚡",
-        "api_key_env": "GROQ_API_KEY",
-        "api_key_url": "https://console.groq.com/keys",
-    },
-    "nvidia": {
-        "name": "NVIDIA",
-        "color": "#76b900",
-        "icon": "◈",
-        "api_key_env": "NVIDIA_API_KEY",
-        "api_key_url": "https://build.nvidia.com/settings/api-keys",
-    },
-    "mistral": {
-        "name": "Mistral AI",
-        "color": "#ff7000",
-        "icon": "◧",
-        "api_key_env": "MISTRAL_API_KEY",
-        "api_key_url": "https://console.mistral.ai/api-keys/",
-    },
-    "google": {
-        "name": "Google AI",
-        "color": "#4285f4",
-        "icon": "◎",
-        "api_key_env": "GOOGLE_API_KEY",
-        "api_key_url": "https://aistudio.google.com/apikey",
-    },
+    "nvidia": {"name": "NVIDIA", "icon": "◆", "api_key_env": "NVIDIA_API_KEY"},
+    "deepseek": {"name": "DeepSeek", "icon": "◇", "api_key_env": "DEEPSEEK_API_KEY"},
+    "minimax": {"name": "MiniMax", "icon": "✦", "api_key_env": "MINIMAX_API_KEY"},
+    "mistral": {"name": "Mistral", "icon": "M", "api_key_env": "MISTRAL_API_KEY"},
+    "anthropic": {"name": "Anthropic", "icon": "A", "api_key_env": "ANTHROPIC_API_KEY"},
+    "google": {"name": "Google", "icon": "G", "api_key_env": "GOOGLE_API_KEY"},
+    "openai": {"name": "OpenAI", "icon": "O", "api_key_env": "OPENAI_API_KEY"},
+    "groq": {"name": "Groq", "icon": "⚡", "api_key_env": "GROQ_API_KEY"},
+    "moonshot": {"name": "Moonshot", "icon": "☾", "api_key_env": "MOONSHOT_API_KEY"},
+    "zai": {"name": "Z.AI", "icon": "Z", "api_key_env": "ZAI_API_KEY"},
+    "qwen": {"name": "Qwen", "icon": "Q", "api_key_env": "DASHSCOPE_API_KEY"},
+    "meta": {"name": "Meta", "icon": "M", "api_key_env": "META_API_KEY"},
+    "alibaba": {"name": "Alibaba", "icon": "A", "api_key_env": "DASHSCOPE_API_KEY"},
+    "openrouter": {"name": "OpenRouter", "icon": "↗", "api_key_env": "OPENROUTER_API_KEY"},
 }
 
 
-# ======================================================================
-# CONFIG STORAGE
-# ======================================================================
-
-def _get_config_dir() -> Path:
+def _config_file() -> Path:
     if os.name == "nt":
         base = Path(os.environ.get("APPDATA", Path.home() / "AppData" / "Roaming"))
     else:
         base = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
-    config_dir = base / "depression"
-    config_dir.mkdir(parents=True, exist_ok=True)
-    return config_dir
-
-
-def _get_config_file() -> Path:
-    return _get_config_dir() / "llm.json"
-
-
-def _obfuscate(text: str) -> str:
-    return base64.urlsafe_b64encode(text.encode()).decode()
-
-
-def _deobfuscate(text: str) -> str:
-    try:
-        return base64.urlsafe_b64decode(text.encode()).decode()
-    except Exception:
-        return text
+    directory = base / "depression"
+    directory.mkdir(parents=True, exist_ok=True)
+    return directory / "llm.json"
 
 
 class LLMConfig:
-    """Persistent LLM configuration manager."""
-
-    def __init__(self):
+    """Persistent selected model, endpoint and API-key configuration."""
+    def __init__(self) -> None:
         self._selected_model: Optional[str] = None
         self._api_keys: Dict[str, str] = {}
-        self._custom_base_urls: Dict[str, str] = {}
+        self._base_urls: Dict[str, str] = {}
         self._load()
 
     def _load(self) -> None:
-        config_file = _get_config_file()
-        if config_file.exists():
-            try:
-                with open(config_file, "r") as f:
-                    data = json.load(f)
-                self._selected_model = data.get("selected_model")
-                encrypted_keys = data.get("api_keys", {})
-                self._api_keys = {k: _deobfuscate(v) for k, v in encrypted_keys.items()}
-                self._custom_base_urls = data.get("base_urls", {})
-            except Exception:
-                pass
+        try:
+            with _config_file().open("r", encoding="utf-8") as f:
+                data = json.load(f)
+            self._selected_model = data.get("selected_model")
+            self._api_keys = dict(data.get("api_keys", {}))
+            self._base_urls = dict(data.get("base_urls", {}))
+        except (OSError, ValueError, TypeError):
+            return
 
     def save(self) -> None:
-        config_file = _get_config_file()
-        data = {
-            "selected_model": self._selected_model,
-            "api_keys": {k: _obfuscate(v) for k, v in self._api_keys.items()},
-            "base_urls": self._custom_base_urls,
-        }
+        path = _config_file()
+        tmp = path.with_suffix(".tmp")
+        data = {"selected_model": self._selected_model, "api_keys": self._api_keys, "base_urls": self._base_urls}
         try:
-            with open(config_file, "w") as f:
+            with tmp.open("w", encoding="utf-8") as f:
                 json.dump(data, f, indent=2)
-        except Exception as e:
-            print(f"Warning: Could not save LLM config: {e}")
+            os.replace(tmp, path)
+            try:
+                path.chmod(0o600)
+            except OSError:
+                pass
+        except OSError:
+            try: tmp.unlink(missing_ok=True)
+            except OSError: pass
 
     @property
-    def selected_model(self) -> Optional[str]:
-        return self._selected_model
-
+    def selected_model(self) -> Optional[str]: return self._selected_model
     @selected_model.setter
-    def selected_model(self, model_name: str) -> None:
-        self._selected_model = model_name
-        self.save()
+    def selected_model(self, value: str) -> None:
+        self._selected_model = value; self.save()
 
     def get_api_key(self, provider: str) -> str:
-        if provider in self._api_keys and self._api_keys[provider]:
-            return self._api_keys[provider]
-        info = PROVIDER_INFO.get(provider, {})
-        env_var = info.get("api_key_env", "")
-        if env_var:
-            return os.environ.get(env_var, "")
-        return ""
+        value = self._api_keys.get(provider)
+        if value: return value
+        env = PROVIDER_INFO.get(provider, {}).get("api_key_env", "")
+        return os.environ.get(env, "") if env else ""
 
     def set_api_key(self, provider: str, key: str) -> None:
-        if key:
-            self._api_keys[provider] = key
-        else:
-            self._api_keys.pop(provider, None)
+        if key: self._api_keys[provider] = key
+        else: self._api_keys.pop(provider, None)
         self.save()
 
-    def has_api_key(self, provider: str) -> bool:
-        return bool(self.get_api_key(provider))
-
     def get_base_url(self, provider: str) -> str:
-        if provider in self._custom_base_urls:
-            return self._custom_base_urls[provider]
+        if provider in self._base_urls: return self._base_urls[provider]
         for model in PROVIDER_MODELS:
-            if model.provider == provider:
-                return model.base_url
+            if model.provider == provider and model.base_url: return model.base_url
         return ""
 
     def set_base_url(self, provider: str, url: str) -> None:
-        if url:
-            self._custom_base_urls[provider] = url
-        else:
-            self._custom_base_urls.pop(provider, None)
+        if url: self._base_urls[provider] = url.rstrip("/")
+        else: self._base_urls.pop(provider, None)
         self.save()
 
     def get_selected_model_info(self) -> Optional[LLMModel]:
-        if not self._selected_model:
-            return None
-        for model in PROVIDER_MODELS:
-            if model.name == self._selected_model:
-                return model
-        return None
-
-    def get_provider_status(self) -> List[Dict]:
-        providers = {}
-        for model in PROVIDER_MODELS:
-            p = model.provider
-            if p not in providers:
-                info = PROVIDER_INFO.get(p, {})
-                providers[p] = {
-                    "id": p,
-                    "name": info.get("name", p),
-                    "color": info.get("color", "#ffffff"),
-                    "icon": info.get("icon", "●"),
-                    "has_key": self.has_api_key(p),
-                    "models": [],
-                }
-            providers[p]["models"].append(model)
-        return list(providers.values())
+        return next((m for m in PROVIDER_MODELS if m.name == self._selected_model), None)
 
     def build_llm_config(self, model: LLMModel) -> Dict:
-        api_key = self.get_api_key(model.provider)
-        base_url = self.get_base_url(model.provider)
-        return {
-            "llm": {
-                "provider": model.provider,
-                "model": model.name,
-                "api_key": api_key,
-                "base_url": base_url,
-                "params": {"temperature": 0.7},
-            }
-        }
+        return {"llm": {"provider": model.provider, "model": model.name, "api_key": self.get_api_key(model.provider), "base_url": self.get_base_url(model.provider), "params": {"temperature": 0.1}}}
+
+    def get_provider_status(self) -> List[Dict]:
+        result = []
+        for provider, info in PROVIDER_INFO.items():
+            models = [m for m in PROVIDER_MODELS if m.provider == provider]
+            if models:
+                result.append({"id": provider, "name": info["name"], "icon": info["icon"], "has_key": bool(self.get_api_key(provider)), "models": models})
+        return result
 
 
 _llm_config: Optional[LLMConfig] = None
 
-
 def get_llm_config() -> LLMConfig:
     global _llm_config
-    if _llm_config is None:
-        _llm_config = LLMConfig()
+    if _llm_config is None: _llm_config = LLMConfig()
     return _llm_config
