@@ -1,61 +1,36 @@
-"""
-Context Manager - Central orchestrator for agent context.
-
-Responsibilities:
-- Maintains the live conversation context (messages, tool outputs, files)
-- Tracks token usage against ContextConfig.max_tokens
-- Triggers compaction when threshold is exceeded
-- Provides retrieval APIs for the agent loop and planner
-- Persists context snapshots to storage
-"""
-
+"""Central, session-owned context for the agent runtime."""
 from __future__ import annotations
-
-import time
-import json
-import asyncio
+import time, json, asyncio
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 from collections import deque
-
 from agent.utils.logging import get_logger
-from agent.utils.errors import ContextError
 from agent.context.project import ProjectContext
 from agent.context.files import FileContext
 from agent.context.compaction import Compactor
-
 logger = get_logger(__name__)
-
-
-# ======================================================================
-# DATA MODELS
-# ======================================================================
 
 @dataclass
 class ContextMessage:
-    """A single message in the conversation context"""
-    role: str                   # "user" | "assistant" | "system" | "tool"
+    role: str
     content: str
     tokens: int = 0
     timestamp: float = field(default_factory=time.time)
     metadata: Dict[str, Any] = field(default_factory=dict)
-    pinned: bool = False        # pinned messages are never compacted
-
+    pinned: bool = False
 
 @dataclass
 class ToolOutput:
-    """A recorded tool execution output"""
     tool: str
     params: Dict[str, Any]
     result: Any
     tokens: int = 0
     timestamp: float = field(default_factory=time.time)
     success: bool = True
-
+    tool_call_id: Optional[str] = None
 
 @dataclass
 class ContextStats:
-    """Snapshot of context statistics"""
     total_tokens: int
     max_tokens: int
     usage_pct: float
@@ -65,465 +40,165 @@ class ContextStats:
     last_compaction: Optional[float]
     compaction_count: int
 
-
-# ======================================================================
-# CONTEXT MANAGER
-# ======================================================================
-
 class ContextManager:
-    """
-    Central context orchestrator.
-
-    The manager holds three layers:
-      1. `messages`   — conversation history (user / assistant / system)
-      2. `tool_outputs` — recent tool results, bounded by recent_tool_outputs
-      3. `files`      — file snippets referenced by the agent (via FileContext)
-      4. `project`    — project-level summary (via ProjectContext)
-
-    It automatically compacts when token usage crosses
-    `ContextConfig.compaction_threshold` and shrinks down to
-    `ContextConfig.compaction_target`.
-    """
-
-    def __init__(
-        self,
-        workspace: Any,
-        session: Any,
-        config: Optional[Dict[str, Any]] = None,
-        llm: Any = None,
-    ):
-        self.workspace = workspace
-        self.session = session
-        self.config = config or {}
-        self.llm = llm
-
-        # Config-driven bounds
-        self.max_tokens: int = self.config.get("max_tokens", 100_000)
-        self.max_messages: int = self.config.get("max_messages", 200)
-        self.compaction_threshold: float = self.config.get("compaction_threshold", 0.8)
-        self.compaction_target: float = self.config.get("compaction_target", 0.5)
-        self.recent_tool_outputs: int = self.config.get("recent_tool_outputs", 5)
-        self.recent_messages: int = self.config.get("recent_messages", 20)
-        self.include_file_contents: bool = self.config.get("include_file_contents", True)
-        self.include_tool_outputs: bool = self.config.get("include_tool_outputs", True)
-        self.enable_summarization: bool = self.config.get("enable_summarization", True)
-
-        # Layer 1: messages
+    """Single source of truth for messages, tool results and context state."""
+    def __init__(self, workspace: Any, session: Any, config: Optional[Dict[str, Any]] = None, llm: Any = None):
+        self.workspace, self.session, self.config, self.llm = workspace, session, config or {}, llm
+        self.max_tokens = self.config.get("max_tokens", 100_000)
+        self.max_messages = self.config.get("max_messages", 200)
+        self.compaction_threshold = self.config.get("compaction_threshold", 0.8)
+        self.compaction_target = self.config.get("compaction_target", 0.5)
+        self.recent_tool_outputs = self.config.get("recent_tool_outputs", 5)
+        self.recent_messages = self.config.get("recent_messages", 40)
+        self.include_file_contents = self.config.get("include_file_contents", True)
+        self.include_tool_outputs = self.config.get("include_tool_outputs", True)
+        self.enable_summarization = self.config.get("enable_summarization", True)
         self.messages: List[ContextMessage] = []
-        # Layer 2: tool outputs
-        self.tool_outputs: deque = deque(maxlen=max(20, self.recent_tool_outputs * 4))
-        # Layer 3: file context
-        self.file_context = FileContext(
-            workspace=workspace,
-            max_tokens=max(4_000, self.max_tokens // 8),
-            include_contents=self.include_file_contents,
-        )
-        # Layer 4: project context
+        self.tool_outputs = deque(maxlen=max(20, self.recent_tool_outputs * 4))
+        self.file_context = FileContext(workspace=workspace, max_tokens=max(4_000, self.max_tokens // 8), include_contents=self.include_file_contents)
         self.project_context = ProjectContext(workspace=workspace)
-
-        # Compactor
-        self.compactor = Compactor(
-            llm=llm,
-            config={
-                "target_ratio": self.compaction_target,
-                "enable_summarization": self.enable_summarization,
-            },
-        )
-
-        # State
-        self._last_compaction: Optional[float] = None
-        self._compaction_count: int = 0
+        self.compactor = Compactor(llm=llm, config={"target_ratio": self.compaction_target, "enable_summarization": self.enable_summarization})
+        self._last_compaction = None
+        self._compaction_count = 0
         self._lock = asyncio.Lock()
 
-        logger.info(
-            f"ContextManager initialized (max_tokens={self.max_tokens}, "
-            f"threshold={self.compaction_threshold}, target={self.compaction_target})"
-        )
-
-    # ------------------------------------------------------------------
-    # LIFECYCLE
-    # ------------------------------------------------------------------
-
     async def initialize(self) -> None:
-        """Warm up project + file context from the workspace"""
-        try:
-            await self.project_context.refresh()
-            logger.debug("Project context initialized")
-        except Exception as e:
-            logger.warning(f"Project context init failed: {e}")
+        try: await self.project_context.refresh()
+        except Exception as e: logger.warning("Project context init failed: %s", e)
 
     async def save(self) -> None:
-        """Persist context to the session (best-effort)"""
         try:
-            if self.session and hasattr(self.session, "update_context"):
-                self.session.update_context(self.to_dict())
-        except Exception as e:
-            logger.warning(f"Failed to save context: {e}")
+            if self.session and hasattr(self.session, "update_context"): self.session.update_context(self.to_dict())
+        except Exception as e: logger.warning("Failed to save context: %s", e)
 
-    # ------------------------------------------------------------------
-    # MESSAGE MANAGEMENT
-    # ------------------------------------------------------------------
-
-    async def add_user_message(
-        self,
-        content: str,
-        context: Optional[Dict[str, Any]] = None,
-    ) -> ContextMessage:
-        msg = ContextMessage(
-            role="user",
-            content=content,
-            tokens=self._estimate_tokens(content),
-            metadata=context or {},
-        )
-        return await self._add_message(msg)
-
-    async def add_assistant_message(
-        self,
-        content: str,
-        metadata: Optional[Dict[str, Any]] = None,
-    ) -> ContextMessage:
-        msg = ContextMessage(
-            role="assistant",
-            content=content,
-            tokens=self._estimate_tokens(content),
-            metadata=metadata or {},
-        )
-        return await self._add_message(msg)
-
-    async def add_system_message(
-        self,
-        content: str,
-        pinned: bool = False,
-    ) -> ContextMessage:
-        msg = ContextMessage(
-            role="system",
-            content=content,
-            tokens=self._estimate_tokens(content),
-            pinned=pinned,
-        )
-        return await self._add_message(msg)
-
-    async def add_message(
-        self,
-        role: str,
-        content: str,
-        pinned: bool = False,
-        metadata: Optional[Dict[str, Any]] = None,
-    ) -> ContextMessage:
-        msg = ContextMessage(
-            role=role,
-            content=content,
-            tokens=self._estimate_tokens(content),
-            pinned=pinned,
-            metadata=metadata or {},
-        )
-        return await self._add_message(msg)
+    def _estimate_tokens(self, text: str) -> int:
+        if not text: return 0
+        try:
+            from agent.llm.rate_limiter import TokenCounter
+            model = self.llm.get_current_model() if self.llm and hasattr(self.llm, "get_current_model") else "default"
+            return TokenCounter.count_tokens(text, model or "default")
+        except Exception: return max(1, len(text) // 4)
 
     async def _add_message(self, msg: ContextMessage) -> ContextMessage:
         async with self._lock:
             self.messages.append(msg)
-            # Soft trim: drop oldest non-pinned if we exceeded max_messages
-            if len(self.messages) > self.max_messages:
-                self._trim_messages()
+            self._trim_messages()
         return msg
 
+    async def add_message(self, role: str, content: str, pinned: bool = False, metadata: Optional[Dict[str, Any]] = None) -> ContextMessage:
+        return await self._add_message(ContextMessage(role, content, self._estimate_tokens(content), metadata=metadata or {}, pinned=pinned))
+
+    async def add_user_message(self, content: str, context: Optional[Dict[str, Any]] = None):
+        return await self.add_message("user", content, metadata=context)
+
+    async def add_assistant_message(self, content: str, metadata: Optional[Dict[str, Any]] = None):
+        return await self.add_message("assistant", content, metadata=metadata)
+
+    async def add_system_message(self, content: str, pinned: bool = False):
+        return await self.add_message("system", content, pinned=pinned)
+
+    def _tool_call_ids(self, m: ContextMessage) -> set[str]:
+        return {str(x.get("id")) for x in (m.metadata.get("tool_calls") or []) if x.get("id")}
+
     def _trim_messages(self) -> None:
-        """Drop oldest non-pinned messages to stay under max_messages"""
-        if len(self.messages) <= self.max_messages:
-            return
-        pinned = [m for m in self.messages if m.pinned]
-        unpinned = [m for m in self.messages if not m.pinned]
-        # Keep the newest unpinned messages
+        if len(self.messages) <= self.max_messages: return
+        pinned = [m for m in self.messages if m.pinned or m.role == "system"]
+        others = [m for m in self.messages if m not in pinned]
         keep = max(0, self.max_messages - len(pinned))
-        unpinned = unpinned[-keep:] if keep else []
-        # Restore original order
-        self.messages = sorted(pinned + unpinned, key=lambda m: m.timestamp)
+        kept = others[-keep:] if keep else []
+        # Never keep an orphan tool result or an assistant tool call without all results.
+        while kept and kept[0].role == "tool": kept.pop(0)
+        while kept and kept[0].role == "assistant" and self._tool_call_ids(kept[0]):
+            ids = self._tool_call_ids(kept[0]); results = [m for m in kept[1:] if m.role == "tool"]
+            if not ids.issubset({str(m.metadata.get("tool_call_id")) for m in results}): kept.pop(0)
+            else: break
+        self.messages = sorted(pinned + kept, key=lambda m: m.timestamp)
 
-    # ------------------------------------------------------------------
-    # TOOL OUTPUTS
-    # ------------------------------------------------------------------
-
-    async def add_tool_output(
-        self,
-        tool_name: str,
-        params: Dict[str, Any],
-        result: Any,
-    ) -> ToolOutput:
-        success = True
-        if isinstance(result, dict):
-            success = bool(result.get("success", True))
-
+    async def add_tool_output(self, tool_name: str, params: Dict[str, Any], result: Any, tool_call_id: Optional[str] = None):
         rendered = self._render_tool_result(result)
-        out = ToolOutput(
-            tool=tool_name,
-            params=params,
-            result=result,
-            tokens=self._estimate_tokens(rendered),
-            success=success,
-        )
+        out = ToolOutput(tool_name, params, result, self._estimate_tokens(rendered), success=bool(result.get("success", True)) if isinstance(result, dict) else True, tool_call_id=tool_call_id)
         self.tool_outputs.append(out)
         return out
 
-    def get_recent_tool_outputs(self, n: Optional[int] = None) -> List[Dict[str, Any]]:
-        n = n or self.recent_tool_outputs
-        recent = list(self.tool_outputs)[-n:]
-        return [
-            {
-                "tool": t.tool,
-                "params": t.params,
-                "result": t.result,
-                "success": t.success,
-                "timestamp": t.timestamp,
-            }
-            for t in recent
-        ]
-
     def _render_tool_result(self, result: Any) -> str:
-        try:
-            return json.dumps(result, default=str)
-        except Exception:
-            return str(result)
+        try: return json.dumps(result, default=str)
+        except Exception: return str(result)
 
-    # ------------------------------------------------------------------
-    # FILE / PROJECT CONTEXT
-    # ------------------------------------------------------------------
+    async def add_tool_message(self, tool_name: str, result: Any, tool_call_id: str, params: Optional[Dict[str, Any]] = None):
+        await self.add_tool_output(tool_name, params or {}, result, tool_call_id)
+        return await self.add_message("tool", self._render_tool_result(result), metadata={"tool_call_id": tool_call_id, "name": tool_name})
 
-    async def add_file_context(
-        self,
-        path: str,
-        content: Optional[str] = None,
-    ) -> bool:
-        return await self.file_context.add_file(path, content)
+    def get_recent_tool_outputs(self, n: Optional[int] = None):
+        recent = list(self.tool_outputs)[-(n or self.recent_tool_outputs):]
+        return [{"tool": t.tool, "params": t.params, "result": t.result, "success": t.success, "timestamp": t.timestamp, "tool_call_id": t.tool_call_id} for t in recent]
 
-    async def get_project_context(self) -> Dict[str, Any]:
-        return await self.project_context.get_summary()
+    async def add_file_context(self, path: str, content: Optional[str] = None): return await self.file_context.add_file(path, content)
+    async def get_project_context(self): return await self.project_context.get_summary()
 
-    # ------------------------------------------------------------------
-    # CONTEXT RETRIEVAL
-    # ------------------------------------------------------------------
+    def _effective_messages(self):
+        from agent.context.runtime import normalize_messages
+        normalize_messages(self)
+        msgs = list(self.messages)
+        if len(msgs) <= self.recent_messages: return msgs
+        pinned = [m for m in msgs if m.pinned or m.role == "system"]
+        others = [m for m in msgs if m not in pinned]
+        selected = []
+        i = len(others) - 1
+        while i >= 0 and len(selected) < self.recent_messages:
+            m = others[i]
+            if m.role == "tool":
+                tid = str(m.metadata.get("tool_call_id") or "")
+                if i > 0 and others[i-1].role == "assistant" and tid in self._tool_call_ids(others[i-1]):
+                    group = [others[i-1]]
+                    j = i
+                    ids = self._tool_call_ids(others[i-1])
+                    while j < len(others) and others[j].role == "tool" and str(others[j].metadata.get("tool_call_id")) in ids:
+                        group.append(others[j]); j += 1
+                    if len(selected) + len(group) <= self.recent_messages: selected[0:0] = group
+                    i -= 1
+                    continue
+            selected.insert(0, m); i -= 1
+        return sorted(pinned + selected, key=lambda m: m.timestamp)
 
-    async def get_context(
-        self,
-        include_project: bool = True,
-        include_files: bool = True,
-        include_tool_outputs: bool = True,
-    ) -> Dict[str, Any]:
-        """
-        Return the current context as a dict suitable for LLM prompts.
-        """
-        ctx: Dict[str, Any] = {
-            "messages": [
-                {"role": m.role, "content": m.content}
-                for m in self._effective_messages()
-            ],
-        }
-        if include_tool_outputs and self.include_tool_outputs:
-            ctx["tool_outputs"] = self.get_recent_tool_outputs()
-        if include_files and self.include_file_contents:
-            ctx["files"] = await self.file_context.get_summary()
-        if include_project:
-            ctx["project"] = await self.project_context.get_summary()
+    async def get_context(self, include_project=True, include_files=True, include_tool_outputs=True):
+        from agent.context.runtime import get_model_messages
+        ctx = {"messages": [m.__dict__ for m in self._effective_messages()]}
+        ctx["model_messages"] = get_model_messages(self, self.recent_messages)
+        if include_tool_outputs and self.include_tool_outputs: ctx["tool_outputs"] = self.get_recent_tool_outputs()
+        if include_files and self.include_file_contents: ctx["files"] = await self.file_context.get_summary()
+        if include_project: ctx["project"] = await self.project_context.get_summary()
         return ctx
 
-    def get_messages(
-        self,
-        limit: Optional[int] = None,
-        include_system: bool = True,
-    ) -> List[Dict[str, str]]:
-        msgs = self.messages
-        if not include_system:
-            msgs = [m for m in msgs if m.role != "system"]
-        if limit:
-            msgs = msgs[-limit:]
-        return [{"role": m.role, "content": m.content} for m in msgs]
+    def get_messages(self, limit=None, include_system=True):
+        msgs = self._effective_messages()
+        if not include_system: msgs = [m for m in msgs if m.role != "system"]
+        return [{"role": m.role, "content": m.content, **({"tool_calls": m.metadata["tool_calls"]} if m.metadata.get("tool_calls") else {}), **({"tool_call_id": m.metadata["tool_call_id"], "name": m.metadata.get("name")} if m.role == "tool" else {})} for m in (msgs[-limit:] if limit else msgs)]
 
-    def _effective_messages(self) -> List[ContextMessage]:
-        """Messages that are currently 'live' for the LLM"""
-        if len(self.messages) <= self.recent_messages:
-            return list(self.messages)
-        # Always include system/pinned + recent messages
-        pinned = [m for m in self.messages if m.pinned or m.role == "system"]
-        recent = self.messages[-self.recent_messages:]
-        seen = set()
-        combined = []
-        for m in pinned + recent:
-            key = (m.timestamp, m.role, m.content[:32])
-            if key in seen:
-                continue
-            seen.add(key)
-            combined.append(m)
-        combined.sort(key=lambda m: m.timestamp)
-        return combined
+    def total_tokens(self): return sum(m.tokens for m in self.messages) + sum(t.tokens for t in self.tool_outputs)
+    def usage_pct(self): return min(1.0, self.total_tokens() / self.max_tokens) if self.max_tokens > 0 else 0.0
+    async def needs_compaction(self): return self.usage_pct() >= self.compaction_threshold
 
-    # ------------------------------------------------------------------
-    # TOKEN ACCOUNTING
-    # ------------------------------------------------------------------
-
-    def total_tokens(self) -> int:
-        msg_tokens = sum(m.tokens for m in self.messages)
-        tool_tokens = sum(t.tokens for t in self.tool_outputs)
-        return msg_tokens + tool_tokens
-
-    def usage_pct(self) -> float:
-        if self.max_tokens <= 0:
-            return 0.0
-        return min(1.0, self.total_tokens() / self.max_tokens)
-
-    def _estimate_tokens(self, text: str) -> int:
-        """Accurate token estimate via tiktoken if available (OpenCode parity), else ~4 chars."""
-        if not text:
-            return 0
-        try:
-            from agent.llm.rate_limiter import TokenCounter
-            # Use default encoding; if model known, use it
-            model = getattr(self.llm, 'get_current_model', lambda: 'default')() if self.llm and hasattr(self.llm, 'get_current_model') else 'default'
-            return TokenCounter.count_tokens(text, model or 'default')
-        except Exception:
-            return max(1, len(text) // 4)
-
-    # ------------------------------------------------------------------
-    # COMPACTION
-    # ------------------------------------------------------------------
-
-    async def needs_compaction(self) -> bool:
-        return self.usage_pct() >= self.compaction_threshold
-
-    async def compact(self, aggressive: bool = False) -> Dict[str, Any]:
-        """
-        Compact the context by summarizing older messages.
-
-        Called automatically from the agent loop when needs_compaction()
-        returns True, or manually via /compact.
-        """
+    async def compact(self, aggressive=False):
+        from agent.context.runtime import normalize_messages
         async with self._lock:
-            before_tokens = self.total_tokens()
-            if before_tokens == 0:
-                return {"compacted": False, "reason": "empty context"}
-
-            target_ratio = 0.35 if aggressive else self.compaction_target
-            target_tokens = int(self.max_tokens * target_ratio)
-
-            result = await self.compactor.compact(
-                messages=self.messages,
-                tool_outputs=list(self.tool_outputs),
-                target_tokens=target_tokens,
-                current_tokens=before_tokens,
-            )
-
-            if not result.get("compacted", False):
-                return result
-
-            # Replace messages with the compacted set
+            normalize_messages(self)
+            before = self.total_tokens()
+            if not before: return {"compacted": False, "reason": "empty context"}
+            target = int(self.max_tokens * (0.35 if aggressive else self.compaction_target))
+            result = await self.compactor.compact(messages=self.messages, tool_outputs=list(self.tool_outputs), target_tokens=target, current_tokens=before)
+            if not result.get("compacted"): return result
             self.messages = result["messages"]
-            # Trim tool outputs
-            keep = max(1, self.recent_tool_outputs)
-            while len(self.tool_outputs) > keep:
-                self.tool_outputs.popleft()
+            normalize_messages(self)
+            while len(self.tool_outputs) > max(1, self.recent_tool_outputs): self.tool_outputs.popleft()
+            self._last_compaction, self._compaction_count = time.time(), self._compaction_count + 1
+            return {"compacted": True, "before_tokens": before, "after_tokens": self.total_tokens(), "saved_tokens": before-self.total_tokens(), "messages_kept": len(self.messages), "summaries_created": result.get("summaries_created", 0)}
 
-            self._last_compaction = time.time()
-            self._compaction_count += 1
-
-            after_tokens = self.total_tokens()
-            logger.info(
-                f"Context compacted: {before_tokens} → {after_tokens} tokens "
-                f"({len(self.messages)} messages remain)"
-            )
-
-            return {
-                "compacted": True,
-                "before_tokens": before_tokens,
-                "after_tokens": after_tokens,
-                "saved_tokens": before_tokens - after_tokens,
-                "messages_kept": len(self.messages),
-                "summaries_created": result.get("summaries_created", 0),
-            }
-
-    async def compact_if_needed(self) -> Optional[Dict[str, Any]]:
-        if await self.needs_compaction():
-            return await self.compact()
-        return None
-
-    # ------------------------------------------------------------------
-    # CLEARING
-    # ------------------------------------------------------------------
-
-    async def clear(self, keep_system: bool = True) -> None:
-        """Clear the conversation context"""
+    async def compact_if_needed(self): return await self.compact() if await self.needs_compaction() else None
+    async def clear(self, keep_system=True):
         async with self._lock:
-            if keep_system:
-                self.messages = [m for m in self.messages if m.role == "system"]
-            else:
-                self.messages = []
-            self.tool_outputs.clear()
-            await self.file_context.clear()
-        logger.info("Context cleared")
-
-    # ------------------------------------------------------------------
-    # STATS / SERIALIZATION
-    # ------------------------------------------------------------------
-
-    async def get_stats(self) -> Dict[str, Any]:
-        stats = ContextStats(
-            total_tokens=self.total_tokens(),
-            max_tokens=self.max_tokens,
-            usage_pct=self.usage_pct(),
-            message_count=len(self.messages),
-            tool_output_count=len(self.tool_outputs),
-            file_count=await self.file_context.count(),
-            last_compaction=self._last_compaction,
-            compaction_count=self._compaction_count,
-        )
-        return stats.__dict__
-
-    def to_dict(self) -> Dict[str, Any]:
-        return {
-            "messages": [
-                {
-                    "role": m.role,
-                    "content": m.content,
-                    "tokens": m.tokens,
-                    "timestamp": m.timestamp,
-                    "pinned": m.pinned,
-                    "metadata": m.metadata,
-                }
-                for m in self.messages
-            ],
-            "tool_outputs": [
-                {
-                    "tool": t.tool,
-                    "params": t.params,
-                    "result": t.result,
-                    "success": t.success,
-                    "timestamp": t.timestamp,
-                }
-                for t in self.tool_outputs
-            ],
-            "stats": {
-                "total_tokens": self.total_tokens(),
-                "usage_pct": self.usage_pct(),
-                "compaction_count": self._compaction_count,
-                "last_compaction": self._last_compaction,
-            },
-        }
-
-    def from_dict(self, data: Dict[str, Any]) -> None:
-        self.messages = [
-            ContextMessage(
-                role=m["role"],
-                content=m["content"],
-                tokens=m.get("tokens", 0),
-                timestamp=m.get("timestamp", time.time()),
-                pinned=m.get("pinned", False),
-                metadata=m.get("metadata", {}),
-            )
-            for m in data.get("messages", [])
-        ]
-        self.tool_outputs.clear()
-        for t in data.get("tool_outputs", []):
-            self.tool_outputs.append(ToolOutput(
-                tool=t["tool"],
-                params=t.get("params", {}),
-                result=t.get("result"),
-                success=t.get("success", True),
-                timestamp=t.get("timestamp", time.time()),
-            ))
+            self.messages = [m for m in self.messages if m.role == "system"] if keep_system else []
+            self.tool_outputs.clear(); await self.file_context.clear()
+    async def get_stats(self):
+        return ContextStats(self.total_tokens(), self.max_tokens, self.usage_pct(), len(self.messages), len(self.tool_outputs), await self.file_context.count(), self._last_compaction, self._compaction_count).__dict__
+    def to_dict(self):
+        return {"messages": [m.__dict__ for m in self.messages], "tool_outputs": [t.__dict__ for t in self.tool_outputs], "compaction_count": self._compaction_count, "last_compaction": self._last_compaction}
