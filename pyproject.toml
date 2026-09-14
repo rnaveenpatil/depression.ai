@@ -45,7 +45,7 @@ dev = [
 [project.scripts]
 depression = "agent.main:main"
 depression_ai = "agent.main:main"
-depression-tui = "agent.tui.run:main"
+depression-tui = "agent.tui.terminal_app:main"
 
 [project.urls]
 Homepage = "https://github.com/rnaveenpatil/depression.ai"
