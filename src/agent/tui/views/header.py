@@ -1,17 +1,15 @@
 """
-Header Bar View
+Depression.AI futuristic hero header.
 
-Displays:
-- Logo/title with gradient text
-- Current mode indicator (Plan/Build/Auto)
-- Model name
-- Session ID
-- Time
+The header is intentionally more like a small web-app hero than a
+traditional terminal banner: large product branding, an animated angel
+mascot, mode/model context, and a restrained glass/neon visual language.
 """
 
 from __future__ import annotations
 
 from datetime import datetime
+from typing import Optional
 
 from textual.app import ComposeResult
 from textual.widget import Widget
@@ -19,64 +17,85 @@ from textual.widgets import Static
 from textual.reactive import reactive
 
 
-# Inline colors (matching ULTIMATE_CSS)
-PANEL = "#12121e"
-BORDER = "#283250"
-CYBER_BLUE = "#00c8ff"
-TEXT_MUTED = "#8c8ca0"
-TEXT_DIM = "#505064"
+# Futuristic dark-glass palette. Kept local to this component so the hero is
+# visually distinctive without changing the public TUI API.
+BG = "#070711"
+PANEL = "#10101d"
+PANEL_2 = "#151528"
+BORDER = "#292947"
+TEXT = "#f4f2ff"
+MUTED = "#9290aa"
+DIM = "#55536d"
+CYAN = "#62ddff"
+VIOLET = "#b78cff"
+PINK = "#ff86d5"
+GREEN = "#6fffc0"
 
 
 class HeaderBar(Widget):
-    """The top header bar."""
+    """Large animated Depression.AI hero/header.
+
+    Public methods are compatible with the previous HeaderBar so the rest of
+    the TUI does not need to know about the visual redesign.
+    """
 
     DEFAULT_CSS = f"""
     HeaderBar {{
-        height: 3;
-        background: {PANEL};
+        height: 10;
+        min-height: 8;
+        background: {BG};
         dock: top;
-        layout: horizontal;
-        padding: 0 1;
+        layout: vertical;
+        border-bottom: solid {BORDER};
+        padding: 0 2;
     }}
 
-    #header-logo {{
-        width: auto;
-        content-align: left middle;
-        color: {CYBER_BLUE};
-        text-style: bold;
-    }}
-
-    #header-separator {{
-        width: 1;
-        color: {BORDER};
-        content-align: center middle;
-    }}
-
-    #header-mode {{
-        width: auto;
-        content-align: center middle;
-        text-style: bold;
-        padding: 0 1;
-    }}
-
-    #header-model {{
+    #hero-stage {{
+        height: 7;
         width: 1fr;
+        background: {PANEL};
+        border: round {BORDER};
+        layout: horizontal;
+        padding: 0 2;
+    }}
+
+    #angel {{
+        width: 15;
+        height: 7;
+        color: {VIOLET};
         content-align: center middle;
-        color: {TEXT_MUTED};
+        text-style: bold;
     }}
 
-    #header-session {{
-        width: auto;
-        content-align: right middle;
-        color: {TEXT_DIM};
+    #hero-brand {{
+        width: 1fr;
+        height: 7;
+        content-align: center middle;
+        color: {TEXT};
+        text-style: bold;
     }}
 
-    #header-time {{
-        width: auto;
-        content-align: right middle;
-        color: {TEXT_DIM};
-        padding: 0 0 0 1;
+    #hero-context {{
+        width: 26;
+        height: 7;
+        content-align: center middle;
+        color: {MUTED};
+        border-left: solid {BORDER};
+        padding: 0 1;
     }}
+
+    #hero-meta {{
+        height: 2;
+        width: 1fr;
+        layout: horizontal;
+        padding: 0 2;
+        color: {DIM};
+    }}
+
+    #header-mode {{ width: 18; color: {GREEN}; text-style: bold; content-align: left middle; }}
+    #header-model {{ width: 1fr; color: {MUTED}; content-align: center middle; }}
+    #header-session {{ width: 24; color: {DIM}; content-align: right middle; }}
+    #header-time {{ width: 8; color: {DIM}; content-align: right middle; }}
     """
 
     mode = reactive[str]("build")
@@ -84,9 +103,9 @@ class HeaderBar(Widget):
     session_id = reactive[str]("—")
 
     MODE_COLORS = {
-        "plan": "#00ffff",
-        "build": "#00ff80",
-        "auto": "#b464ff",
+        "plan": CYAN,
+        "build": GREEN,
+        "auto": VIOLET,
     }
 
     MODE_ICONS = {
@@ -95,67 +114,83 @@ class HeaderBar(Widget):
         "auto": "⟡",
     }
 
+    # The mascot is deliberately pure Unicode/ASCII so it works offline and
+    # does not require an image protocol, sixel, kitty graphics, or assets.
+    ANGEL_FRAMES = (
+        "   ✦   \n  ╱│╲  \n ✧(◡)✧ \n  ╲│╱  \n   ♡   ",
+        "  ✧ ✧  \n   ╲│╱  \n ✦(◡)✦ \n   ╱│╲  \n    ♡   ",
+        "   ✦   \n  ╲│╱  \n ✧(◡)✧ \n  ╱│╲  \n   ♡   ",
+        "  ✧ ✧  \n   ╱│╲  \n ✦(◡)✦ \n   ╲│╱  \n    ♡   ",
+    )
+
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        self._start_time = datetime.now()
+        self._angel_index = 0
+        self._timer = None
 
     def compose(self) -> ComposeResult:
-        yield Static(
-            " ◆ DEPRESSION.AI ",
-            id="header-logo",
+        with Widget(id="hero-stage"):
+            yield Static(self.ANGEL_FRAMES[0], id="angel")
+            yield Static(self._brand_art(), id="hero-brand")
+            yield Static(self._context_text(), id="hero-context")
+
+        with Widget(id="hero-meta"):
+            yield Static(self._mode_display(), id="header-mode")
+            yield Static(self.model, id="header-model")
+            yield Static(f"ses:{self.session_id[:8]}", id="header-session")
+            yield Static(datetime.now().strftime("%H:%M"), id="header-time")
+
+    def on_mount(self) -> None:
+        self._timer = self.set_interval(0.55, self._animate_angel)
+
+    def _animate_angel(self) -> None:
+        self._angel_index = (self._angel_index + 1) % len(self.ANGEL_FRAMES)
+        try:
+            self.query_one("#angel", Static).update(self.ANGEL_FRAMES[self._angel_index])
+        except Exception:
+            pass
+
+    def _brand_art(self) -> str:
+        return (
+            "✦  D E P R E S S I O N . A I  ✦\n"
+            f"{MUTED}agentic intelligence • local + cloud • human controlled{TEXT}"
         )
-        yield Static("│", id="header-separator")
-        yield Static(
-            self._mode_display(),
-            id="header-mode",
-        )
-        yield Static(
-            self.model,
-            id="header-model",
-        )
-        yield Static(
-            f"ses:{self.session_id[:8]}",
-            id="header-session",
-        )
-        yield Static(
-            datetime.now().strftime("%H:%M"),
-            id="header-time",
-        )
+
+    def _context_text(self) -> str:
+        return "◌ ONLINE\n\nPLAN  →  BUILD\n\nVERIFY  →  DONE"
 
     def _mode_display(self) -> str:
         icon = self.MODE_ICONS.get(self.mode, "◆")
-        color = self.MODE_COLORS.get(self.mode, "#00c8ff")
-        return f" [{color}]{icon} {self.mode.upper()}[/]"
+        color = self.MODE_COLORS.get(self.mode, CYAN)
+        return f"[{color}]{icon} {self.mode.upper()}[/]"
 
     def set_mode(self, mode: str) -> None:
-        """Update the current mode."""
+        """Update the current execution mode."""
         self.mode = mode
         try:
-            self.query_one("#header-mode").update(self._mode_display())
+            self.query_one("#header-mode", Static).update(self._mode_display())
         except Exception:
             pass
 
     def set_model(self, model: str) -> None:
-        """Update the model name."""
+        """Update the active model name."""
         self.model = model
         try:
-            self.query_one("#header-model").update(model)
+            self.query_one("#header-model", Static).update(model)
         except Exception:
             pass
 
     def set_session(self, session_id: str) -> None:
-        """Update the session ID."""
+        """Update the current session id."""
         self.session_id = session_id
         try:
-            self.query_one("#header-session").update(f"ses:{session_id[:8]}")
+            self.query_one("#header-session", Static).update(f"ses:{session_id[:8]}")
         except Exception:
             pass
 
     def update_time(self) -> None:
-        """Update the clock."""
+        """Refresh the clock."""
         try:
-            self.query_one("#header-time").update(
-                datetime.now().strftime("%H:%M")
-            )
+            self.query_one("#header-time", Static).update(datetime.now().strftime("%H:%M"))
         except Exception:
             pass
