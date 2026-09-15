@@ -1,7 +1,7 @@
-"""TUI entry point for Depression.AI."""
+"""Fully bootstrapped Textual entry point."""
 from __future__ import annotations
 
-import argparse
+import asyncio
 import sys
 from pathlib import Path
 
@@ -11,21 +11,25 @@ if str(_REPO_ROOT / "src") not in sys.path:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(
-        prog="depression-tui",
-        description="Depression.AI — terminal agentic workspace",
-    )
-    parser.add_argument("-p", "--project", help="Project directory")
-    parser.add_argument("-m", "--model",   help="Override model")
-    parser.add_argument("--provider",      help="Override provider")
-    parser.add_argument("--yolo",   action="store_true", help="Auto-approve tools")
-    parser.add_argument("--session",       help="Resume session ID")
-    parser.add_argument("--no-sidebar", action="store_true", help="Compatibility")
-    args = parser.parse_args()
+    from agent.main import CLIAgent
 
-    from agent.tui.app import DepressionApp
+    cli = CLIAgent()
+    args = cli.parse_arguments()
+    # TUI owns presentation; suppress the legacy Rich CLI banner/output.
+    args.non_interactive = True
+    args.query = None
+    args.quiet = True
 
-    DepressionApp().run()
+    async def boot() -> None:
+        await cli.initialize(args)
+        from agent.tui.app import DepressionApp
+        app = DepressionApp(coordinator=cli.agent_coordinator)
+        try:
+            await app.run_async()
+        finally:
+            await cli.shutdown()
+
+    asyncio.run(boot())
 
 
 if __name__ == "__main__":
