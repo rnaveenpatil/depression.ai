@@ -12,13 +12,20 @@ if str(_REPO_ROOT / "src") not in sys.path:
 
 def main() -> None:
     from agent.main import CLIAgent
+    from agent.llm.provider import get_llm_registry
+    from agent.llm.runtime import load_runtime_config, configure_runtime_provider
 
     cli = CLIAgent()
     args = cli.parse_arguments()
-    # TUI owns presentation; suppress the legacy Rich CLI banner/output.
     args.non_interactive = True
     args.query = None
     args.quiet = True
+
+    # Configure the persisted TUI endpoint before Plan/Build are constructed.
+    runtime = load_runtime_config()
+    if all(runtime.values()):
+        configure_runtime_provider(get_llm_registry(), runtime["base_url"],
+                                   runtime["api_key"], runtime["model"])
 
     async def boot() -> None:
         await cli.initialize(args)
