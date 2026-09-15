@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import os
 from pathlib import Path
 from typing import List, Optional, Tuple
@@ -15,6 +14,17 @@ from textual.reactive import reactive
 from textual.theme import Theme
 from textual.widgets import Static, Input, Markdown, Button, Select
 from textual import on, work
+
+from agent.utils.env_manager import (
+    load_env_file,
+    write_env_file,
+    set_provider_credentials,
+    get_provider_credentials,
+    set_aws_credentials,
+    get_aws_credentials,
+    set_selected_model,
+    get_selected_model,
+)
 
 
 # ── Matrix green palette ──────────────────────────────────────────────────
@@ -87,62 +97,64 @@ AWS_REGIONS = [
 ]
 
 
-# ── Config: LLM ───────────────────────────────────────────────────────────
-def _config_dir() -> Path:
-    base = (Path(os.environ.get("APPDATA", Path.home() / "AppData" / "Roaming"))
-            if os.name == "nt"
-            else Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")))
-    d = base / "depression"
-    d.mkdir(parents=True, exist_ok=True)
-    return d
-
-
-def _llm_path() -> Path:
-    return _config_dir() / "llm.json"
-
-
-def _aws_path() -> Path:
-    return _config_dir() / "aws.json"
-
-
-def _read_json(p: Path, default: dict) -> dict:
-    try:
-        with p.open("r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return default
-
-
-def _write_json(p: Path, data: dict) -> None:
-    tmp = p.with_suffix(".tmp")
-    try:
-        with tmp.open("w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2)
-        os.replace(tmp, p)
-        try:
-            p.chmod(0o600)
-        except OSError:
-            pass
-    except Exception:
-        pass
-
-
+# ── Config: LLM (uses .env file) ──────────────────────────────────────────
 def load_config() -> dict:
-    return _read_json(_llm_path(),
-                      {"provider": "", "model": "", "base_url": "", "api_key": ""})
+    """Load LLM config from .env file."""
+    env_vars = load_env_file()
+    selected_model = get_selected_model() or ""
+    provider, model = "", ""
+    if selected_model and "/" in selected_model:
+        provider, model = selected_model.split("/", 1)
+    return {
+        "provider": provider or env_vars.get("DEPRESSION_PROVIDER", ""),
+        "model": model or env_vars.get("DEPRESSION_MODEL", ""),
+        "base_url": env_vars.get("DEPRESSION_BASE_URL", ""),
+        "api_key": env_vars.get("DEPRESSION_API_KEY", ""),
+    }
 
 
 def save_config(cfg: dict) -> None:
-    _write_json(_llm_path(), cfg)
+    """Save LLM config to .env file."""
+    provider = cfg.get("provider", "")
+    model = cfg.get("model", "")
+    base_url = cfg.get("base_url", "")
+    api_key = cfg.get("api_key", "")
+    
+    if provider and model:
+        set_selected_model(f"{provider}/{model}")
+    
+    if provider:
+        set_provider_credentials(provider, api_key=api_key, base_url=base_url)
+    
+    env_vars = load_env_file()
+    if provider:
+        env_vars["DEPRESSION_PROVIDER"] = provider
+    if model:
+        env_vars["DEPRESSION_MODEL"] = model
+    if base_url:
+        env_vars["DEPRESSION_BASE_URL"] = base_url
+    if api_key:
+        env_vars["DEPRESSION_API_KEY"] = api_key
+    write_env_file(env_vars)
 
 
 def load_aws() -> dict:
-    return _read_json(_aws_path(),
-                      {"access_key": "", "secret_key": "", "region": "us-east-1"})
+    """Load AWS config from .env file."""
+    creds = get_aws_credentials()
+    return {
+        "access_key": creds.get("access_key", ""),
+        "secret_key": creds.get("secret_key", ""),
+        "region": creds.get("region", "us-east-1"),
+    }
 
 
 def save_aws(cfg: dict) -> None:
-    _write_json(_aws_path(), cfg)
+    """Save AWS config to .env file."""
+    set_aws_credentials(
+        access_key=cfg.get("access_key"),
+        secret_key=cfg.get("secret_key"),
+        region=cfg.get("region", "us-east-1"),
+    )
 
 
 # ── Sidebar panels ────────────────────────────────────────────────────────
@@ -284,13 +296,18 @@ class LLMConnectPanel(Static):
         })
         save_config(self._app.cfg)
 
+        # Update LLM registry with the new credentials
         try:
             from agent.llm.provider import get_llm_registry
             reg = get_llm_registry()
             reg.set_api_key(self._app.selected_provider.lower(), key)
             reg.set_model(self._app.selected_model)
-        except Exception:
-            pass
+            # Also set base URL if the provider supports it
+            if hasattr(reg.providers.get(self._app.selected_provider.lower()), 'base_url'):
+                reg.providers[self._app.selected_provider.lower()].base_url = url
+        except Exception as e:
+            self._app._show_error(f"Failed to update LLM registry: {e}")
+            return
 
         self._app._refresh_mode_chip()
         self._app._show_system(f"connected · {self._app.selected_provider} · {self._app.selected_model}")
