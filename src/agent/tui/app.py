@@ -1,211 +1,914 @@
-"""Depression.AI polished terminal workspace."""
+"""depression.ai — matrix green terminal agent with LLM + AWS connect panels."""
 from __future__ import annotations
+
 import asyncio
-from datetime import datetime
-from typing import Any, Dict, List, Optional
+import json
+import os
+from pathlib import Path
+from typing import List, Optional, Tuple
+
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.widgets import Static, Input, ListView, ListItem, Label, Button
-from textual.screen import ModalScreen
+from textual.containers import Horizontal, Vertical, VerticalScroll
+from textual.events import Click
 from textual.reactive import reactive
+from textual.theme import Theme
+from textual.widgets import Static, Input, Markdown, Button, Select
 from textual import on, work
-from textual.containers import Container, Horizontal, Vertical
-from textual.widget import Widget
-from agent.tui.theme import OPENCODE_CSS, apply_opencode_theme
-from agent.tui.views.header import HeaderBar
-from agent.tui.views.status_bar import StatusBar
-from agent.tui.views.sidebar import Sidebar
-from agent.tui.views.chat import ChatView
-from agent.tui.llm_providers import LLMModel, get_llm_config, PROVIDER_MODELS
 
-class CommandPalette(ModalScreen[str]):
-    DEFAULT_CSS = """
-    CommandPalette { align: center middle; background: #000000 55%; }
-    #palette-container { width: 64; max-width: 85%; height: auto; max-height: 24; background: $bg-panel; border: round $border-focused; }
-    #palette-input { height: 3; background: $input-bg; border: none; border-bottom: solid $border; padding: 0 1; }
-    #palette-list { height: auto; max-height: 18; }
-    .palette-item { height: 2; padding: 0 2; color: $text; }
-    .palette-item:hover { background: $bg-hover; color: $secondary; }
-    .shortcut { color: $text-dim; }
-    """
-    COMMANDS = [("/help","Show help","?"),("/model","Switch model","m"),("/llm","LLM provider panel","l"),("/plan","Switch to Plan mode","1"),("/build","Switch to Build mode","2"),("/auto","Switch to Auto mode","3"),("/session","Manage sessions","s"),("/sessions","List all sessions",""),("/clear","Clear chat","Ctrl+L"),("/tools","List tools","t"),("/config","Show config",""),("/status","Show status",""),("/context","Show context",""),("/compact","Compact context",""),("/export","Export session",""),("/quit","Exit","Ctrl+D")]
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs); self.filtered_commands=list(self.COMMANDS)
-    def compose(self):
-        with Widget(id="palette-container"):
-            yield Input(placeholder="Command...", id="palette-input")
-            with ListView(id="palette-list"):
-                for c,d,s in self.filtered_commands: yield ListItem(Label(f"{c}  {d}"), Label(s, classes="shortcut"))
-    @on(Input.Changed, "#palette-input")
-    def _changed(self,event):
-        q=event.value.lower(); self.filtered_commands=[x for x in self.COMMANDS if q in x[0].lower() or q in x[1].lower()]
-        v=self.query_one("#palette-list",ListView); v.clear()
-        for c,d,s in self.filtered_commands: v.append(ListItem(Label(f"{c}  {d}"),Label(s,classes="shortcut")))
-    @on(ListView.Selected,"#palette-list")
-    def _selected(self,event):
-        if 0<=event.index<len(self.filtered_commands): self.dismiss(self.filtered_commands[event.index][0])
-    @on(Input.Submitted,"#palette-input")
-    def _submitted(self,event):
-        if self.filtered_commands: self.dismiss(self.filtered_commands[0][0])
-    def on_key(self,event):
-        if event.key=="escape": self.dismiss(None)
 
-class HelpScreen(ModalScreen[str]):
-    DEFAULT_CSS="""
-    HelpScreen { align:center middle; background:#000000 55%; }
-    #help-container { width:70; height:auto; max-height:30; background:$bg-panel; border:round $border-focused; padding:1 2; }
-    .help-title { text-style:bold; color:$primary; height:1; }
-    .help-section { color:$secondary; text-style:bold; height:1; margin:1 0 0 0; }
-    .help-row { height:1; color:$text; }
-    """
-    def compose(self):
-        with Widget(id="help-container"):
-            yield Static("DEPRESSION.AI  ·  KEYBOARD",classes="help-title")
-            yield Static("Navigation",classes="help-section")
-            yield Static("[help-key]Tab[/] switch mode    [help-key]Ctrl+P[/] command palette    [help-key]F2[/] sidebar",classes="help-row")
-            yield Static("Input",classes="help-section")
-            yield Static("[help-key]Enter[/] send    [help-key]Shift+Enter[/] newline    [help-key]Ctrl+C[/] cancel    [help-key]Ctrl+D[/] exit",classes="help-row")
-            yield Static("Commands",classes="help-section")
-            yield Static("/llm  /model  /plan  /build  /auto  /session  /tools  /context  /compact  /clear",classes="help-row")
-    def on_key(self,event): self.dismiss(None)
+# ── Matrix green palette ──────────────────────────────────────────────────
+GREEN       = "#00ff66"
+GREEN_DIM   = "#00aa44"
+GREEN_FAINT = "#005522"
+GREEN_GLOW  = "#88ffbb"
+AMBER       = "#ffcc44"
+ERROR       = "#ff4466"
+TEXT        = "#aaffcc"
+MUTED       = "#3d8c5c"
+DIM         = "#1a5c33"
+BG          = "#000000"
+PANEL       = "#031008"
+RAISED      = "#061a0f"
+BORDER      = "#0a3d20"
 
-class DepressionTUI(App):
-    TITLE="DEPRESSION.AI"; SUB_TITLE="Agentic Workspace"; CSS=OPENCODE_CSS
-    BINDINGS=[Binding("ctrl+p","command_palette","Command Palette",show=True),Binding("ctrl+l","clear_screen","Clear",show=True),Binding("ctrl+d","quit","Exit",show=True),Binding("ctrl+c","cancel","Cancel",show=True),Binding("tab","switch_mode","Switch Mode",show=True),Binding("f1","show_help","Help",show=True),Binding("f2","toggle_sidebar","Sidebar",show=True),Binding("escape","escape","Back",show=False)]
-    current_mode=reactive[str]("build"); agent_status=reactive[str]("idle"); model_name=reactive[str]("—"); tokens_used=reactive[int](0); cost=reactive[float](0.0); session_id=reactive[str]("—")
-    def __init__(self,agent_coordinator=None,config:dict=None,project_dir:str=None,model_override:str=None,provider_override:str=None,yolo:bool=False,no_sidebar:bool=False,session_id:str=None,**kwargs):
-        super().__init__(**kwargs); self.coordinator=agent_coordinator; self.config=config or {}; self.project_dir=project_dir; self.model_override=model_override; self.provider_override=provider_override; self.yolo=yolo; self.no_sidebar=no_sidebar; self.session_id_override=session_id; self.sidebar_visible=not no_sidebar; self._init_task=None
-    def compose(self):
-        yield HeaderBar(id="header")
-        with Widget(id="main-container"):
-            yield ChatView(id="chat-panel")
-            yield Sidebar(id="sidebar",on_llm_connect=self._on_llm_connect)
-        yield StatusBar(id="status-bar")
-    def on_mount(self):
-        apply_opencode_theme(self); self.title="DEPRESSION.AI"; self.sub_title=f"{self.current_mode.upper()}  /  WORKSPACE"; self._load_sidebar_data(); self.query_one("#sidebar",Sidebar).display=self.sidebar_visible
-        chat=self.query_one("#chat-panel",ChatView); chat.add_system("**DEPRESSION.AI**  ·  local + cloud agent\n\nType a task to begin.  **Tab** changes mode · **Ctrl+P** opens commands · **F2** toggles the workspace sidebar."); chat.add_divider()
-        self.query_one("#status-bar",StatusBar).update_all(status="idle",model=self.model_name,tokens=self.tokens_used,cost=self.cost)
-        self._init_task=self.run_worker(self._init_agent_async(),exclusive=True,group="agent-init",thread=True)
-        try:self.query_one("#chat-input",Input).focus()
-        except Exception:pass
-    def _load_sidebar_data(self):
-        sidebar=self.query_one("#sidebar",Sidebar); sidebar.set_sessions([{"id":"current","name":"Current Workspace","time":"now","active":True}]); sidebar.set_tools([{"name":n,"enabled":True} for n in ["terminal","filesystem","git","search","web","patch","browser","task","diagnostics"]]); selected=get_llm_config().get_selected_model_info()
-        if selected: self.model_name=f"{selected.provider}/{selected.short_name}"; self.query_one("#header",HeaderBar).set_model(self.model_name); self.query_one("#status-bar",StatusBar).set_model(self.model_name)
-    def _on_llm_connect(self,model:LLMModel):
-        cfg=get_llm_config(); self.model_name=f"{model.provider}/{model.short_name}"; self.query_one("#header",HeaderBar).set_model(self.model_name); self.query_one("#status-bar",StatusBar).set_model(self.model_name); cfg.selected_model=model.name
-        chat=self.query_one("#chat-panel",ChatView); chat.add_system(f"Configured **{model.display_name}** · `{cfg.get_base_url(model.provider)}` · key saved")
-        if self.coordinator:self._apply_llm_to_coordinator(model)
-    def _apply_llm_to_coordinator(self,model:LLMModel):
+
+THEME = Theme(
+    name="matrix",
+    primary=GREEN, secondary=GREEN_DIM, accent=GREEN_GLOW,
+    warning=AMBER, error=ERROR, success=GREEN,
+    surface=PANEL, panel=RAISED, boost="#0d2a17",
+    foreground=TEXT, background=BG, dark=True,
+)
+
+
+BANNER_LINES = [
+    "  ██████╗ ███████╗██████╗ ██████╗ ███████╗███████╗███████╗██╗ ██████╗ ███╗   ██╗",
+    "  ██╔══██╗██╔════╝██╔══██╗██╔══██╗██╔════╝██╔════╝██╔════╝██║██╔═══██╗████╗  ██║",
+    "  ██║  ██║█████╗  ██████╔╝██████╔╝█████╗  ███████╗███████╗██║██║   ██║██╔██╗ ██║",
+    "  ██║  ██║██╔══╝  ██╔═══╝ ██╔═══╝ ██╔══╝  ╚════██║╚════██║██║██║   ██║██║╚██╗██║",
+    "  ██████╔╝███████╗██║     ██║     ███████╗███████║███████║██║╚██████╔╝██║ ╚████║",
+    "  ╚═════╝ ╚══════╝╚═╝     ╚═╝     ╚══════╝╚══════╝╚══════╝╚═╝ ╚═════╝ ╚═╝  ╚═══╝",
+]
+
+
+SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+MODE_ICONS     = {"Build": "◆", "Plan": "◇", "Auto": "⟡"}
+MODE_ORDER     = ["Build", "Plan", "Auto"]
+
+
+PROVIDERS = [
+    ("NVIDIA",     "https://integrate.api.nvidia.com/v1",
+     ["Nemotron 3 Ultra 550B", "Nemotron 3 Super 120B",
+      "Nemotron 3.5 Lightning 30B", "Nemotron 3 Nano 30B"]),
+    ("DeepSeek",   "https://api.deepseek.com",
+     ["DeepSeek V4 Pro", "DeepSeek V4 Flash"]),
+    ("MiniMax",    "https://api.minimax.io/v1", ["MiniMax M2.5"]),
+    ("Mistral",    "https://api.mistral.ai/v1",
+     ["Mistral Medium 3.5", "Devstral"]),
+    ("Anthropic",  "https://api.anthropic.com",
+     ["Claude Sonnet", "Claude Opus"]),
+    ("Google",     "https://generativelanguage.googleapis.com/v1beta/openai",
+     ["Gemini Flash", "Gemini Pro"]),
+    ("OpenAI",     "https://api.openai.com/v1", ["GPT-5.x"]),
+    ("Groq",       "https://api.groq.com/openai/v1",
+     ["GPT-OSS 120B", "GPT-OSS 20B"]),
+    ("Moonshot",   "https://api.moonshot.ai/v1",
+     ["Kimi K2.x", "Kimi K3"]),
+    ("Z.AI",       "https://api.z.ai/api/paas/v4", ["GLM-5.x"]),
+    ("OpenRouter", "https://openrouter.ai/api/v1", ["OpenRouter Coding"]),
+]
+
+AWS_REGIONS = [
+    "us-east-1", "us-east-2", "us-west-1", "us-west-2",
+    "eu-west-1", "eu-west-2", "eu-central-1",
+    "ap-south-1", "ap-southeast-1", "ap-southeast-2",
+    "ap-northeast-1", "sa-east-1", "ca-central-1",
+]
+
+
+# ── Config: LLM ───────────────────────────────────────────────────────────
+def _config_dir() -> Path:
+    base = (Path(os.environ.get("APPDATA", Path.home() / "AppData" / "Roaming"))
+            if os.name == "nt"
+            else Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")))
+    d = base / "depression"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _llm_path() -> Path:
+    return _config_dir() / "llm.json"
+
+
+def _aws_path() -> Path:
+    return _config_dir() / "aws.json"
+
+
+def _read_json(p: Path, default: dict) -> dict:
+    try:
+        with p.open("r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return default
+
+
+def _write_json(p: Path, data: dict) -> None:
+    tmp = p.with_suffix(".tmp")
+    try:
+        with tmp.open("w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+        os.replace(tmp, p)
         try:
-            cfg=get_llm_config(); key=cfg.get_api_key(model.provider); url=cfg.get_base_url(model.provider)
-            for agent in [self.coordinator.plan_agent,self.coordinator.build_agent]:
-                llm=getattr(agent,"llm",None)
-                if llm:
-                    if hasattr(llm,"api_key"):llm.api_key=key
-                    if hasattr(llm,"base_url"):llm.base_url=url
-                    if hasattr(llm,"model"):llm.model=model.name
-            try:
-                from agent.llm.provider import get_llm_registry
-                registry=get_llm_registry(); registry.set_api_key(model.provider,key)
-                for provider in getattr(registry,"providers",{}).values():
-                    if getattr(provider,"name","")==model.provider or getattr(provider,"name","")=="base":
-                        provider.base_url=url
-                registry.set_model(model.name)
-            except Exception: pass
-            self.query_one("#chat-panel",ChatView).add_system(f"Runtime model set to **{model.display_name}**")
-        except Exception as e:self.query_one("#chat-panel",ChatView).add_error(f"Failed to update agent: {e}")
-    async def action_command_palette(self):
-        result=await self.push_screen_wait(CommandPalette());
-        if result:await self._execute_command(result)
-    async def action_show_help(self):await self.push_screen_wait(HelpScreen())
-    def action_clear_screen(self):self.query_one("#chat-panel",ChatView).clear_messages()
-    def action_cancel(self):
-        if self.agent_status in ("thinking","acting"):self.agent_status="idle"; self.query_one("#status-bar",StatusBar).set_status("idle")
-    def action_switch_mode(self):
-        modes=["plan","build","auto"]; self.current_mode=modes[(modes.index(self.current_mode)+1)%3] if self.current_mode in modes else "build"; 
-        if self.coordinator:self.coordinator.set_mode(self.current_mode)
-        self.query_one("#header",HeaderBar).set_mode(self.current_mode); self.sub_title=f"{self.current_mode.upper()}  /  WORKSPACE"; self.query_one("#chat-panel",ChatView).add_system(f"Switched to {self.current_mode.upper()} mode")
-    def action_toggle_sidebar(self):self.sidebar_visible=not self.sidebar_visible; self.query_one("#sidebar",Sidebar).display=self.sidebar_visible
-    def action_escape(self):self.query_one("#chat-panel",ChatView).clear_input()
-    async def _execute_command(self,command:str):
-        chat=self.query_one("#chat-panel",ChatView)
-        if command=="/quit":self.exit();return
-        if command=="/clear":chat.clear_messages();return
-        if command=="/help":await self.action_show_help();return
-        if command in ("/plan","/build","/auto"):self.current_mode=command[1:];self.query_one("#header",HeaderBar).set_mode(self.current_mode);chat.add_system(f"Switched to {self.current_mode.upper()} mode");return
-        if command in ("/model","/llm"):self.query_one("#sidebar",Sidebar).switch_to_llm();chat.add_system("LLM panel opened in the right sidebar.");return
-        if command=="/status":chat.add_system(f"Mode: {self.current_mode}\nModel: {self.model_name}\nTokens: {self.tokens_used:,}\nCost: ${self.cost:.4f}\nSession: {self.session_id[:8]}");return
-        if command=="/tools":chat.add_system("Tools shown in the right sidebar.");self.query_one("#sidebar",Sidebar).active_tab="tools";return
-        if command.startswith("/session"):chat.add_system("Session commands: /session new, /session list, /session load <id>, /session save");return
-        chat.add_error(f"Unknown command: {command}")
-    @on(Input.Submitted,"#chat-input")
-    def _on_input_submitted(self,event):self._send_message()
-    def _send_message(self):
-        chat=self.query_one("#chat-panel",ChatView); text=chat.get_input_text().strip()
-        if text:chat.add_message("user",text);chat.clear_input();self._process_message(text)
-    @work(exclusive=True,group="message-processor")
-    async def _process_message(self,text:str):
-        status=self.query_one("#status-bar",StatusBar);chat=self.query_one("#chat-panel",ChatView);self.agent_status="thinking";status.set_status("thinking")
+            p.chmod(0o600)
+        except OSError:
+            pass
+    except Exception:
+        pass
+
+
+def load_config() -> dict:
+    return _read_json(_llm_path(),
+                      {"provider": "", "model": "", "base_url": "", "api_key": ""})
+
+
+def save_config(cfg: dict) -> None:
+    _write_json(_llm_path(), cfg)
+
+
+def load_aws() -> dict:
+    return _read_json(_aws_path(),
+                      {"access_key": "", "secret_key": "", "region": "us-east-1"})
+
+
+def save_aws(cfg: dict) -> None:
+    _write_json(_aws_path(), cfg)
+
+
+# ── Sidebar panels ────────────────────────────────────────────────────────
+class LLMConnectPanel(Static):
+    """Panel: paste base URL + API key for the selected model."""
+
+    DEFAULT_CSS = f"""
+    LLMConnectPanel {{
+        width: 100%; height: auto;
+        padding: 1 1;
+        background: {BG};
+    }}
+    .panel-title {{
+        height: 1; color: {GREEN}; text-style: bold;
+        margin: 0 0 1 0;
+    }}
+    .panel-label {{
+        height: 1; color: {MUTED}; text-style: bold;
+        margin: 1 0 0 0;
+    }}
+    .panel-value {{
+        height: 1; color: {GREEN_GLOW};
+    }}
+    .panel-input {{
+        height: 3; width: 100%;
+        background: {PANEL};
+        border: round {BORDER};
+        color: {TEXT};
+        padding: 0 1;
+    }}
+    .panel-input:focus {{ border: round {GREEN}; }}
+    .panel-btn {{
+        height: 3; width: 100%;
+        margin-top: 1;
+        background: transparent;
+        border: round {GREEN};
+        color: {GREEN};
+        text-style: bold;
+    }}
+    .panel-btn:hover, .panel-btn:focus {{
+        background: {RAISED}; color: {GREEN_GLOW};
+        border: round {GREEN_GLOW};
+    }}
+    .panel-status {{
+        height: 1; color: {MUTED};
+        margin-top: 1;
+    }}
+    .panel-hint {{
+        height: auto; color: {DIM};
+        margin-top: 1;
+    }}
+    """
+
+    def __init__(self, app_ref, **kwargs):
+        super().__init__(**kwargs)
+        self._app = app_ref
+
+    def compose(self) -> ComposeResult:
+        yield Static("▌ CONNECT LLM", classes="panel-title")
+
+        yield Static("Provider / Model", classes="panel-label")
+        provider = self._app.selected_provider or "(pick from /models)"
+        model = self._app.selected_model or ""
+        yield Static(f"{provider}  {model}".strip(), classes="panel-value")
+
+        yield Static("Base URL", classes="panel-label")
+        yield Input(
+            value=self._app.cfg.get("base_url", ""),
+            placeholder="https://api.example.com/v1",
+            id="llm-base-url",
+            classes="panel-input",
+        )
+
+        yield Static("API Key", classes="panel-label")
+        yield Input(
+            value="••••••••" if self._app.cfg.get("api_key") else "",
+            password=True,
+            placeholder="paste your api key",
+            id="llm-api-key",
+            classes="panel-input",
+        )
+
+        yield Button("CONNECT  ↵", id="llm-connect-btn", classes="panel-btn")
+        yield Static(self._status_text(), id="llm-status",
+                     classes="panel-status")
+        yield Static("Press Enter in the API key field to connect.\n"
+                     "Config saved to ~/.config/depression/llm.json",
+                     classes="panel-hint")
+
+    def _status_text(self) -> str:
+        if self._app.cfg.get("api_key"):
+            return f"[{GREEN}]● connected · {self._app.cfg.get('provider','')}[/]"
+        return f"[{MUTED}]○ not connected[/]"
+
+    def refresh_values(self) -> None:
+        try:
+            self.query_one(".panel-value", Static).update(
+                f"{self._app.selected_provider}  {self._app.selected_model}".strip()
+                or "(pick from /models)"
+            )
+            self.query_one("#llm-base-url", Input).value = \
+                self._app.cfg.get("base_url", "")
+            self.query_one("#llm-api-key", Input).value = \
+                "••••••••" if self._app.cfg.get("api_key") else ""
+            self.query_one("#llm-status", Static).update(self._status_text())
+        except Exception:
+            pass
+
+    @on(Button.Pressed, "#llm-connect-btn")
+    def _btn(self) -> None:
+        self._submit()
+
+    @on(Input.Submitted, "#llm-api-key")
+    def _enter_key(self, event: Input.Submitted) -> None:
+        self._submit()
+
+    @on(Input.Submitted, "#llm-base-url")
+    def _enter_url(self, event: Input.Submitted) -> None:
+        try:
+            self.query_one("#llm-api-key", Input).focus()
+        except Exception:
+            pass
+
+    def _submit(self) -> None:
+        url = self.query_one("#llm-base-url", Input).value.strip().rstrip("/")
+        key_input = self.query_one("#llm-api-key", Input)
+        key = (self._app.cfg.get("api_key", "")
+               if key_input.value == "••••••••" else key_input.value.strip())
+
+        if not url or not key:
+            self._app._show_error("base URL and API key are required")
+            return
+
+        self._app.cfg.update({
+            "provider": self._app.selected_provider,
+            "model": self._app.selected_model,
+            "base_url": url,
+            "api_key": key,
+        })
+        save_config(self._app.cfg)
+
+        try:
+            from agent.llm.provider import get_llm_registry
+            reg = get_llm_registry()
+            reg.set_api_key(self._app.selected_provider.lower(), key)
+            reg.set_model(self._app.selected_model)
+        except Exception:
+            pass
+
+        self._app._refresh_mode_chip()
+        self._app._show_system(f"connected · {self._app.selected_provider} · {self._app.selected_model}")
+        self._app._show_system(f"base url · {url}")
+        self.refresh_values()
+
+
+class AWSConnectPanel(Static):
+    """Panel: AWS access key / secret / region dropdown."""
+
+    DEFAULT_CSS = f"""
+    AWSConnectPanel {{
+        width: 100%; height: auto;
+        padding: 1 1;
+        background: {BG};
+    }}
+    """
+
+    def __init__(self, app_ref, **kwargs):
+        super().__init__(**kwargs)
+        self._app = app_ref
+
+    def compose(self) -> ComposeResult:
+        yield Static("▌ AWS CREDENTIALS", classes="panel-title")
+
+        yield Static("Access Key ID", classes="panel-label")
+        yield Input(
+            value=self._app.aws.get("access_key", ""),
+            placeholder="AKIA…",
+            id="aws-access-key",
+            classes="panel-input",
+        )
+
+        yield Static("Secret Access Key", classes="panel-label")
+        yield Input(
+            value="••••••••••••" if self._app.aws.get("secret_key") else "",
+            password=True,
+            placeholder="paste your secret key",
+            id="aws-secret-key",
+            classes="panel-input",
+        )
+
+        yield Static("Region", classes="panel-label")
+        yield Select(
+            [(r, r) for r in AWS_REGIONS],
+            value=self._app.aws.get("region", "us-east-1"),
+            id="aws-region",
+            allow_blank=False,
+        )
+
+        yield Button("SAVE  ↵", id="aws-save-btn", classes="panel-btn")
+        yield Static(self._status_text(), id="aws-status",
+                     classes="panel-status")
+        yield Static("Saved to ~/.config/depression/aws.json",
+                     classes="panel-hint")
+
+    def _status_text(self) -> str:
+        if self._app.aws.get("access_key") and self._app.aws.get("secret_key"):
+            return f"[{GREEN}]● saved · {self._app.aws.get('region','us-east-1')}[/]"
+        return f"[{MUTED}]○ no credentials[/]"
+
+    def refresh_values(self) -> None:
+        try:
+            self.query_one("#aws-access-key", Input).value = \
+                self._app.aws.get("access_key", "")
+            self.query_one("#aws-secret-key", Input).value = \
+                "••••••••••••" if self._app.aws.get("secret_key") else ""
+            self.query_one("#aws-region", Select).value = \
+                self._app.aws.get("region", "us-east-1")
+            self.query_one("#aws-status", Static).update(self._status_text())
+        except Exception:
+            pass
+
+    @on(Button.Pressed, "#aws-save-btn")
+    def _btn(self) -> None:
+        self._submit()
+
+    @on(Input.Submitted, "#aws-secret-key")
+    def _enter_secret(self, event: Input.Submitted) -> None:
+        self._submit()
+
+    def _submit(self) -> None:
+        access = self.query_one("#aws-access-key", Input).value.strip()
+        secret_input = self.query_one("#aws-secret-key", Input)
+        secret = (self._app.aws.get("secret_key", "")
+                  if secret_input.value == "••••••••••••"
+                  else secret_input.value.strip())
+        region = self.query_one("#aws-region", Select).value or "us-east-1"
+
+        if not access or not secret:
+            self._app._show_error("AWS access key and secret are required")
+            return
+
+        self._app.aws.update({
+            "access_key": access,
+            "secret_key": secret,
+            "region": region,
+        })
+        save_aws(self._app.aws)
+
+        # Push into environment for boto3 to pick up automatically.
+        os.environ["AWS_ACCESS_KEY_ID"] = access
+        os.environ["AWS_SECRET_ACCESS_KEY"] = secret
+        os.environ["AWS_DEFAULT_REGION"] = region
+
+        self._app._show_system(f"AWS credentials saved · region {region}")
+        self.refresh_values()
+
+
+# ── Sidebar container ─────────────────────────────────────────────────────
+class Sidebar(Static):
+    """Right rail that swaps between panels."""
+
+    DEFAULT_CSS = f"""
+    Sidebar {{
+        width: 46; min-width: 40; height: 1fr;
+        background: {BG};
+        border-left: solid {BORDER};
+        layout: vertical;
+        padding: 0;
+    }}
+    #sidebar-title {{
+        height: 1; padding: 0 1;
+        background: {BG};
+        color: {GREEN};
+        text-style: bold;
+        border-bottom: solid {BORDER};
+    }}
+    #sidebar-tabs {{
+        height: 1; layout: horizontal;
+        background: {BG};
+        border-bottom: solid {BORDER};
+    }}
+    .side-tab {{
+        width: 1fr; height: 1;
+        background: transparent; border: none;
+        color: {DIM}; text-style: bold;
+    }}
+    .side-tab:hover {{ color: {MUTED}; }}
+    .side-tab.active {{ color: {GREEN}; }}
+    #sidebar-content {{
+        height: 1fr;
+        overflow-y: auto;
+        background: {BG};
+    }}
+    """
+
+    def __init__(self, app_ref, **kwargs):
+        super().__init__(**kwargs)
+        self._app = app_ref
+        self.active_tab = "llm"
+
+    def compose(self) -> ComposeResult:
+        yield Static("▌ SIDEBAR", id="sidebar-title")
+        with Horizontal(id="sidebar-tabs"):
+            yield Button("CONNECT", id="tab-llm", classes="side-tab active")
+            yield Button("AWS",     id="tab-aws", classes="side-tab")
+            yield Button("HELP",    id="tab-help", classes="side-tab")
+        with VerticalScroll(id="sidebar-content"):
+            yield LLMConnectPanel(self._app, id="panel-llm")
+            yield AWSConnectPanel(self._app, id="panel-aws")
+            yield HelpPanel(id="panel-help")
+
+    def on_mount(self) -> None:
+        self._show("llm")
+
+    @on(Button.Pressed, ".side-tab")
+    def _tab(self, event: Button.Pressed) -> None:
+        self._show(event.button.id.replace("tab-", ""))
+
+    def _show(self, tab: str) -> None:
+        self.active_tab = tab
+        for b in self.query(".side-tab"):
+            b.remove_class("active")
+        try:
+            self.query_one(f"#tab-{tab}", Button).add_class("active")
+        except Exception:
+            pass
+        content = self.query_one("#sidebar-content")
+        for child in content.children:
+            child.display = False
+        try:
+            self.query_one(f"#panel-{tab}").display = True
+        except Exception:
+            pass
+
+
+class HelpPanel(Static):
+    DEFAULT_CSS = f"""
+    HelpPanel {{
+        width: 100%; height: auto;
+        padding: 1 1;
+        background: {BG};
+    }}
+    .help-section {{
+        height: 1; color: {GREEN}; text-style: bold;
+        margin: 1 0 0 0;
+    }}
+    .help-row {{ height: 1; color: {TEXT}; }}
+    .help-key {{ color: {GREEN_GLOW}; }}
+    """
+
+    def compose(self) -> ComposeResult:
+        yield Static("▌ HELP", classes="panel-title")
+        yield Static("Commands", classes="help-section")
+        yield Static("/models   pick a model", classes="help-row")
+        yield Static("/connect  open LLM panel", classes="help-row")
+        yield Static("/aws      open AWS panel", classes="help-row")
+        yield Static("/clear    clear transcript", classes="help-row")
+        yield Static("/help     this panel", classes="help-row")
+        yield Static("/quit     exit", classes="help-row")
+        yield Static("Keys", classes="help-section")
+        yield Static("Tab       cycle mode", classes="help-row")
+        yield Static("Ctrl+P    model picker", classes="help-row")
+        yield Static("Ctrl+C    exit", classes="help-row")
+        yield Static("Ctrl+L    clear transcript", classes="help-row")
+
+
+# ── Model picker overlay ──────────────────────────────────────────────────
+class ModelPickerModal(Static):
+    DEFAULT_CSS = f"""
+    ModelPickerModal {{
+        display: none;
+        width: 100%; height: 100%;
+        background: {BG} 96%;
+        color: {TEXT};
+        padding: 2 4;
+        overflow-y: auto;
+        layer: overlay;
+    }}
+    ModelPickerModal.-open {{ display: block; }}
+    """
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self._flat: List[Tuple[str, str]] = []
+        self._lines: List[str] = []
+        self._row_line: List[int] = []
+        self._lines.append(f"[bold {GREEN}]  select a model[/]")
+        self._lines.append("")
+        for provider, _url, models in PROVIDERS:
+            self._lines.append(f"[bold {GREEN_DIM}]── {provider}[/]")
+            for m in models:
+                self._row_line.append(len(self._lines))
+                self._flat.append((provider, m))
+                self._lines.append(f"  [{TEXT}]{m}[/]")
+        self._lines.append("")
+        self._lines.append(f"[{DIM}]click a model  ·  esc to close[/]")
+
+    def render(self) -> str:
+        return "\n".join(self._lines)
+
+    def on_click(self, event: Click) -> None:
+        idx = event.y - 2
+        if idx in self._row_line:
+            i = self._row_line.index(idx)
+            provider, model = self._flat[i]
+            app = self.app
+            if hasattr(app, "_select_model"):
+                app._select_model(provider, model)
+            if hasattr(app, "_close_model_picker"):
+                app._close_model_picker()
+
+
+# ── App ───────────────────────────────────────────────────────────────────
+class DepressionApp(App):
+    TITLE = "depression.ai"
+
+    CSS = f"""
+    Screen {{ background: {BG}; color: {TEXT}; }}
+
+    #topbar {{
+        height: 1; background: {BG}; color: {DIM};
+        padding: 0 2; dock: top;
+    }}
+    #topbar-left {{ width: 1fr; color: {GREEN_DIM}; }}
+    #topbar-right {{ width: auto; color: {DIM}; }}
+
+    #body {{ height: 1fr; layout: horizontal; }}
+    #main-col {{ width: 1fr; height: 1fr; layout: vertical; }}
+
+    #hero {{
+        height: auto; width: 100%;
+        padding: 1 2 0 2;
+        layout: vertical;
+    }}
+    #banner {{ height: 7; width: 100%; }}
+    #banner-sub {{
+        height: 1; color: {GREEN_DIM};
+        padding: 0 0 0 2;
+        margin: 0 0 1 0;
+    }}
+
+    #transcript {{
+        height: 1fr; background: {BG}; color: {TEXT};
+        padding: 1 2 0 2;
+        scrollbar-background: {BG};
+        scrollbar-color: {BORDER};
+    }}
+    .msg-user       {{ height: auto; color: {TEXT}; margin: 0 0 1 0; }}
+    .msg-agent-head {{ height: 1; color: {GREEN}; text-style: bold; }}
+    .msg-agent-body {{ height: auto; margin: 0 0 1 0; }}
+    .msg-sys        {{ height: auto; color: {MUTED}; margin: 0 0 1 0; }}
+    .msg-err        {{ height: auto; color: {ERROR}; margin: 0 0 1 0; }}
+
+    #prompt-wrap {{
+        dock: bottom;
+        height: auto; min-height: 5;
+        background: {BG};
+        border-left: thick {GREEN};
+        padding: 1 0 0 2;
+        margin: 0 0 0 2;
+    }}
+    #prompt-row  {{ height: 3; layout: horizontal; background: {BG}; }}
+    #prompt-sign {{
+        width: 2; height: 3;
+        color: {GREEN}; content-align: left middle;
+    }}
+    #prompt-input {{
+        width: 1fr; height: 3;
+        background: {BG}; border: none;
+        color: {TEXT}; padding: 0;
+    }}
+    #prompt-input:focus {{ border: none; }}
+    #mode-chip {{ height: 1; padding: 0 0 0 2; color: {MUTED}; background: {BG}; }}
+    #shortcut-hint {{
+        height: 1; padding: 0 0 0 2;
+        color: {DIM}; background: {BG}; margin-bottom: 1;
+    }}
+
+    #footer {{
+        height: 1; background: {BG}; color: {DIM};
+        padding: 0 2; dock: bottom;
+    }}
+    #footer-left {{ width: 1fr; color: {MUTED}; }}
+    #footer-right {{ width: auto; color: {MUTED}; }}
+
+    Button {{ background: transparent; border: none; }}
+    """
+
+    BINDINGS = [
+        Binding("ctrl+q", "quit",   "Quit",   priority=True),
+        Binding("ctrl+d", "quit",   "Quit",   priority=True),
+        Binding("ctrl+c", "cancel", "Cancel", priority=True),
+        Binding("ctrl+l", "clear",  "Clear"),
+        Binding("ctrl+p", "open_picker", "Picker"),
+        Binding("tab",    "cycle_mode",  "Mode",  priority=True),
+        Binding("escape", "escape", "Back"),
+    ]
+
+    current_mode: reactive[str] = reactive("Build")
+
+    def __init__(self, coordinator=None, **kwargs):
+        super().__init__(**kwargs)
+        self.coordinator = coordinator
+        self.cfg = load_config()
+        self.aws = load_aws()
+        self.selected_provider: str = self.cfg.get("provider", "")
+        self.selected_model: str = self.cfg.get("model", "")
+        self._picker_open = False
+        self._spinner_on = False
+        self._spinner_idx = 0
+        self._banner_glow = 0
+
+    def compose(self) -> ComposeResult:
+        with Horizontal(id="topbar"):
+            yield Static("depression.ai", id="topbar-left")
+            yield Static("", id="topbar-right")
+
+        with Horizontal(id="body"):
+            with Vertical(id="main-col"):
+                with Vertical(id="hero"):
+                    yield Static(self._banner_markup(), id="banner")
+                    yield Static(
+                        f"  [{GREEN_DIM}]✧  a  t  e  r  m  i  n  a  l  "
+                        f"c  o  d  i  n  g  a  g  e  n  t  ✧[/]",
+                        id="banner-sub",
+                    )
+
+                yield VerticalScroll(id="transcript")
+
+                with Vertical(id="prompt-wrap"):
+                    with Horizontal(id="prompt-row"):
+                        yield Static("›", id="prompt-sign")
+                        yield Input(
+                            placeholder='ask anything…  "fix broken tests"',
+                            id="prompt-input",
+                        )
+                    yield Static(self._mode_chip(), id="mode-chip")
+                    yield Static("tab agents    ctrl+p commands    /connect /aws /models",
+                                 id="shortcut-hint")
+
+            yield Sidebar(self, id="sidebar")
+
+        with Horizontal(id="footer"):
+            yield Static(self._footer_left(), id="footer-left")
+            yield Static("depression.ai 0.1.0", id="footer-right")
+
+        yield ModelPickerModal(id="picker-overlay")
+
+    def on_mount(self) -> None:
+        self.register_theme(THEME)
+        self.theme = "matrix"
+        self.query_one("#prompt-input", Input).focus()
+        self.set_interval(0.10, self._tick_spinner)
+        self.set_interval(1.50, self._tick_banner)
+
+    # ── markup ────────────────────────────────────────────────────────
+    def _banner_markup(self) -> str:
+        greens = [GREEN_GLOW, GREEN, GREEN, GREEN, GREEN_DIM, GREEN_DIM]
+        return "\n".join(f"[bold {greens[i]}]{line}[/]"
+                         for i, line in enumerate(BANNER_LINES))
+
+    def _mode_chip(self) -> str:
+        icon = MODE_ICONS.get(self.current_mode, "◆")
+        model = (f"{self.selected_provider} {self.selected_model}"
+                 if self.selected_provider else "no model selected")
+        prefix = ""
+        if self._spinner_on:
+            spin = SPINNER_FRAMES[self._spinner_idx % len(SPINNER_FRAMES)]
+            prefix = f"[{AMBER}]{spin}[/] "
+        return (f"{prefix}[{GREEN}]{icon} {self.current_mode}[/]  "
+                f"[{DIM}]·[/]  [{TEXT}]{model}[/]")
+
+    def _refresh_mode_chip(self) -> None:
+        try:
+            self.query_one("#mode-chip", Static).update(self._mode_chip())
+        except Exception:
+            pass
+
+    def _session_head(self) -> str:
+        from datetime import datetime
+        return f"New session — {datetime.now().strftime('%Y-%m-%dT%H:%M:%S')}"
+
+    def _footer_left(self) -> str:
+        try:
+            cwd = os.getcwd()
+        except Exception:
+            cwd = "."
+        return f"{cwd}:main"
+
+    # ── animations ────────────────────────────────────────────────────
+    def _tick_spinner(self) -> None:
+        if not self._spinner_on:
+            return
+        self._spinner_idx += 1
+        self._refresh_mode_chip()
+
+    def _tick_banner(self) -> None:
+        self._banner_glow = (self._banner_glow + 1) % 3
+        greens = [
+            [GREEN_GLOW, GREEN, GREEN, GREEN, GREEN_DIM, GREEN_DIM],
+            [GREEN, GREEN_GLOW, GREEN, GREEN_DIM, GREEN, GREEN_DIM],
+            [GREEN, GREEN, GREEN_GLOW, GREEN_DIM, GREEN_DIM, GREEN],
+        ][self._banner_glow]
+        rows = "\n".join(f"[bold {greens[i]}]{line}[/]"
+                         for i, line in enumerate(BANNER_LINES))
+        try:
+            self.query_one("#banner", Static).update(rows)
+        except Exception:
+            pass
+
+    # ── sidebar switching ─────────────────────────────────────────────
+    def show_sidebar(self, panel: str) -> None:
+        try:
+            self.query_one("#sidebar", Sidebar)._show(panel)
+        except Exception:
+            pass
+
+    # ── prompt submission ─────────────────────────────────────────────
+    @on(Input.Submitted, "#prompt-input")
+    def _on_submitted(self, event: Input.Submitted) -> None:
+        text = event.value.strip()
+        self.query_one("#prompt-input", Input).value = ""
+        if not text:
+            return
+        if text.startswith("/"):
+            self._handle_slash(text)
+            return
+        self._show_user(text)
+        self._respond(text)
+
+    def _handle_slash(self, text: str) -> None:
+        cmd = text.split()[0].lower()
+        if cmd in ("/models", "/model"):
+            self.action_open_picker()
+        elif cmd == "/connect":
+            self.show_sidebar("llm")
+        elif cmd == "/aws":
+            self.show_sidebar("aws")
+        elif cmd == "/help":
+            self.show_sidebar("help")
+        elif cmd == "/clear":
+            self.action_clear()
+        elif cmd in ("/quit", "/exit"):
+            self.exit()
+        else:
+            self._show_error(f"unknown command: {cmd}")
+
+    # ── transcript ────────────────────────────────────────────────────
+    def _show_user(self, text: str) -> None:
+        t = self.query_one("#transcript", VerticalScroll)
+        t.mount(Static(f"[bold {GREEN}]❯[/] [bold {TEXT}]{text}[/]",
+                       classes="msg-user"))
+        t.scroll_end(animate=False)
+
+    def _show_system(self, text: str) -> None:
+        t = self.query_one("#transcript", VerticalScroll)
+        t.mount(Static(f"[{MUTED}]· {text}[/]", classes="msg-sys"))
+        t.scroll_end(animate=False)
+
+    def _show_error(self, text: str) -> None:
+        t = self.query_one("#transcript", VerticalScroll)
+        t.mount(Static(f"[bold {ERROR}]× {text}[/]", classes="msg-err"))
+        t.scroll_end(animate=False)
+
+    def _show_agent(self, text: str) -> None:
+        t = self.query_one("#transcript", VerticalScroll)
+        t.mount(Static(f"[bold {GREEN}]◆ depression.ai[/]",
+                       classes="msg-agent-head"))
+        t.mount(Markdown(text, classes="msg-agent-body"))
+        t.scroll_end(animate=False)
+
+    # ── picker ────────────────────────────────────────────────────────
+    def action_open_picker(self) -> None:
+        try:
+            self.query_one("#picker-overlay", ModelPickerModal).add_class("-open")
+            self._picker_open = True
+        except Exception:
+            pass
+
+    def _close_model_picker(self) -> None:
+        try:
+            self.query_one("#picker-overlay", ModelPickerModal).remove_class("-open")
+            self._picker_open = False
+            self.query_one("#prompt-input", Input).focus()
+        except Exception:
+            pass
+
+    def _select_model(self, provider: str, model: str) -> None:
+        self.selected_provider = provider
+        self.selected_model = model
+        default_url = next((u for p, u, _ in PROVIDERS if p == provider), "")
+        if not self.cfg.get("base_url") or self.cfg.get("provider") != provider:
+            self.cfg["base_url"] = default_url
+        self.cfg["provider"] = provider
+        self.cfg["model"] = model
+        save_config(self.cfg)
+        self._refresh_mode_chip()
+        self._show_system(f"selected {provider} · {model}")
+        self._show_system("open /connect to paste your api key")
+
+        # refresh the LLM panel with the new provider/model
+        try:
+            self.query_one("#panel-llm", LLMConnectPanel).refresh_values()
+        except Exception:
+            pass
+        self.show_sidebar("llm")
+
+    # ── respond ───────────────────────────────────────────────────────
+    @work(exclusive=True, group="msg")
+    async def _respond(self, text: str) -> None:
+        self._spinner_on = True
+        self._refresh_mode_chip()
         try:
             if self.coordinator:
-                chat.add_thinking("Analyzing..."); result=await asyncio.wait_for(self.coordinator.process_query(text,mode=self.current_mode,auto_execute=True),timeout=120);chat.remove_thinking()
+                result = await asyncio.wait_for(
+                    self.coordinator.process_query(
+                        text, mode=self.current_mode.lower(),
+                        auto_execute=True),
+                    timeout=180,
+                )
                 if result.get("success"):
-                    chat.add_message("agent",result.get("execution") or result.get("response", ""));
-                    if "tokens" in result:self.tokens_used=result["tokens"];status.set_tokens(result["tokens"])
-                    if "cost" in result:self.cost=result["cost"];status.set_cost(result["cost"])
-                else:chat.add_error(result.get("error","Unknown error"))
-            else:chat.add_message("agent",f"Received: {text}\n\nConnect an agent coordinator for full functionality.")
-        except asyncio.TimeoutError:chat.add_error("Request timed out after 120 seconds.")
-        except Exception as e:chat.add_error(f"Error: {e}")
-        finally:self.agent_status="idle";status.set_status("idle");status.set_tool("")
-    def set_coordinator(self,coordinator):self.coordinator=coordinator
-    def set_model(self,model:str):self.model_name=model;self.query_one("#header",HeaderBar).set_model(model);self.query_one("#status-bar",StatusBar).set_model(model)
-    def set_session(self,session_id:str):self.session_id=session_id;self.query_one("#header",HeaderBar).set_session(session_id)
-    def update_metrics(self,tokens:int=0,cost:float=0.0):self.tokens_used=tokens;self.cost=cost;self.query_one("#status-bar",StatusBar).update_all(tokens=tokens,cost=cost)
-    def show_tool_call(self,tool_name:str,params:dict=None,result:Any=None,success:bool=True,duration:float=None):self.query_one("#chat-panel",ChatView).add_tool_call(tool_name,params,result,success,duration)
-    def stream_response(self,text:str):self.query_one("#chat-panel",ChatView).append_stream(text)
-    async def action_quit(self):
-        if self.coordinator:
-            try:await self.coordinator.shutdown()
-            except Exception:pass
-        if hasattr(self,"session_manager") and self.session_manager:
-            try:await self.session_manager.save_current_session()
-            except Exception:pass
+                    self._show_agent(
+                        result.get("execution") or result.get("response", ""))
+                else:
+                    self._show_error(result.get("error", "unknown error"))
+            else:
+                if self.cfg.get("api_key"):
+                    self._show_agent(
+                        f"_({self.cfg['provider']}/{self.cfg['model']} is "
+                        f"connected but no coordinator is running.)_\n\n"
+                        f"you said: **{text}**"
+                    )
+                else:
+                    self._show_agent(
+                        f"_no model connected — open /connect to paste your key._\n\n"
+                        f"you said: **{text}**"
+                    )
+        except asyncio.TimeoutError:
+            self._show_error("timed out after 180s")
+        except Exception as e:
+            self._show_error(str(e))
+        finally:
+            self._spinner_on = False
+            self._refresh_mode_chip()
+
+    # ── actions ───────────────────────────────────────────────────────
+    def action_cycle_mode(self) -> None:
+        self.current_mode = MODE_ORDER[
+            (MODE_ORDER.index(self.current_mode) + 1) % len(MODE_ORDER)
+        ]
+        self._refresh_mode_chip()
+
+    def action_cancel(self) -> None:
+        if self._picker_open:
+            self._close_model_picker()
+            return
         self.exit()
-    async def _init_agent_async(self):
-        try:
-            from agent.config.loader import load_config
-            from agent.utils.platform import get_data_dir,get_cache_dir
-            from agent.storage.database import Database
-            from agent.storage.cache import Cache
-            from agent.project.workspace import WorkspaceManager
-            from agent.session.session import SessionManager
-            from agent.context.manager import ContextManager
-            from agent.llm.provider import get_llm_registry
-            from agent.permissions.manager import PermissionManager
-            from agent.agent.dual_agent import create_dual_agent_system
-            cfg=load_config(cache=True)
-            if self.model_override:cfg.setdefault("llm",{})["model"]=self.model_override
-            if self.provider_override:cfg.setdefault("llm",{})["provider"]=self.provider_override
-            if self.yolo:cfg.setdefault("permissions",{})["auto_approve"]=True
-            database=Database(str(get_data_dir("depression")/"agent.db"));await database.initialize();cache=Cache(cache_dir=str(get_cache_dir("depression")));project_dir=self.project_dir or cfg.get("workspace",{}).get("path",".");workspace=WorkspaceManager(workspace_dir=str(get_data_dir("depression")),project_dir=project_dir);await workspace.initialize();session_manager=SessionManager(database=database);session=await session_manager.load_session(self.session_id_override) if self.session_id_override else await session_manager.get_or_create_session();registry=get_llm_registry();context=ContextManager(workspace=workspace,session=session,config=cfg.get("context",{}),llm=registry);await context.initialize();permissions=PermissionManager(config=cfg.get("permissions",{}),ui=None);coordinator=await create_dual_agent_system(config=cfg,session=session,context_manager=context,permission_manager=permissions,workspace=workspace,database=database,ui=None,cache=cache);self.call_from_thread(self._on_agent_ready,coordinator,session,workspace,session_manager)
-        except Exception as e:self.call_from_thread(self._on_agent_error,str(e))
-    def _on_agent_ready(self,coordinator,session,workspace,session_manager):
-        self.coordinator=coordinator;self.session_manager=session_manager;self.workspace=workspace;status=coordinator.get_status();self.set_model(f"Plan: {status.get('plan_agent',{}).get('model','—')} | Build: {status.get('build_agent',{}).get('model','—')}");self.set_session(session.id);sidebar=self.query_one("#sidebar",Sidebar)
-        try:sidebar.set_tools([{"name":n,"enabled":True} for n in coordinator.plan_agent.tool_registry.list_tools()])
-        except Exception:pass
-        try:sidebar.set_files([{ "name":str(f.relative_to(workspace.get_project_dir())),"is_dir":f.is_dir(),"size":self._human_size(f.stat().st_size) if f.is_file() else ""} for f in workspace.list_files()][:100])
-        except Exception:pass
-        self._load_sessions_list();self.query_one("#chat-panel",ChatView).add_system(f"Agent connected! Session: {session.id[:8]}");self.query_one("#chat-panel",ChatView).add_divider()
-    def _on_agent_error(self,error:str):self.query_one("#chat-panel",ChatView).add_error(f"Agent initialization failed: {error}\nRunning in demo mode.");self.query_one("#chat-panel",ChatView).add_divider()
-    def _load_sessions_list(self):
-        try:
-            if hasattr(self,"session_manager") and self.session_manager:self.query_one("#sidebar",Sidebar).set_sessions([{"id":"current","name":"Current Session","time":"now","active":True}])
-        except Exception:pass
-    @staticmethod
-    def _human_size(size:int)->str:
-        for unit in ["B","KB","MB","GB"]:
-            if size<1024:return f"{size:.0f}{unit}"
-            size/=1024
-        return f"{size:.1f}TB"
-    def action_toggle_llm_panel(self):self.query_one("#sidebar",Sidebar).switch_to_llm()
+
+    def action_escape(self) -> None:
+        if self._picker_open:
+            self._close_model_picker()
+
+    def action_clear(self) -> None:
+        t = self.query_one("#transcript", VerticalScroll)
+        t.remove_children()
+
+
+if __name__ == "__main__":
+    DepressionApp().run()

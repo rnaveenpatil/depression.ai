@@ -1,0 +1,4 @@
+[console_scripts]
+depression = agent.main:main
+depression-tui = agent.tui.run:main
+depression_ai = agent.main:main

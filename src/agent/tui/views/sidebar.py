@@ -1,27 +1,26 @@
-"""Optional contextual workspace rail for Depression.AI.
-
-The transcript is the primary interface. The rail stays hidden until the user
-explicitly asks for it with F2, so the application behaves like a terminal
-agent rather than a dashboard.
-"""
+"""Compact terminal rail — hidden by default, toggled with F2."""
 from __future__ import annotations
+
 from typing import Callable, Dict, List, Optional
+
 from textual.app import ComposeResult
 from textual.widget import Widget
 from textual.widgets import Static, Button, ListView, ListItem, Label
 from textual.reactive import reactive
 from textual import on
+
 from agent.tui.widgets.llm_panel import LLMProviderPanel
 
 
 class SessionItem(ListItem):
     DEFAULT_CSS = """
     SessionItem { height: 2; padding: 0 1; }
-    SessionItem:hover, SessionItem.active { background: $boost; color: $text; }
-    .session-name { width: 1fr; color: $text; }
-    .session-state { width: 2; color: $success; }
+    SessionItem:hover, SessionItem.active { background: #1a1820; }
+    .session-name { width: 1fr; color: #e8e3f0; }
+    .session-state { width: 2; color: #7ef7c0; }
     """
-    def __init__(self, session_id: str, name: str, time: str = "", active: bool = False, **kwargs):
+    def __init__(self, session_id: str, name: str, time: str = "",
+                 active: bool = False, **kwargs):
         super().__init__(**kwargs)
         self.session_id, self.session_name = session_id, name
         if active:
@@ -34,50 +33,75 @@ class SessionItem(ListItem):
 
 class ToolItem(ListItem):
     DEFAULT_CSS = """
-    ToolItem { height: 2; padding: 0 1; }
-    ToolItem:hover { background: $boost; }
-    .tool-name { width: 1fr; color: $text; }
-    .tool-status { width: 2; color: $success; }
+    ToolItem { height: 1; padding: 0 1; }
+    .tool-name { width: 1fr; color: #8a849a; }
+    .tool-status { width: 2; color: #7ef7c0; }
     """
     def __init__(self, name: str, enabled: bool = True, **kwargs):
         super().__init__(**kwargs)
         self.tool_name, self.tool_enabled = name, enabled
 
     def compose(self) -> ComposeResult:
-        yield Label(self.tool_name, classes="tool-name")
+        yield Label(f" · {self.tool_name}", classes="tool-name")
         yield Label("●" if self.tool_enabled else "○", classes="tool-status")
 
 
 class Sidebar(Widget):
-    """Optional rail shown only when explicitly requested (F2)."""
+    """Contextual rail: sessions / tools / files / model."""
+
     DEFAULT_CSS = """
-    Sidebar { width: 34; min-width: 30; background: $panel; border-left: solid $border; layout: vertical; }
-    #rail-title { height: 3; padding: 1 1 0 1; color: $text; text-style: bold; border-bottom: solid $border; }
-    #rail-tabs { height: 3; layout: horizontal; border-bottom: solid $border; }
-    .rail-tab { width: 1fr; height: 3; background: transparent; border: none; color: $text-muted; }
-    .rail-tab:hover { background: $boost; color: $text; }
-    .rail-tab.active { color: $secondary; border-bottom: tall $secondary; }
-    #sidebar-content { height: 1fr; padding: 0 1; }
-    #sidebar-sessions, #sidebar-tools, #sidebar-files, #sidebar-llm { height: 1fr; }
-    #sidebar-llm { padding: 0; }
+    Sidebar {
+        width: 40; min-width: 34;
+        background: #0e0d12;
+        border-left: solid #2a2735;
+        layout: vertical;
+    }
+    #rail-title {
+        height: 1; padding: 0 1;
+        color: #8a849a; text-style: bold;
+        background: #08070c;
+        border-bottom: solid #2a2735;
+    }
+    #rail-tabs {
+        height: 1; layout: horizontal; background: #08070c;
+        border-bottom: solid #2a2735;
+    }
+    .rail-tab {
+        width: 1fr; height: 1;
+        background: transparent; border: none;
+        color: #524d60; text-style: bold;
+    }
+    .rail-tab:hover { color: #8a849a; }
+    .rail-tab.active { color: #ff9bc7; }
+    #sidebar-content {
+        height: 1fr;
+        layout: vertical;
+    }
+    #sidebar-sessions, #sidebar-tools, #sidebar-files, #sidebar-llm {
+        height: 1fr;
+        width: 100%;
+    }
     """
-    active_tab = reactive[str]("sessions")
+
+    active_tab = reactive("sessions")
+
+    TABS = [("sessions", "chat"), ("tools", "tools"),
+            ("files", "files"), ("llm", "model")]
 
     def __init__(self, on_llm_connect: Optional[Callable] = None, **kwargs):
         super().__init__(**kwargs)
         self.sessions: List[Dict] = []
-        self.tools: List[Dict] = []
-        self.files: List[Dict] = []
+        self.tools:    List[Dict] = []
+        self.files:    List[Dict] = []
         self._on_llm_connect = on_llm_connect
         self._llm_panel = None
 
     def compose(self) -> ComposeResult:
         yield Static("WORKSPACE", id="rail-title")
         with Widget(id="rail-tabs"):
-            yield Button("CHAT", id="tab-sessions", classes="rail-tab active")
-            yield Button("TOOLS", id="tab-tools", classes="rail-tab")
-            yield Button("FILES", id="tab-files", classes="rail-tab")
-            yield Button("MODEL", id="tab-llm", classes="rail-tab")
+            for key, label in self.TABS:
+                cls = "rail-tab active" if key == "sessions" else "rail-tab"
+                yield Button(label.upper(), id=f"tab-{key}", classes=cls)
         with Widget(id="sidebar-content"):
             yield ListView(id="sidebar-sessions")
             yield ListView(id="sidebar-tools")
@@ -85,19 +109,10 @@ class Sidebar(Widget):
             yield Widget(id="sidebar-llm")
 
     def on_mount(self) -> None:
-        self._show("sessions")
         self._populate_sessions()
         self._populate_tools()
-        self._populate_files()
-        # The app currently initializes the legacy rail as visible. Hide it on
-        # the first refresh; F2 can then explicitly reveal it.
-        self.call_after_refresh(self._hide_initial_rail)
-
-    def _hide_initial_rail(self) -> None:
-        try:
-            self.display = False
-        except Exception:
-            pass
+        self._init_llm_panel()
+        self._show("sessions")
 
     @on(Button.Pressed, ".rail-tab")
     def _on_tab(self, event: Button.Pressed) -> None:
@@ -118,13 +133,14 @@ class Sidebar(Widget):
             self.query_one(f"#sidebar-{tab}").display = True
         except Exception:
             pass
-        if tab == "llm" and self._llm_panel is None:
-            self._init_llm_panel()
 
     def _init_llm_panel(self) -> None:
+        if self._llm_panel is not None:
+            return
         try:
             container = self.query_one("#sidebar-llm")
-            self._llm_panel = LLMProviderPanel(id="llm-panel", on_connect=self._on_llm_connect)
+            self._llm_panel = LLMProviderPanel(id="llm-panel",
+                                               on_connect=self._on_llm_connect)
             container.mount(self._llm_panel)
         except Exception:
             pass
@@ -134,7 +150,8 @@ class Sidebar(Widget):
             view = self.query_one("#sidebar-sessions", ListView)
             view.clear()
             for s in self.sessions:
-                view.append(SessionItem(s.get("id", ""), s.get("name", "Unnamed"), s.get("time", ""), s.get("active", False)))
+                view.append(SessionItem(s.get("id", ""), s.get("name", "Unnamed"),
+                                        s.get("time", ""), s.get("active", False)))
         except Exception:
             pass
 
@@ -152,7 +169,7 @@ class Sidebar(Widget):
             view = self.query_one("#sidebar-files", ListView)
             view.clear()
             for f in self.files:
-                view.append(ListItem(Label(f.get("name", ""))))
+                view.append(ListItem(Label(f" · {f.get('name', '')}")))
         except Exception:
             pass
 
@@ -169,8 +186,6 @@ class Sidebar(Widget):
         self._populate_files()
 
     def get_llm_panel(self) -> Optional[LLMProviderPanel]:
-        if self._llm_panel is None:
-            self._init_llm_panel()
         return self._llm_panel
 
     def switch_to_llm(self) -> None:

@@ -1,173 +1,288 @@
-"""LLM catalog and persistent user connection settings for the TUI.
+"""Terminal-native model picker + LLM connection panel.
 
-The TUI owns presentation; the runtime provider registry remains responsible
-for actual completions. Keys are stored locally with restrictive permissions
-and are never rendered back into the interface in clear text.
+Uses plain ScrollableContainer + Static rows instead of ListView so the model
+list always renders inside the narrow sidebar.
 """
 from __future__ import annotations
 
-import json
-import os
-from dataclasses import dataclass
-from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Callable, Optional
+
+from textual.app import ComposeResult
+from textual.containers import VerticalScroll
+from textual.widget import Widget
+from textual.widgets import Static, Button, Input
+from textual.reactive import reactive
+from textual import on
+
+from agent.tui.llm_providers import (
+    PROVIDER_MODELS, PROVIDER_INFO, LLMModel, get_llm_config,
+)
 
 
-@dataclass(frozen=True)
-class LLMModel:
-    name: str
-    display_name: str
-    provider: str
-    base_url: str
-    context_window: int
-    supports_tools: bool = True
-    rating: int = 4
+class ModelButton(Button):
+    """One model row — a Button so it's clickable and focusable."""
+    DEFAULT_CSS = """
+    ModelButton {
+        height: 2;
+        width: 100%;
+        background: transparent;
+        border: none;
+        color: #e8e3f0;
+        text-align: left;
+        padding: 0 1;
+        content-align: left middle;
+    }
+    ModelButton:hover { background: #1a1820; color: #ff9bc7; }
+    ModelButton:focus { background: #1a1820; color: #ff9bc7; }
+    ModelButton.-selected { background: #1a1820; color: #7ee7ff; }
+    """
 
-    @property
-    def short_name(self) -> str:
-        return self.name.split("/")[-1] if "/" in self.name else self.name
-
-    @property
-    def stars(self) -> str:
-        return "★" * self.rating + "☆" * (5 - self.rating)
-
-
-# Curated catalog requested for Depression.AI. Provider/model IDs are kept
-# separate from display names so the UI can remain clean and searchable.
-PROVIDER_MODELS: List[LLMModel] = [
-    LLMModel("nvidia/nemotron-3-ultra-550b-a55b", "Nemotron 3 Ultra 550B A55B", "nvidia", "https://integrate.api.nvidia.com/v1", 1_000_000, rating=5),
-    LLMModel("deepseek/DeepSeek-V4-Pro", "DeepSeek V4 Pro", "deepseek", "https://api.deepseek.com", 1_000_000, rating=5),
-    LLMModel("deepseek/DeepSeek-V4-Flash", "DeepSeek V4 Flash", "deepseek", "https://api.deepseek.com", 1_000_000, rating=5),
-    LLMModel("nvidia/nemotron-3-super-120b-a12b", "Nemotron 3 Super 120B A12B", "nvidia", "https://integrate.api.nvidia.com/v1", 1_000_000, rating=5),
-    LLMModel("nvidia/nemotron-3.5-lightning-30b-a3b", "Nemotron 3.5 Lightning 30B A3B", "nvidia", "https://integrate.api.nvidia.com/v1", 1_000_000, rating=5),
-    LLMModel("nvidia/nemotron-3-nano-30b-a3b", "Nemotron 3 Nano 30B A3B", "nvidia", "https://integrate.api.nvidia.com/v1", 1_000_000, rating=4),
-    LLMModel("minimax/MiniMax-M2.5", "MiniMax M2.5", "minimax", "https://api.minimax.io/v1", 200_000, rating=5),
-    LLMModel("mistral/mistral-medium-3.5", "Mistral Medium 3.5", "mistral", "https://api.mistral.ai/v1", 256_000, rating=5),
-    LLMModel("mistral/devstral", "Devstral", "mistral", "https://api.mistral.ai/v1", 256_000, rating=5),
-    LLMModel("anthropic/claude-sonnet", "Claude Sonnet", "anthropic", "https://api.anthropic.com", 200_000, rating=5),
-    LLMModel("anthropic/claude-opus", "Claude Opus", "anthropic", "https://api.anthropic.com", 200_000, rating=5),
-    LLMModel("google/gemini-flash", "Gemini Flash", "google", "https://generativelanguage.googleapis.com/v1beta/openai", 1_000_000, rating=5),
-    LLMModel("google/gemini-pro", "Gemini Pro", "google", "https://generativelanguage.googleapis.com/v1beta/openai", 1_000_000, rating=5),
-    LLMModel("openai/gpt-5.x", "GPT-5.x", "openai", "https://api.openai.com/v1", 400_000, rating=5),
-    LLMModel("openai/gpt-oss-120b", "GPT-OSS 120B", "groq", "https://api.groq.com/openai/v1", 131_000, rating=5),
-    LLMModel("openai/gpt-oss-20b", "GPT-OSS 20B", "groq", "https://api.groq.com/openai/v1", 131_000, rating=4),
-    LLMModel("moonshot/kimi-k2", "Kimi K2.x", "moonshot", "https://api.moonshot.ai/v1", 200_000, rating=5),
-    LLMModel("moonshot/kimi-k3", "Kimi K3", "moonshot", "https://api.moonshot.ai/v1", 200_000, rating=5),
-    LLMModel("zai/glm-5.x", "GLM-5.x", "zai", "https://api.z.ai/api/paas/v4", 200_000, rating=5),
-    LLMModel("qwen/qwen-coder", "Qwen Coder", "qwen", "", 200_000, rating=5),
-    LLMModel("meta/llama-4", "Llama 4 / latest Llama", "meta", "", 200_000, rating=4),
-    LLMModel("alibaba/qwen-3.x", "Qwen 3.x", "alibaba", "", 200_000, rating=4),
-    LLMModel("openrouter/coding-agent", "OpenRouter Coding / Agent Models", "openrouter", "https://openrouter.ai/api/v1", 200_000, rating=5),
-]
-
-PROVIDER_INFO: Dict[str, Dict] = {
-    "nvidia": {"name": "NVIDIA", "icon": "◆", "api_key_env": "NVIDIA_API_KEY"},
-    "deepseek": {"name": "DeepSeek", "icon": "◇", "api_key_env": "DEEPSEEK_API_KEY"},
-    "minimax": {"name": "MiniMax", "icon": "✦", "api_key_env": "MINIMAX_API_KEY"},
-    "mistral": {"name": "Mistral", "icon": "M", "api_key_env": "MISTRAL_API_KEY"},
-    "anthropic": {"name": "Anthropic", "icon": "A", "api_key_env": "ANTHROPIC_API_KEY"},
-    "google": {"name": "Google", "icon": "G", "api_key_env": "GOOGLE_API_KEY"},
-    "openai": {"name": "OpenAI", "icon": "O", "api_key_env": "OPENAI_API_KEY"},
-    "groq": {"name": "Groq", "icon": "⚡", "api_key_env": "GROQ_API_KEY"},
-    "moonshot": {"name": "Moonshot", "icon": "☾", "api_key_env": "MOONSHOT_API_KEY"},
-    "zai": {"name": "Z.AI", "icon": "Z", "api_key_env": "ZAI_API_KEY"},
-    "qwen": {"name": "Qwen", "icon": "Q", "api_key_env": "DASHSCOPE_API_KEY"},
-    "meta": {"name": "Meta", "icon": "M", "api_key_env": "META_API_KEY"},
-    "alibaba": {"name": "Alibaba", "icon": "A", "api_key_env": "DASHSCOPE_API_KEY"},
-    "openrouter": {"name": "OpenRouter", "icon": "↗", "api_key_env": "OPENROUTER_API_KEY"},
-}
+    def __init__(self, model: LLMModel, selected: bool = False, **kwargs):
+        label = f"{model.display_name}  ·  {model.stars}"
+        super().__init__(label=label, **kwargs)
+        self.model = model
+        if selected:
+            self.add_class("-selected")
 
 
-def _config_file() -> Path:
-    if os.name == "nt":
-        base = Path(os.environ.get("APPDATA", Path.home() / "AppData" / "Roaming"))
-    else:
-        base = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
-    directory = base / "depression"
-    directory.mkdir(parents=True, exist_ok=True)
-    return directory / "llm.json"
+class ProviderLabel(Static):
+    DEFAULT_CSS = """
+    ProviderLabel {
+        height: 1;
+        width: 100%;
+        color: #ff9bc7;
+        text-style: bold;
+        padding: 0 1;
+        background: transparent;
+    }
+    """
+
+    def __init__(self, provider: str):
+        info = PROVIDER_INFO.get(provider, {})
+        super().__init__(f"── {info.get('name', provider).upper()}")
 
 
-class LLMConfig:
-    """Persistent selected model, endpoint and API-key configuration."""
-    def __init__(self) -> None:
-        self._selected_model: Optional[str] = None
-        self._api_keys: Dict[str, str] = {}
-        self._base_urls: Dict[str, str] = {}
-        self._load()
+class LLMProviderPanel(Widget):
+    """Model picker + endpoint/API-key form."""
 
-    def _load(self) -> None:
+    DEFAULT_CSS = """
+    LLMProviderPanel {
+        height: 100%;
+        width: 100%;
+        layout: vertical;
+        background: #0e0d12;
+    }
+    #llm-header {
+        height: 1;
+        width: 100%;
+        padding: 0 1;
+        color: #8a849a;
+        text-style: bold;
+        background: #08070c;
+        border-bottom: solid #2a2735;
+    }
+    #llm-model-scroll {
+        height: 1fr;
+        width: 100%;
+        background: #0e0d12;
+        border-bottom: solid #2a2735;
+    }
+    #llm-config {
+        height: 15;
+        width: 100%;
+        padding: 0 1;
+        background: #131118;
+    }
+    .llm-label {
+        height: 1;
+        width: 100%;
+        color: #8a849a;
+        text-style: bold;
+        margin-top: 1;
+    }
+    #llm-selected-model {
+        height: 1;
+        width: 100%;
+        color: #7ee7ff;
+    }
+    #llm-base-url-input, #llm-api-key-input {
+        height: 3;
+        width: 100%;
+        background: #0e0d12;
+        border: round #2a2735;
+        color: #e8e3f0;
+        padding: 0 1;
+    }
+    #llm-base-url-input:focus, #llm-api-key-input:focus {
+        border: round #ff9bc7;
+    }
+    #llm-connect-btn {
+        height: 3;
+        width: 100%;
+        margin-top: 1;
+        background: transparent;
+        border: round #b794f6;
+        color: #b794f6;
+        text-style: bold;
+    }
+    #llm-connect-btn:hover, #llm-connect-btn:focus {
+        background: #1a1820;
+        color: #ffffff;
+        border: round #ff9bc7;
+    }
+    #llm-status {
+        height: 1;
+        width: 100%;
+        color: #8a849a;
+        margin-top: 1;
+    }
+    """
+
+    selected_model    = reactive(None)
+    connection_status = reactive("disconnected")
+
+    def __init__(self, on_connect: Optional[Callable] = None, **kwargs):
+        super().__init__(**kwargs)
+        self.config = get_llm_config()
+        self._on_connect = on_connect
+        self.selected_model = (self.config.get_selected_model_info()
+                               or PROVIDER_MODELS[0])
+
+    def compose(self) -> ComposeResult:
+        yield Static("MODEL / CONNECTION", id="llm-header")
+
+        with VerticalScroll(id="llm-model-scroll"):
+            current_provider = None
+            for model in PROVIDER_MODELS:
+                if model.provider != current_provider:
+                    current_provider = model.provider
+                    yield ProviderLabel(current_provider)
+                yield ModelButton(
+                    model,
+                    selected=(model.name == self.selected_model.name),
+                    id=f"model-{model.name.replace('/', '-').replace('.', '-')}",
+                )
+
+        with Widget(id="llm-config"):
+            yield Static("SELECTED", classes="llm-label")
+            yield Static(self.selected_model.display_name,
+                         id="llm-selected-model")
+
+            yield Static("BASE URL", classes="llm-label")
+            yield Input(
+                value=self.config.get_base_url(self.selected_model.provider),
+                placeholder="https://api.example.com/v1",
+                id="llm-base-url-input",
+            )
+
+            yield Static("API KEY", classes="llm-label")
+            existing_key = self.config.get_api_key(self.selected_model.provider)
+            yield Input(
+                value="••••••••" if existing_key else "",
+                password=True,
+                placeholder="paste api key and press enter",
+                id="llm-api-key-input",
+            )
+
+            yield Button("CONNECT  ↵", id="llm-connect-btn")
+            yield Static(self._status_text(), id="llm-status")
+
+    def _status_text(self) -> str:
+        provider = self.selected_model.provider
+        if self.connection_status == "connected":
+            return f"[#7ef7c0]● connected · {provider}[/]"
+        if self.connection_status == "error":
+            return "[#ff6b8a]× failed · check key/url[/]"
+        has_key = bool(self.config.get_api_key(provider))
+        marker = "saved" if has_key else "required"
+        return f"[#8a849a]○ {provider} · key {marker}[/]"
+
+    def _refresh(self) -> None:
         try:
-            with _config_file().open("r", encoding="utf-8") as f:
-                data = json.load(f)
-            self._selected_model = data.get("selected_model")
-            self._api_keys = dict(data.get("api_keys", {}))
-            self._base_urls = dict(data.get("base_urls", {}))
-        except (OSError, ValueError, TypeError):
+            self.query_one("#llm-selected-model", Static).update(
+                self.selected_model.display_name)
+            self.query_one("#llm-base-url-input", Input).value = \
+                self.config.get_base_url(self.selected_model.provider)
+            existing = self.config.get_api_key(self.selected_model.provider)
+            self.query_one("#llm-api-key-input", Input).value = \
+                "••••••••" if existing else ""
+            self.query_one("#llm-status", Static).update(self._status_text())
+            # Update selected marker on model buttons.
+            for btn in self.query(ModelButton):
+                if btn.model.name == self.selected_model.name:
+                    btn.add_class("-selected")
+                else:
+                    btn.remove_class("-selected")
+        except Exception:
+            pass
+
+    @on(Button.Pressed)
+    def _on_button_pressed(self, event: Button.Pressed) -> None:
+        # Model row click
+        if isinstance(event.button, ModelButton):
+            self.selected_model = event.button.model
+            self.config.selected_model = event.button.model.name
+            self.connection_status = "disconnected"
+            self._refresh()
+            return
+        # Connect button
+        if event.button.id == "llm-connect-btn":
+            self._do_connect()
+
+    @on(Input.Submitted, "#llm-api-key-input")
+    def _on_api_key_submitted(self, event: Input.Submitted) -> None:
+        self._do_connect()
+
+    @on(Input.Submitted, "#llm-base-url-input")
+    def _on_base_url_submitted(self, event: Input.Submitted) -> None:
+        try:
+            self.query_one("#llm-api-key-input", Input).focus()
+        except Exception:
+            pass
+
+    def _do_connect(self) -> None:
+        provider = self.selected_model.provider
+        base = self.query_one("#llm-base-url-input", Input)
+        key_input = self.query_one("#llm-api-key-input", Input)
+
+        if key_input.value == "••••••••":
+            key = self.config.get_api_key(provider)
+        else:
+            key = key_input.value.strip()
+
+        url = base.value.strip().rstrip("/")
+
+        if not key or not url:
+            self.connection_status = "error"
+            self._refresh()
             return
 
-    def save(self) -> None:
-        path = _config_file()
-        tmp = path.with_suffix(".tmp")
-        data = {"selected_model": self._selected_model, "api_keys": self._api_keys, "base_urls": self._base_urls}
+        self.config.set_base_url(provider, url)
+        self.config.set_api_key(provider, key)
+        self.config.selected_model = self.selected_model.name
+
         try:
-            with tmp.open("w", encoding="utf-8") as f:
-                json.dump(data, f, indent=2)
-            os.replace(tmp, path)
+            from agent.llm.provider import get_llm_registry
+            registry = get_llm_registry()
+            registry.set_api_key(provider, key)
+            registry.set_model(self.selected_model.name)
+        except Exception:
+            pass
+
+        self.connection_status = "connected"
+        self._refresh()
+        if self._on_connect:
             try:
-                path.chmod(0o600)
-            except OSError:
+                self._on_connect(self.selected_model)
+            except Exception:
                 pass
-        except OSError:
-            try: tmp.unlink(missing_ok=True)
-            except OSError: pass
 
-    @property
-    def selected_model(self) -> Optional[str]: return self._selected_model
-    @selected_model.setter
-    def selected_model(self, value: str) -> None:
-        self._selected_model = value; self.save()
+    def get_current_config(self):
+        return self.config.build_llm_config(self.selected_model)
 
-    def get_api_key(self, provider: str) -> str:
-        value = self._api_keys.get(provider)
-        if value: return value
-        env = PROVIDER_INFO.get(provider, {}).get("api_key_env", "")
-        return os.environ.get(env, "") if env else ""
+    def set_connected(self, connected: bool) -> None:
+        self.connection_status = "connected" if connected else "disconnected"
+        self._refresh()
 
-    def set_api_key(self, provider: str, key: str) -> None:
-        if key: self._api_keys[provider] = key
-        else: self._api_keys.pop(provider, None)
-        self.save()
-
-    def get_base_url(self, provider: str) -> str:
-        if provider in self._base_urls: return self._base_urls[provider]
-        for model in PROVIDER_MODELS:
-            if model.provider == provider and model.base_url: return model.base_url
-        return ""
-
-    def set_base_url(self, provider: str, url: str) -> None:
-        if url: self._base_urls[provider] = url.rstrip("/")
-        else: self._base_urls.pop(provider, None)
-        self.save()
-
-    def get_selected_model_info(self) -> Optional[LLMModel]:
-        return next((m for m in PROVIDER_MODELS if m.name == self._selected_model), None)
-
-    def build_llm_config(self, model: LLMModel) -> Dict:
-        return {"llm": {"provider": model.provider, "model": model.name, "api_key": self.get_api_key(model.provider), "base_url": self.get_base_url(model.provider), "params": {"temperature": 0.1}}}
-
-    def get_provider_status(self) -> List[Dict]:
-        result = []
-        for provider, info in PROVIDER_INFO.items():
-            models = [m for m in PROVIDER_MODELS if m.provider == provider]
-            if models:
-                result.append({"id": provider, "name": info["name"], "icon": info["icon"], "has_key": bool(self.get_api_key(provider)), "models": models})
-        return result
-
-
-_llm_config: Optional[LLMConfig] = None
-
-def get_llm_config() -> LLMConfig:
-    global _llm_config
-    if _llm_config is None: _llm_config = LLMConfig()
-    return _llm_config
+    def get_selected_model(self):
+        return self.selected_model
