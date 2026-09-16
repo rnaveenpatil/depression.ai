@@ -28,6 +28,13 @@ DEFAULT_MAX_FILE_BYTES = 512 * 1024      # 512 KB per file
 DEFAULT_MAX_FILES = 50                    # total files kept
 
 
+def _default_token_counter(text: str, model: str = "default") -> int:
+    """Fallback counter used when no TokenCounter is supplied."""
+    if not text:
+        return 0
+    return max(1, len(text) // 4)
+
+
 @dataclass
 class FileEntry:
     """A tracked file"""
@@ -58,6 +65,7 @@ class FileContext:
         include_contents: bool = True,
         max_file_bytes: int = DEFAULT_MAX_FILE_BYTES,
         max_files: int = DEFAULT_MAX_FILES,
+        token_counter: Optional[Any] = None,
     ):
         self.workspace = workspace
         self.max_tokens = max_tokens
@@ -65,11 +73,13 @@ class FileContext:
         self.max_file_bytes = max_file_bytes
         self.max_files = max_files
 
+        # Prefer an injected TokenCounter; fall back to a local heuristic.
+        self._counter = token_counter
+
         self._files: Dict[str, FileEntry] = {}   # key: normalized absolute path
         self._total_tokens = 0
         self._lock = asyncio.Lock()
 
-        # Resolve project root
         self._root: Path = self._resolve_root()
 
     def _resolve_root(self) -> Path:
@@ -154,7 +164,6 @@ class FileContext:
             self._files[str(abs_path)] = new_entry
             self._total_tokens += new_entry.tokens
 
-            # Trim if over budget
             self._enforce_token_budget()
 
             return True
@@ -169,7 +178,6 @@ class FileContext:
                 entry.read_count += 1
                 return entry.content
 
-        # Read fresh
         ok = await self.add_file(path)
         if not ok:
             return None
@@ -255,7 +263,6 @@ class FileContext:
             logger.debug(f"Read failed for {path}: {e}")
             return "", False, False
 
-        # Binary check
         is_binary = b"\x00" in raw[:1024]
         truncated = len(raw) > self.max_file_bytes
         if truncated:
@@ -279,7 +286,12 @@ class FileContext:
     def _estimate_tokens(self, text: str) -> int:
         if not text:
             return 0
-        return max(1, len(text) // 4)
+        if self._counter is not None:
+            try:
+                return int(self._counter.count_tokens(text))
+            except Exception:
+                pass
+        return _default_token_counter(text)
 
     def _evict_oldest(self) -> None:
         if not self._files:

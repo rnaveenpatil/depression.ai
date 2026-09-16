@@ -8,6 +8,9 @@ Strategy (multi-stage):
 
 The summarization step uses the LLM when available; otherwise a
 deterministic heuristic summary is produced.
+
+Ordering is preserved throughout so assistant tool_calls always remain
+adjacent to their tool results.
 """
 
 from __future__ import annotations
@@ -17,6 +20,7 @@ import json
 from typing import Any, Dict, List, Optional
 
 from agent.utils.logging import get_logger
+from agent.llm.provider import Message
 
 logger = get_logger(__name__)
 
@@ -36,9 +40,7 @@ Output only the summary, no preamble."""
 
 
 class Compactor:
-    """
-    Context compaction engine.
-    """
+    """Context compaction engine."""
 
     def __init__(self, llm: Any = None, config: Optional[Dict[str, Any]] = None):
         cfg = config or {}
@@ -67,14 +69,6 @@ class Compactor:
     ) -> Dict[str, Any]:
         """
         Compact messages + tool outputs down toward `target_tokens`.
-
-        Returns:
-            {
-                "compacted": bool,
-                "messages": [ContextMessage, ...],
-                "summaries_created": int,
-                "stages_applied": [str, ...],
-            }
         """
         if not messages:
             return {"compacted": False, "reason": "no messages"}
@@ -82,7 +76,7 @@ class Compactor:
         stages: List[str] = []
         working = list(messages)
 
-        # ---- Stage 1: trim tool outputs ----
+        # ---- Stage 1: trim tool outputs (recorded for callers) ----
         if len(tool_outputs) > self.max_tool_outputs_keep:
             stages.append("tool_output_trim")
 
@@ -114,6 +108,25 @@ class Compactor:
         }
 
     # ------------------------------------------------------------------
+    # PINNED / UNPINNED SPLIT
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _split_pinned(messages: List[Any]) -> tuple[List[Any], List[Any]]:
+        """
+        Return (pinned, unpinned). Pinned = `pinned=True` or system role.
+        Single pass — no `in` list containment checks.
+        """
+        pinned: List[Any] = []
+        unpinned: List[Any] = []
+        for m in messages:
+            if getattr(m, "pinned", False) or getattr(m, "role", "") == "system":
+                pinned.append(m)
+            else:
+                unpinned.append(m)
+        return pinned, unpinned
+
+    # ------------------------------------------------------------------
     # STAGE 2: SUMMARIZATION
     # ------------------------------------------------------------------
 
@@ -124,54 +137,58 @@ class Compactor:
     ) -> tuple[List[Any], bool]:
         """
         Split into (old, recent). Summarize `old` into a single message.
-        Recent messages are preserved verbatim.
+        Recent messages are preserved verbatim. Ordering preserved; the
+        summary is inserted between pinned and recent.
         """
-        # Always keep pinned / system messages + last N verbatim
-        pinned = [m for m in messages if getattr(m, "pinned", False) or m.role == "system"]
-        unpinned = [m for m in messages if m not in pinned]
+        pinned, unpinned = self._split_pinned(messages)
 
         keep_recent = max(self.min_messages_to_keep, len(unpinned) // 3)
-        old = unpinned[:-keep_recent] if keep_recent else unpinned
-        recent = unpinned[-keep_recent:] if keep_recent else []
+        if keep_recent <= 0 or len(unpinned) <= keep_recent:
+            return messages, False
 
-        # Nothing meaningful to summarize
+        old = unpinned[:-keep_recent]
+        recent = unpinned[-keep_recent:]
+
         if len(old) < 3:
             return messages, False
 
-        # Build the transcript for the LLM
         transcript = self._render_transcript(old)
         summary_text = await self._generate_summary(transcript)
 
-        # Build the summary message
         try:
             from agent.context.manager import ContextMessage
         except Exception:
-            # Fallback if ContextMessage isn't importable (e.g. in isolation)
-            class ContextMessage:  # type: ignore
-                def __init__(self, role, content, tokens=0, pinned=False, metadata=None):
-                    self.role = role
-                    self.content = content
-                    self.tokens = tokens
-                    self.pinned = pinned
-                    self.metadata = metadata or {}
+            ContextMessage = None  # type: ignore
+
+        summary_content = f"[CONTEXT SUMMARY — earlier turns]\n{summary_text}"
+        summary_tokens = self._estimate_str_tokens(summary_text) + 20
+
+        if ContextMessage is not None:
+            summary_msg = ContextMessage(
+                role="system",
+                content=summary_content,
+                tokens=summary_tokens,
+                pinned=True,
+                metadata={"compacted": True, "summary_of": len(old)},
+            )
+        else:
+            # Defensive fallback if manager import fails.
+            class _Fallback:
+                def __init__(self):
+                    self.role = "system"
+                    self.content = summary_content
+                    self.tokens = summary_tokens
+                    self.pinned = True
+                    self.metadata = {"compacted": True, "summary_of": len(old)}
                     self.timestamp = time.time()
+            summary_msg = _Fallback()
 
-        summary_msg = ContextMessage(
-            role="system",
-            content=f"[CONTEXT SUMMARY — earlier turns]\n{summary_text}",
-            tokens=self._estimate_str_tokens(summary_text) + 20,
-            pinned=True,
-            metadata={"compacted": True, "summary_of": len(old)},
-        )
-
-        # Reassemble in original order-ish: pinned + summary + recent
-        combined = pinned + [summary_msg] + recent
-        combined.sort(key=lambda m: getattr(m, "timestamp", 0))
+        # Preserve order: pinned + summary + recent. No re-sort.
+        combined = list(pinned) + [summary_msg] + list(recent)
         return combined, True
 
     async def _generate_summary(self, transcript: str) -> str:
         """Ask the LLM for a summary; fall back to heuristic"""
-        # Truncate transcript to a reasonable size for the summarizer
         max_chars = self.max_summary_tokens * 4
         if len(transcript) > max_chars:
             transcript = transcript[:max_chars] + "\n… (truncated)"
@@ -179,8 +196,8 @@ class Compactor:
         try:
             result = await self.llm.complete(
                 messages=[
-                    {"role": "system", "content": SUMMARY_SYSTEM_PROMPT},
-                    {"role": "user", "content": transcript},
+                    Message(role="system", content=SUMMARY_SYSTEM_PROMPT),
+                    Message(role="user", content=transcript),
                 ],
                 temperature=0.1,
                 max_tokens=self.max_summary_tokens,
@@ -199,38 +216,37 @@ class Compactor:
         """
         Drop oldest non-pinned messages until we're under budget.
         Always preserves pinned / system messages and the last few turns.
+        No re-sort — messages keep their original order.
         """
-        pinned = [m for m in messages if getattr(m, "pinned", False) or m.role == "system"]
-        unpinned = [m for m in messages if m not in pinned]
+        pinned, unpinned = self._split_pinned(messages)
 
-        # Always keep the last `min_messages_to_keep`
-        must_keep = unpinned[-self.min_messages_to_keep:]
-        candidates = unpinned[:-self.min_messages_to_keep]
+        must_keep_count = min(self.min_messages_to_keep, len(unpinned))
+        must_keep = unpinned[-must_keep_count:] if must_keep_count else []
+        candidates = unpinned[:-must_keep_count] if must_keep_count else list(unpinned)
 
         result = list(pinned) + list(must_keep)
         budget = target_tokens - self._estimate_tokens(result)
 
-        # Add back the newest of the remaining candidates until budget is hit
+        added: List[Any] = []
         for m in reversed(candidates):
-            t = getattr(m, "tokens", 0) or self._estimate_str_tokens(getattr(m, "content", ""))
+            t = getattr(m, "tokens", 0) or self._estimate_str_tokens(
+                getattr(m, "content", "")
+            )
             if t <= budget:
-                result.append(m)
+                added.append(m)
                 budget -= t
             else:
                 break
 
-        result.sort(key=lambda m: getattr(m, "timestamp", 0))
-        return result
+        # Prepend the kept tail in original order.
+        added.reverse()
+        return list(pinned) + added + list(must_keep)
 
     # ------------------------------------------------------------------
     # HEURISTIC SUMMARY (fallback)
     # ------------------------------------------------------------------
 
     def _heuristic_summary(self, transcript: str) -> str:
-        """
-        Deterministic summary when no LLM is available.
-        Extracts user messages + short assistant previews.
-        """
         lines = transcript.splitlines()
         user_lines = [l for l in lines if l.startswith("USER:")]
         assistant_previews = [
@@ -257,7 +273,6 @@ class Compactor:
         for m in messages:
             role = getattr(m, "role", "unknown").upper()
             content = getattr(m, "content", "") or ""
-            # Cap each message in the transcript
             if len(content) > 2000:
                 content = content[:2000] + "…"
             parts.append(f"{role}: {content}")

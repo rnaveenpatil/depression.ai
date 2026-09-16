@@ -14,10 +14,12 @@ from agent.tools.proccess import ProcessTool
 from agent.tools.patch import PatchTool
 from agent.tools.web import WebTool
 from agent.tools.browser import BrowserTool
+from agent.tools.realtime_browser import RealtimeBrowserTool
 from agent.tools.task import TaskTool
 from agent.tools.mcp import MCPTool
 from agent.tools.diagnostics import DiagnosticsTool
 from agent.tools.todo import TodoTool
+from agent.tools.aws_helper import AWSHelperTool
 from agent.tools.compat import (
     BashTool,
     ReadTool,
@@ -47,10 +49,12 @@ __all__ = [
     "PatchTool",
     "WebTool",
     "BrowserTool",
+    "RealtimeBrowserTool",
     "TaskTool",
     "MCPTool",
     "DiagnosticsTool",
     "TodoTool",
+    "AWSHelperTool",
     "BashTool",
     "ReadTool",
     "WriteTool",

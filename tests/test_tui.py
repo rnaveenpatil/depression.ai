@@ -82,9 +82,9 @@ async def test_tui_permission_deny_button_returns_false():
         assert await asyncio.wait_for(worker.wait(), 5) is False
 
 @pytest.mark.asyncio
-async def test_tui_submit_while_busy_keeps_typed_text():
-    """Submitting while the agent is busy must NOT wipe the typed message —
-    it stays in the box and can be resubmitted when the task finishes."""
+async def test_tui_submit_while_busy_queues_prompt():
+    """Submitting while the agent is busy must queue the prompt (not drop it)
+    and clear the box — it runs when the current task finishes."""
     app = DepressionApp(coordinator=None)
     async with app.run_test() as pilot:
         await pilot.pause()
@@ -96,8 +96,94 @@ async def test_tui_submit_while_busy_keeps_typed_text():
         await pilot.press("enter")
         await pilot.pause()
 
-        assert inp.value == "keep my text", f"typed text was dropped: {inp.value!r}"
+        assert inp.value == "", "box should clear once the prompt is queued"
+        assert app._prompt_queue == ["keep my text"], \
+            f"queued: {app._prompt_queue!r}"
         assert app.busy is True
+
+        app.busy = False
+        app._drain_prompt_queue()
+        await pilot.pause()
+        assert app._prompt_queue == [], "queued prompt should have drained"
+        transcript = " ".join(
+            str(n.render()) for n in app.query_one("#transcript").children)
+        assert "coordinator is not initialized" in transcript, \
+            "drained prompt must spawn a real agent run"
+
+
+@pytest.mark.asyncio
+async def test_tui_esc_interrupt_drops_worker_and_queue():
+    """Esc must cancel the running worker and drop any queued prompts,
+    leaving the TUI idle and focused on the prompt."""
+    app = DepressionApp(coordinator=None)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app.busy = True
+        app._prompt_queue = ["queued-1", "queued-2"]
+
+        cancelled = []
+        class FakeWorker:
+            is_running = True
+            def cancel(self):
+                cancelled.append(True)
+
+        app._agent_worker = FakeWorker()
+        app.action_interrupt()
+        await pilot.pause()
+
+        assert cancelled == [True], "running worker must be cancelled"
+        assert app.busy is False
+        assert app._prompt_queue == [], "queued prompts must be dropped on Esc"
+        assert app.query_one("#prompt", Input).placeholder == "ask the agent…"
+
+
+@pytest.mark.asyncio
+async def test_tui_esc_spams_nothing_when_idle():
+    """Esc on an idle TUI must do nothing (no noise, queue untouched)."""
+    app = DepressionApp(coordinator=None)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        before = len(app.query_one("#transcript").children)
+        app._prompt_queue = ["held"]
+        app.action_interrupt()
+        await pilot.pause()
+        assert app._prompt_queue == ["held"]
+        assert not app.busy
+        assert len(app.query_one("#transcript").children) == before
+
+
+@pytest.mark.asyncio
+async def test_tui_esc_denies_modal_and_interrupts_run():
+    """Esc while a permission ask is open must deny the ask AND stop the run."""
+    app = DepressionApp(coordinator=None)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        req = PermissionRequest(
+            tool="terminal", action="run",
+            params={"command": "rm -rf /tmp/x",
+                    "args": ["rm", "-rf", "/tmp/x"]},
+        )
+        verdict = PermissionVerdict.ask(
+            reason="user must decide", risk=RiskLevel.HIGH,
+        )
+        modal = PermissionModal(req, verdict)
+        pilot.app.push_screen(modal)
+        await pilot.pause()
+
+        cancelled = []
+        class FakeWorker:
+            is_running = True
+            def cancel(self):
+                cancelled.append(True)
+
+        app.busy = True
+        app._agent_worker = FakeWorker()
+        app.action_interrupt()
+        await pilot.pause()
+
+        assert cancelled == [True], "run must be cancelled even with modal open"
+        assert app.busy is False
+        assert modal._done, "permission ask must be denied on Esc"
 
 
 @pytest.mark.asyncio
@@ -117,7 +203,55 @@ async def test_tui_sidebar_click_keeps_prompt_focus_and_typing():
 
         assert inp.has_focus, "focus must stay on the prompt input"
         await pilot.press("s", "t", "i", "l", "l", " ", "t", "y", "p", "i", "n", "g")
+        await pilot.pause()
         assert inp.value == "still typing"
+
+
+@pytest.mark.asyncio
+async def test_tui_busy_visual_shows_on_input_and_restores():
+    """While the agent runs, the prompt must show a visible busy state on the
+    input row (placeholder + amber class) and restore to normal afterwards."""
+    app = DepressionApp(coordinator=None)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        inp = app.query_one("#prompt", Input)
+        assert inp.placeholder == "ask the agent…"
+        assert not inp.has_class("busy")
+
+        app._set_busy_visual(True)
+        await pilot.pause()
+        assert inp.placeholder == app._BUSY_PLACEHOLDER
+        assert inp.has_class("busy")
+
+        app._set_busy_visual(False)
+        await pilot.pause()
+        assert inp.placeholder == "ask the agent…"
+        assert not inp.has_class("busy")
+
+
+@pytest.mark.asyncio
+async def test_tui_write_strips_control_chars_and_renders():
+    """LLM / tool output with raw ANSI or control bytes must not garble the
+    screen — _write strips everything except \\n and \\t."""
+    app = DepressionApp(coordinator=None)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        dirty = ("clean head\x1b[31mred text\x07\x1b[0m "
+                 "\rline-cr done\x00\x08middle\x7f")
+        app._write(dirty + "\nwith\t[tabs] kept", "system")
+        await pilot.pause()
+        joins = []
+        for node in app.query_one("#transcript").children:
+            txt = getattr(node, "render", None)
+            if txt is not None:
+                joins.append(str(txt()))
+        out = "\n".join(joins)
+        assert "line-cr done" in out
+        assert "clean head" in out and "red text" in out, \
+            "raw CSI sequence should be stripped in place"
+        assert "\t" in out
+        assert "\n" in out
+        assert "\x1b" not in out and "\x07" not in out and "\r" not in out
 
 
 @pytest.mark.asyncio

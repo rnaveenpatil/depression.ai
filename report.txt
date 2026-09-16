@@ -1,0 +1,75 @@
+PROJECT REPORT: depression.ai
+================================
+
+OVERVIEW
+--------
+depression.ai is an AI-powered CLI agent that acts as an intelligent terminal
+assistant. It was built primarily in Python and lets users run natural-language
+queries that get translated into terminal/filesystem/git actions.
+
+TECH STACK
+----------
+- Language: Python 3.10+ (src/agent package)
+- Build: setuptools via pyproject.toml, version 1.0.0
+- Key libraries: httpx, pydantic, pyyaml, tiktoken, rich, prompt-toolkit, textual
+- CLI entry points: `depression`, `depression_ai`, `depression-tui`
+- License: ISC
+
+MAIN FEATURES
+-------------
+- Dual-Agent Architecture: a read-only "Plan" agent + a full-access "Build" agent
+- Multi-model LLM support: Google Gemini, DeepSeek, Anthropic, Groq, NVIDIA,
+  local/OpenAI-compatible providers
+- Tool calling: terminal, filesystem, git, search, web, MCP, patch, browser, task
+- Session management with persistent history (SQLite storage + cache)
+- Git-based snapshots and undo for safe experimentation
+- Subagents for parallel task execution
+- TUI (Textual-based) interface + interactive/repl CLI mode
+- Permission system with rules, terminal, filesystem, and AWS guards
+- Config via .agent/config.json and environment variables
+- AWS project mode and environment management
+
+PROJECT STRUCTURE
+-----------------
+src/agent/
+  main.py          - entry point / bootstrap
+  agent/           - core agent logic (plan/build, loop, subagents)
+  cli/             - CLI interface, commands, UI, input
+  config/          - configuration loading
+  context/         - context/runtime management
+  llm/             - LLM provider integrations
+  mcp/             - Model Context Protocol client
+  permissions/     - permission system
+  plugins/         - plugin loader/registry
+  project/         - workspace management (scanner, git, aws)
+  session/         - sessions, state, history
+  storage/         - database and cache
+  tools/           - built-in tool implementations
+  tui/             - terminal UI
+  utils/           - logging, env, platform helpers
+
+tests/             - pytest suite (CLI, agent, session, config, TUI, tools, etc.)
+
+OTHER FILES
+-----------
+- index.html, hello.py, kks/  - related/app sample projects
+- README.md, docs/, assets/   - documentation and assets
+
+USAGE EXAMPLES
+--------------
+  depression                                # interactive mode
+  depression "run flutter build web in kks" # single query
+  depression --model google/gemini-2.5-flash-lite "explain this code"
+  depression -p /path/to/project "refactor this code"
+
+RECENT WORK (git log)
+---------------------
+- Fixed TUI permission modal thread bridge
+- Added TUI and runtime smoke tests
+- Replaced TUI with a real agent-connected runtime UI
+- Made TUI LLM connection provider-agnostic
+
+STATUS
+------
+Active development, version 1.0.0, uncommitted changes present in TUI/permissions
+areas plus a new kks/VERIFICATION.md.

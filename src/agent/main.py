@@ -381,6 +381,16 @@ Examples:
         )
         await self.context_manager.initialize()
 
+        # Seed the context from the resumed session so the model sees the
+        # conversation the user sees. Fresh sessions have an empty history
+        # and load_from_session() returns 0 immediately.
+        try:
+            seeded = await self.context_manager.load_from_session(self.session)
+            if seeded and not args.quiet:
+                self.ui.print_status(f"Resumed context: {seeded} message(s)")
+        except Exception as e:
+            logger.warning(f"Context seed from session failed: {e}")
+
         # 10. MCP ------------------------------------------------------
         mcp_cfg = dict(self.config_dict.get("mcp", {}) or {})
         if args.no_mcp:
@@ -441,10 +451,9 @@ Examples:
             except Exception as e:
                 self.ui.print_warning(f"Plugin load failed: {e}")
 
-        # 14. Wire live output rendering (OpenCode: stream + tool live + permission cards + status)
+        # 14. Wire live output rendering (stream + tool live + permission cards + status)
         for agent in (self.agent_coordinator.plan_agent, self.agent_coordinator.build_agent):
             if hasattr(agent, 'loop') and agent.loop:
-                # Live tool render — matches opencode tool call live view
                 async def _on_tool(data, _ui=self.ui):
                     try:
                         _ui.print_tool_call(
@@ -454,13 +463,11 @@ Examples:
                             success=data.get('result', {}).get('success', True) if isinstance(data.get('result'), dict) else True,
                             duration=data.get('execution_time')
                         )
-                        # Update status bar per tool call (tokens/cost live)
                         st = agent.get_status()
                         _ui.set_status(model=st.get('model') or '—', tokens=st.get('tokens_used', 0), cost=st.get('cost', 0.0), session=st.get('session_id','')[:8])
                     except Exception:
                         pass
                 agent.loop.add_event_handler('on_tool_executed', _on_tool)
-                # Permission risk rendering is handled via PermissionManager._render_prompt -> UI box
         status = self.agent.get_status()
         self.ui.set_status(
             model=status.get("model") or "—",

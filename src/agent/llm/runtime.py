@@ -1,7 +1,8 @@
 """Runtime LLM connection selected by the TUI.
 
 A user can supply any OpenAI-compatible Base URL, API key and model ID.
-The runtime connection is kept separate from the built-in provider catalog.
+The runtime connection is the sole source of providers — there is no
+built-in catalog.
 """
 from __future__ import annotations
 
@@ -43,23 +44,64 @@ def configure_runtime_provider(registry: Any, base_url: str, api_key: str,
                                model: str) -> OpenAICompatibleProvider:
     """Install the user endpoint as the active runtime provider."""
     save_runtime_config(base_url, api_key, model)
+
     provider = OpenAICompatibleProvider({
-        "api_key": api_key.strip(), "base_url": base_url.strip().rstrip("/"),
-        "timeout": 30.0, "max_retries": 2,
+        "api_key": api_key.strip(),
+        "base_url": base_url.strip().rstrip("/"),
+        "timeout": 30.0,
+        "max_retries": 2,
     })
-    registry.providers[RUNTIME_PROVIDER] = provider
-    registry._api_keys[RUNTIME_PROVIDER] = api_key.strip()
-    registry._current_provider = RUNTIME_PROVIDER
-    registry._current_model = model.strip()
-    # Existing registry completion code resolves a model through metadata.
-    # This entry is created only for the user-selected runtime model.
-    from agent.llm import provider as provider_module
-    provider_module.MODEL_METADATA[model.strip()] = {
-        "provider": RUNTIME_PROVIDER, "name": model.strip(),
-        "description": "User-configured runtime model", "context_window": 200_000,
-        "max_output": 16_384, "cost_input": 0.0, "cost_output": 0.0,
-        "capabilities": ["text", "function_calling"],
-        "recommended_for": ["agentic tasks"], "speed": "provider-dependent",
-        "quality": "provider-dependent",
-    }
+
+    registry.install_provider(
+        name=RUNTIME_PROVIDER,
+        provider=provider,
+        api_key=api_key.strip(),
+        model=model.strip(),
+        metadata={
+            "provider": RUNTIME_PROVIDER,
+            "name": model.strip(),
+            "description": "User-configured runtime model",
+            "context_window": 200_000,
+            "max_output": 16_384,
+            "cost_input": 0.0,
+            "cost_output": 0.0,
+            "capabilities": ["text", "function_calling"],
+            "recommended_for": ["agentic tasks"],
+            "speed": "provider-dependent",
+            "quality": "provider-dependent",
+        },
+    )
     return provider
+
+
+def apply_persisted_runtime(registry: Any) -> bool:
+    """
+    Re-apply a previously saved runtime connection (from .env).
+    Returns True if a full set of credentials was found and applied.
+    """
+    runtime = load_runtime_config()
+    if not all(runtime.values()):
+        return False
+    try:
+        configure_runtime_provider(
+            registry,
+            runtime["base_url"],
+            runtime["api_key"],
+            runtime["model"],
+        )
+        return True
+    except Exception:
+        return False
+
+
+__all__ = [
+    "RUNTIME_PROVIDER",
+    "ENV_BASE_URL",
+    "ENV_API_KEY",
+    "ENV_MODEL",
+    "ENV_PROVIDER",
+    "load_runtime_config",
+    "save_runtime_config",
+    "configure_runtime_provider",
+    "apply_persisted_runtime",
+]

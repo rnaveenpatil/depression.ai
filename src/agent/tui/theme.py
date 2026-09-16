@@ -1,51 +1,56 @@
-"""Terminal theme for Depression.AI — princess CLI aesthetic."""
-from __future__ import annotations
+"""
+Theme tokens for the TUI.
 
-from textual.app import App
-from textual.theme import Theme as TextualTheme
-
-
-DEPRESSION_THEME = TextualTheme(
-    name="depression",
-    primary="#ff9bc7",
-    secondary="#b794f6",
-    accent="#7ee7ff",
-    warning="#ffd28a",
-    error="#ff6b8a",
-    success="#7ef7c0",
-    surface="#0e0d12",
-    panel="#131118",
-    boost="#1a1820",
-    foreground="#e8e3f0",
-    background="#08070c",
-    dark=True,
-    variables={},
-)
-
-OPENCODE_THEME = DEPRESSION_THEME
-
-OPENCODE_CSS = """
-Screen { background: #08070c; color: #e8e3f0; }
-* {
-    scrollbar-background: #08070c;
-    scrollbar-color: #2a2735;
-    scrollbar-corner-color: #08070c;
-}
-#main-container { height: 1fr; layout: horizontal; }
-#chat-panel    { width: 1fr; background: #08070c; }
-#sidebar       { width: 38; min-width: 32; background: #0e0d12; border-left: solid #2a2735; }
-#status-bar    { height: 1; background: #0e0d12; border-top: solid #2a2735; color: #8a849a; }
-Button         { background: transparent; border: none; }
-ListView       { background: transparent; border: none; }
-ListView > ListItem        { background: transparent; border: none; }
-ListView > ListItem:hover  { background: #1a1820; }
-Markdown       { background: transparent; }
+Single source of truth. All colors used by the app and widgets come
+from here so the palette can be swapped in one place.
 """
 
+from __future__ import annotations
 
-def apply_opencode_theme(app: App) -> None:
-    try:
-        app.register_theme(DEPRESSION_THEME)
-        app.theme = "depression"
-    except Exception:
-        pass
+from textual.theme import Theme
+
+
+GREEN       = "#00ff66"
+GREEN_DIM   = "#00aa44"
+GREEN_FAINT = "#005522"
+GREEN_GLOW  = "#88ffbb"
+AMBER       = "#ffcc44"
+ERROR       = "#ff4466"
+TEXT        = "#aaffcc"
+MUTED       = "#3d8c5c"
+DIM         = "#1a5c33"
+BG          = "#000000"
+PANEL       = "#031008"
+RAISED      = "#061a0f"
+BORDER      = "#0a3d20"
+
+RED_DIFF    = "#ff4466"
+RED_DIFF_DIM = "#7a1f30"
+GREEN_DIFF  = "#00ff66"
+GREEN_DIFF_DIM = "#0a5c2a"
+
+
+MATRIX_THEME = Theme(
+    name="matrix",
+    primary=GREEN,
+    secondary=GREEN_DIM,
+    accent=GREEN_GLOW,
+    warning=AMBER,
+    error=ERROR,
+    success=GREEN,
+    surface=PANEL,
+    panel=RAISED,
+    boost="#0d2a17",
+    foreground=TEXT,
+    background=BG,
+    dark=True,
+)
+
+
+__all__ = [
+    "GREEN", "GREEN_DIM", "GREEN_FAINT", "GREEN_GLOW",
+    "AMBER", "ERROR", "TEXT", "MUTED", "DIM",
+    "BG", "PANEL", "RAISED", "BORDER",
+    "RED_DIFF", "RED_DIFF_DIM", "GREEN_DIFF", "GREEN_DIFF_DIM",
+    "MATRIX_THEME",
+]

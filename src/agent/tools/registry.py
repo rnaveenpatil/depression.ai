@@ -20,6 +20,7 @@ from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 from agent.utils.logging import get_logger
 from agent.utils.errors import ToolError, ToolNotFoundError, ToolExecutionError
+from agent.utils.redact import redact
 
 logger = get_logger(__name__)
 
@@ -162,11 +163,13 @@ class ToolRegistry:
 
         tool = self.tools.get(name)
         if not tool:
-            # Suggest closest match for UX (opencode does)
             from difflib import get_close_matches
             suggestion = get_close_matches(name, list(self.tools.keys()), n=1)
             hint = f" Did you mean '{suggestion[0]}'?" if suggestion else ""
-            raise ToolNotFoundError(f"Tool not found: {name}.{hint} Available: {', '.join(sorted(self.tools.keys()))}")
+            raise ToolNotFoundError(
+                f"Tool not found: {name}.{hint} "
+                f"Available: {', '.join(sorted(self.tools.keys()))}"
+            )
 
         if not getattr(tool, "enabled", True):
             return {"success": False, "error": f"Tool '{name}' is disabled"}
@@ -180,6 +183,12 @@ class ToolRegistry:
             if not isinstance(result, dict):
                 result = {"success": True, "result": result}
 
+            # Redact any credentials before the caller sees the result.
+            try:
+                result = redact(result)
+            except Exception:
+                pass
+
             stats = self.stats[name]
             stats.calls += 1
             if result.get("success", True):
@@ -188,7 +197,6 @@ class ToolRegistry:
                 stats.failures += 1
                 stats.last_error = str(result.get("error", ""))
             stats.total_time += time.time() - t0
-            # Normalize result shape (opencode always returns success flag)
             if "success" not in result:
                 result["success"] = True
             return result
@@ -197,7 +205,13 @@ class ToolRegistry:
             self.stats[name].calls += 1
             self.stats[name].failures += 1
             self.stats[name].last_error = "timeout"
-            return {"success": False, "error": f"Tool '{name}' timed out after {timeout or getattr(tool,'timeout',60.0)}s"}
+            return {
+                "success": False,
+                "error": (
+                    f"Tool '{name}' timed out after "
+                    f"{timeout or getattr(tool, 'timeout', 60.0)}s"
+                ),
+            }
 
         except Exception as e:
             self.stats[name].calls += 1
@@ -211,7 +225,7 @@ class ToolRegistry:
         calls: List[Dict[str, Any]],
         timeout: Optional[float] = None,
     ) -> List[Dict[str, Any]]:
-        """Execute multiple tool calls concurrently — up to 5 at a time (OpenCode style)."""
+        """Execute multiple tool calls concurrently — up to 5 at a time."""
         semaphore = asyncio.Semaphore(5)
 
         async def _run(c: Dict[str, Any]) -> Dict[str, Any]:
@@ -232,9 +246,15 @@ class ToolRegistry:
         info = self._external[name]
         handler = info["handler"]
         try:
-            result = await asyncio.wait_for(handler(**params), timeout=timeout or 60.0)
+            result = await asyncio.wait_for(
+                handler(**params), timeout=timeout or 60.0
+            )
             if not isinstance(result, dict):
                 result = {"success": True, "result": result}
+            try:
+                result = redact(result)
+            except Exception:
+                pass
             self.stats[name].calls += 1
             self.stats[name].successes += 1
             return result
@@ -259,3 +279,6 @@ class ToolRegistry:
             }
             for name, s in self.stats.items()
         }
+
+
+__all__ = ["BaseTool", "ToolRegistry", "ToolStats"]

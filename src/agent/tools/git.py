@@ -14,9 +14,19 @@ from agent.utils.logging import get_logger
 logger = get_logger(__name__)
 
 
+# Mutating actions that must be rejected when read_only=True.
+_WRITE_ACTIONS = {
+    "add", "commit", "checkout", "pull", "push", "stash", "reset",
+    "branch_delete", "tag_delete", "clean", "rebase", "merge", "cherry_pick",
+}
+
+
 class GitTool(BaseTool):
     name = "git"
-    description = "Inspect and manipulate git repositories (status, diff, log, add, commit, branch)."
+    description = (
+        "Inspect and manipulate git repositories "
+        "(status, diff, log, add, commit, branch)."
+    )
     parameters = {
         "type": "object",
         "properties": {
@@ -39,24 +49,32 @@ class GitTool(BaseTool):
     }
     timeout = 60.0
 
-    def __init__(self, workspace: Any = None):
+    def __init__(self, workspace: Any = None, read_only: bool = False):
         self.workspace = workspace
-        self.cwd = (
-            str(workspace.get_project_dir()) if workspace else os.getcwd()
-        )
+        self.read_only = bool(read_only)
+        self.cwd = str(workspace.get_project_dir()) if workspace else os.getcwd()
 
     async def _git(self, *args: str, timeout: float = 30.0) -> Dict[str, Any]:
-        proc = await asyncio.create_subprocess_exec(
-            "git", *args,
-            cwd=self.cwd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "git", *args,
+                cwd=self.cwd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+        except FileNotFoundError:
+            return {"success": False, "error": "git executable not found"}
+
         try:
             stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
         except asyncio.TimeoutError:
-            proc.kill()
+            try:
+                proc.kill()
+                await asyncio.wait_for(proc.wait(), timeout=2)
+            except Exception:
+                pass
             return {"success": False, "error": "git command timed out"}
+
         return {
             "success": proc.returncode == 0,
             "exit_code": proc.returncode,
@@ -65,7 +83,16 @@ class GitTool(BaseTool):
         }
 
     async def execute(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        action = params.get("action", "").lower()
+        action = (params.get("action") or "").lower()
+
+        if self.read_only and action in _WRITE_ACTIONS:
+            return {
+                "success": False,
+                "error": f"Action '{action}' not allowed in read-only mode",
+                "permission_denied": True,
+                "tool": self.name,
+            }
+
         args: List[str] = []
 
         if action == "status":
@@ -116,4 +143,5 @@ class GitTool(BaseTool):
         result = await self._git(*args, timeout=self.timeout)
         result["action"] = action
         result["args"] = args
+        result["read_only"] = self.read_only
         return result

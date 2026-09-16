@@ -46,14 +46,17 @@ class TodoTool(BaseTool):
     }
     timeout = 10.0
 
-    # Shared store so todowrite/todoread/todo see same data per session
+    # Shared store per session so `todo`, `todowrite`, and `todoread` see the
+    # same data. Plain dict — session-scoped cleanup is handled by
+    # forget_session(), not by weak references.
     _shared_stores: Dict[Any, Dict[str, TodoItem]] = {}
+    # Alias kept for compatibility with callers that read _strong_keys.
+    _strong_keys: Dict[Any, Dict[str, TodoItem]] = _shared_stores
 
     @staticmethod
     def _session_key(session: Any) -> Any:
         if session is None:
-            return 0
-        # Prefer stable session.id if available (persists across reloads)
+            return "__default__"
         sid = getattr(session, "id", None)
         if isinstance(sid, str) and sid:
             return sid
@@ -62,10 +65,10 @@ class TodoTool(BaseTool):
     def __init__(self, session: Any = None):
         self.session = session
         sid = self._session_key(session)
-        if sid not in self._shared_stores:
-            self._shared_stores[sid] = {}
+        if sid not in self._strong_keys:
+            self._strong_keys[sid] = {}
         # self.items is a reference to the shared dict for this session
-        self.items: Dict[str, TodoItem] = self._shared_stores[sid]
+        self.items: Dict[str, TodoItem] = self._strong_keys[sid]
 
     async def execute(self, params: Dict[str, Any]) -> Dict[str, Any]:
         action = params.get("action", "")
@@ -144,3 +147,8 @@ class TodoTool(BaseTool):
         for i in self.items.values():
             stats[i.status] = stats.get(i.status, 0) + 1
         return {"success": True, "stats": stats, "total": len(self.items)}
+
+    @classmethod
+    def forget_session(cls, session: Any) -> None:
+        """Called on session teardown so the shared store doesn't leak."""
+        cls._strong_keys.pop(cls._session_key(session), None)

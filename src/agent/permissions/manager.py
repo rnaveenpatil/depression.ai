@@ -200,7 +200,11 @@ class PermissionManager:
         self.mode: str = cfg.get("mode", "manual")   # kept for compat
         self.auto_approve: bool = cfg.get("auto_approve", False)
         self.allow_dangerous: bool = cfg.get("allow_dangerous", False)
-        self.default_decision: Decision = Decision.ALLOW
+        self.default_decision: Decision = self._parse_default(
+            cfg.get("default", "allow")
+        )
+        self._rules: Dict[str, str] = {}
+        self._load_rules(cfg)
 
         # No policy list is used — the manager decides directly.
         self.policies: List[Policy] = []
@@ -235,7 +239,51 @@ class PermissionManager:
     # ------------------------------------------------------------------
 
     def _parse_default(self, val: str) -> Decision:
+        if isinstance(val, str):
+            low = val.strip().lower()
+            if low == "ask":
+                return Decision.ASK
+            if low == "deny":
+                return Decision.DENY
         return Decision.ALLOW
+
+    def _load_rules(self, cfg: Dict[str, Any]) -> None:
+        """Load tool/tool.action permission rules from config.
+
+        Accepts the opencode-style nested shorthand
+        ``{"permission": {"*": "ask"}}`` as well as flat top-level entries
+        (``{"*": "ask"}``). Reserved config keys are never treated as rules.
+        """
+        reserved = {
+            "mode", "enabled", "auto_approve", "allow_dangerous", "default",
+            "session_ttl", "input_handler", "permission", "ui",
+        }
+        shared: Dict[str, str] = {}
+        nested = cfg.get("permission")
+        if isinstance(nested, dict):
+            for k, v in nested.items():
+                if isinstance(k, str) and isinstance(v, str) and v.strip().lower() in ("allow", "ask", "deny"):
+                    shared.setdefault(k.lower(), v.strip().lower())
+        for k, v in cfg.items():
+            if k in reserved or not isinstance(k, str) or not isinstance(v, str):
+                continue
+            low = v.strip().lower()
+            if low in ("allow", "ask", "deny"):
+                shared.setdefault(k.lower(), low)
+        self._rules = shared
+
+    def _rule_for(self, request: PermissionRequest) -> Optional[str]:
+        """Find the most specific matching config rule for the request."""
+        tool = (request.tool or "").lower()
+        action = (request.action or "").lower()
+        targets = (f"{tool}.{action}", tool, action)
+        best: Optional[Tuple[int, str]] = None
+        for key, verdict in self._rules.items():
+            for t in targets:
+                if fnmatch.fnmatchcase(t, key):
+                    if best is None or len(key) > best[0]:
+                        best = (len(key), verdict)
+        return best[1] if best else None
 
     def _register_policies(self, cfg: Dict[str, Any]) -> None:
         # No policies. The manager handles everything directly.
@@ -352,11 +400,47 @@ class PermissionManager:
         destructive, why = _looks_destructive(
             request.tool, request.action, request.params
         )
-        if destructive:
+        if destructive and not self.allow_dangerous:
             return PermissionVerdict.ask(
                 f"destructive action detected ({why})",
                 risk=RiskLevel.HIGH,
                 policy="delete_guard",
+            )
+
+        # --- config rules (tool / tool.action / glob) ----------------
+        rule = self._rule_for(request)
+        if rule == "deny":
+            return PermissionVerdict.deny(
+                "denied by config rule",
+                risk=RiskLevel.HIGH,
+                policy="config",
+            )
+        if rule == "ask":
+            return PermissionVerdict.ask(
+                "config rule asks for confirmation",
+                risk=RiskLevel.MEDIUM,
+                policy="config",
+            )
+        if rule == "allow":
+            self.stats["auto_approved"] += 1
+            return PermissionVerdict.allow(
+                "allowed by config rule",
+                risk=RiskLevel.SAFE,
+                policy="config",
+            )
+
+        # --- default decision ----------------------------------------
+        if self.default_decision == Decision.ASK:
+            return PermissionVerdict.ask(
+                "default policy asks for confirmation",
+                risk=RiskLevel.MEDIUM,
+                policy="default_ask",
+            )
+        if self.default_decision == Decision.DENY:
+            return PermissionVerdict.deny(
+                "default policy denies",
+                risk=RiskLevel.MEDIUM,
+                policy="default_deny",
             )
 
         # --- everything else is allowed ------------------------------

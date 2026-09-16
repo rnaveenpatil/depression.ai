@@ -4,6 +4,7 @@ Filesystem Tool - Read / write / edit / list / delete files inside the workspace
 
 from __future__ import annotations
 
+import asyncio
 import os
 import shutil
 from pathlib import Path
@@ -19,24 +20,31 @@ class FileSystemTool(BaseTool):
     name = "filesystem"
     description = (
         "Read, write, edit, list, and delete files in the project. "
-        "All paths are relative to the workspace unless absolute paths are allowed."
+        "All paths are relative to the workspace unless allowlisted."
     )
     parameters = {
         "type": "object",
         "properties": {
             "action": {
                 "type": "string",
-                "enum": ["read", "write", "append", "edit", "list", "stat", "delete", "mkdir", "move", "copy"],
-                "description": "Operation to perform",
+                "enum": [
+                    "read", "write", "append", "edit", "list",
+                    "stat", "delete", "mkdir", "move", "copy",
+                ],
             },
-            "path": {"type": "string", "description": "Target file or directory"},
-            "content": {"type": "string", "description": "For write/append/edit"},
-            "old": {"type": "string", "description": "For edit: text to replace"},
-            "new": {"type": "string", "description": "For edit: replacement text"},
-            "dest": {"type": "string", "description": "For move/copy: destination"},
-            "pattern": {"type": "string", "description": "For list: glob pattern"},
+            "path": {"type": "string"},
+            "content": {"type": "string"},
+            "old": {"type": "string"},
+            "new": {"type": "string"},
+            "dest": {"type": "string"},
+            "pattern": {"type": "string"},
             "recursive": {"type": "boolean", "default": False},
             "max_bytes": {"type": "integer", "default": 1048576},
+            "max_files": {"type": "integer", "default": 500},
+            # Optional: include before/after content in the response so the
+            # TUI can render a red/green diff. Off by default to keep the
+            # LLM prompt small; on when requested by an explicit flag.
+            "include_diff": {"type": "boolean", "default": False},
         },
         "required": ["action", "path"],
     }
@@ -47,24 +55,20 @@ class FileSystemTool(BaseTool):
 
     # ------------------------------------------------------------------
 
-    # Cache for stat calls within a single list operation
-    _stat_cache: Dict[str, Any] = {}
-
     def _resolve(self, path: str) -> Path:
-        # Allow absolute paths outside workspace for /tmp/opencode-style temp handling
-        # OpenCode permits /tmp for external work — mirror that
-        if path.startswith("/tmp/") or path.startswith("/tmp\\"):
-            p = Path(os.path.expanduser(path))
-            return p.resolve()
+        # Temp paths are allowed outside the workspace.
+        expanded = os.path.expanduser(path)
+        if expanded.startswith(("/tmp/", "/tmp\\", "/var/tmp/")):
+            return Path(expanded).resolve()
         if self.workspace:
             return self.workspace.assert_inside_workspace(path)
-        p = Path(os.path.expanduser(path))
+        p = Path(expanded)
         if not p.is_absolute():
             p = Path.cwd() / p
         return p.resolve()
 
     async def execute(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        action = params.get("action", "read").lower()
+        action = (params.get("action") or "read").lower()
         path = params.get("path", "")
         if not path:
             return {"success": False, "error": "Missing path"}
@@ -108,7 +112,7 @@ class FileSystemTool(BaseTool):
             return await self._list(target, params)
 
         max_bytes = int(params.get("max_bytes", 1_048_576))
-        # Use thread pool for large files to avoid blocking event loop
+
         def _read_bytes() -> tuple[bytes, bool, int]:
             with open(target, "rb") as f:
                 raw = f.read(max_bytes + 1)
@@ -117,11 +121,10 @@ class FileSystemTool(BaseTool):
                 raw = raw[:max_bytes]
             size = target.stat().st_size
             return raw, truncated, size
-        import asyncio
+
         raw, truncated, size = await asyncio.to_thread(_read_bytes)
         if b"\x00" in raw[:2048]:
             return {"success": False, "error": "Binary file not supported"}
-        # Fast decode with error replace
         content = raw.decode("utf-8", errors="replace")
         return {
             "success": True,
@@ -133,14 +136,41 @@ class FileSystemTool(BaseTool):
 
     async def _write(self, target: Path, params: Dict[str, Any], mode: str) -> Dict[str, Any]:
         content = params.get("content", "")
+        include_diff = bool(params.get("include_diff", False))
+
+        # Capture pre-image for append/write when a diff was requested.
+        before = ""
+        existed = target.exists()
+        if include_diff and existed and target.is_file():
+            try:
+                before = target.read_text(encoding="utf-8", errors="replace")
+            except Exception:
+                before = ""
+
         target.parent.mkdir(parents=True, exist_ok=True)
-        with open(target, mode, encoding="utf-8") as f:
-            f.write(content)
-        return {
+
+        def _do_write() -> int:
+            with open(target, mode, encoding="utf-8") as f:
+                f.write(content)
+            return len(content.encode("utf-8"))
+
+        written = await asyncio.to_thread(_do_write)
+
+        result: Dict[str, Any] = {
             "success": True,
             "path": str(target),
-            "bytes_written": len(content.encode("utf-8")),
+            "bytes_written": written,
         }
+        if include_diff:
+            after = ""
+            try:
+                after = target.read_text(encoding="utf-8", errors="replace")
+            except Exception:
+                after = ""
+            result["before"] = before
+            result["after"] = after
+            result["created"] = not existed
+        return result
 
     async def _edit(self, target: Path, params: Dict[str, Any]) -> Dict[str, Any]:
         old = params.get("old")
@@ -154,44 +184,54 @@ class FileSystemTool(BaseTool):
         count = text.count(old)
         if count == 0:
             return {"success": False, "error": "old text not found"}
-        updated = text.replace(old, new, 1 if not params.get("all") else -1)
+        replace_all = bool(params.get("all"))
+        updated = text.replace(old, new, -1 if replace_all else 1)
         target.write_text(updated, encoding="utf-8")
-        return {
+
+        result: Dict[str, Any] = {
             "success": True,
             "path": str(target),
-            "replacements": 1 if not params.get("all") else count,
+            "replacements": count if replace_all else 1,
         }
+        if bool(params.get("include_diff", False)):
+            result["before"] = text
+            result["after"] = updated
+        return result
 
     async def _list(self, target: Path, params: Dict[str, Any]) -> Dict[str, Any]:
         if not target.exists():
             return {"success": False, "error": f"Not found: {target}"}
+        if target.is_file():
+            return {"success": True, "path": str(target), "entries": [target.name]}
+
         recursive = bool(params.get("recursive", False))
         pattern = params.get("pattern", "*")
         max_files = int(params.get("max_files", 500))
 
-        if target.is_file():
-            return {"success": True, "path": str(target), "entries": [target.name]}
+        iterator = target.rglob(pattern) if recursive else target.glob(pattern)
 
         entries: List[Dict[str, Any]] = []
-        if recursive:
-            iterator = target.rglob(pattern)
-        else:
-            iterator = target.glob(pattern)
-
         for p in iterator:
             try:
                 st = p.stat()
-                entries.append({
-                    "path": str(p.relative_to(target)),
-                    "type": "dir" if p.is_dir() else "file",
-                    "size": st.st_size if p.is_file() else None,
-                })
+                entries.append(
+                    {
+                        "path": str(p.relative_to(target)),
+                        "type": "dir" if p.is_dir() else "file",
+                        "size": st.st_size if p.is_file() else None,
+                    }
+                )
                 if len(entries) >= max_files:
                     break
             except Exception:
                 continue
 
-        return {"success": True, "path": str(target), "entries": entries, "count": len(entries)}
+        return {
+            "success": True,
+            "path": str(target),
+            "entries": entries,
+            "count": len(entries),
+        }
 
     async def _stat(self, target: Path) -> Dict[str, Any]:
         if not target.exists():
@@ -211,7 +251,10 @@ class FileSystemTool(BaseTool):
             return {"success": False, "error": f"Not found: {target}"}
         if target.is_dir():
             if not params.get("recursive", False):
-                return {"success": False, "error": "Directory deletion requires recursive=true"}
+                return {
+                    "success": False,
+                    "error": "Directory deletion requires recursive=true",
+                }
             shutil.rmtree(target)
         else:
             target.unlink()

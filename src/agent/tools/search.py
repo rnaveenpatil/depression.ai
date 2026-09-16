@@ -3,7 +3,6 @@ Search Tool - Regex / glob / text search across the project.
 
 Backends:
     - "ripgrep"  if `rg` is available
-    - "grep"     fallback
     - "python"   pure-Python fallback
 """
 
@@ -56,27 +55,33 @@ class SearchTool(BaseTool):
             str(self.workspace.get_project_dir()) if self.workspace else os.getcwd()
         )
 
-        if shutil.which("rg"):
-            return await self._ripgrep(query, root, params)
+        # name_only relies on Python filtering even when rg is present, because
+        # `rg --files` ignores the query entirely.
+        if shutil.which("rg") and not params.get("name_only"):
+            rg_result = await self._ripgrep(query, root, params)
+            if rg_result is not None:
+                return rg_result
+
         return await self._python_search(query, root, params)
 
     # ------------------------------------------------------------------
 
     async def _ripgrep(
         self, query: str, root: str, params: Dict[str, Any]
-    ) -> Dict[str, Any]:
-        args = ["rg", "--line-number", "--no-heading", "--color=never", "--hidden", "--glob", "!.git"]
+    ) -> Optional[Dict[str, Any]]:
+        args = [
+            "rg", "--line-number", "--no-heading", "--color=never",
+            "--hidden", "--glob", "!.git",
+        ]
         if not params.get("case_sensitive"):
             args.append("-i")
         if not params.get("regex"):
             args.append("-F")
-        if params.get("name_only"):
-            args.append("--files")
         glob = params.get("glob")
         if glob and glob != "*":
             args.extend(["--glob", glob])
-        # Respect .gitignore already via rg defaults; cap results
-        args.extend(["--max-count", str(int(params.get("max_results", 100)))])
+        max_results = int(params.get("max_results", 100))
+        args.extend(["--max-count", str(max_results)])
         args.extend([query, root])
 
         try:
@@ -85,30 +90,45 @@ class SearchTool(BaseTool):
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
-            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=30)
-            # If rg succeeded, parse
-            if proc.returncode not in (0, 1):  # 1 = no matches, still success
-                return await self._python_search(query, root, params)
-        except Exception:
-            return await self._python_search(query, root, params)
+            try:
+                stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=30)
+            except asyncio.TimeoutError:
+                try:
+                    proc.kill()
+                    await asyncio.wait_for(proc.wait(), timeout=2)
+                except Exception:
+                    pass
+                return None
+        except FileNotFoundError:
+            return None
+        except Exception as e:
+            logger.debug("ripgrep failed (%s); falling back to Python", e)
+            return None
 
-        max_results = int(params.get("max_results", 100))
+        # rg: 0 = matches found, 1 = no matches, 2+ = real error.
+        if proc.returncode not in (0, 1):
+            return None
+
         matches: List[Dict[str, Any]] = []
         for line in stdout.decode(errors="replace").splitlines():
             if len(matches) >= max_results:
                 break
-            if params.get("name_only"):
-                matches.append({"path": line})
-            else:
-                parts = line.split(":", 2)
-                if len(parts) == 3:
-                    matches.append({
+            parts = line.split(":", 2)
+            if len(parts) == 3:
+                matches.append(
+                    {
                         "path": parts[0],
                         "line": int(parts[1]) if parts[1].isdigit() else None,
                         "text": parts[2],
-                    })
+                    }
+                )
 
-        return {"success": True, "matches": matches, "count": len(matches), "backend": "ripgrep"}
+        return {
+            "success": True,
+            "matches": matches,
+            "count": len(matches),
+            "backend": "ripgrep",
+        }
 
     async def _python_search(
         self, query: str, root: str, params: Dict[str, Any]
@@ -120,17 +140,22 @@ class SearchTool(BaseTool):
         name_only = bool(params.get("name_only"))
 
         try:
-            pattern = re.compile(query if is_regex else re.escape(query),
-                                0 if case_sensitive else re.IGNORECASE)
+            pattern = re.compile(
+                query if is_regex else re.escape(query),
+                0 if case_sensitive else re.IGNORECASE,
+            )
         except re.error as e:
             return {"success": False, "error": f"Invalid regex: {e}"}
 
         matches: List[Dict[str, Any]] = []
         root_path = Path(root)
 
-        def _scan():
+        def _scan() -> None:
             for dirpath, dirnames, filenames in os.walk(root_path):
-                dirnames[:] = [d for d in dirnames if d not in (".git", "node_modules", "__pycache__")]
+                dirnames[:] = [
+                    d for d in dirnames
+                    if d not in (".git", "node_modules", "__pycache__", ".venv", "venv")
+                ]
                 for fn in filenames:
                     if not fnmatch.fnmatch(fn, glob):
                         continue
@@ -138,22 +163,29 @@ class SearchTool(BaseTool):
                     if name_only:
                         if pattern.search(fn):
                             matches.append({"path": str(p)})
-                    else:
-                        try:
-                            with open(p, "r", encoding="utf-8", errors="replace") as f:
-                                for i, line in enumerate(f, 1):
-                                    if pattern.search(line):
-                                        matches.append({
+                            if len(matches) >= max_results:
+                                return
+                        continue
+                    try:
+                        with open(p, "r", encoding="utf-8", errors="replace") as f:
+                            for i, line in enumerate(f, 1):
+                                if pattern.search(line):
+                                    matches.append(
+                                        {
                                             "path": str(p),
                                             "line": i,
                                             "text": line.rstrip("\n"),
-                                        })
-                                        if len(matches) >= max_results:
-                                            return
-                        except Exception:
-                            continue
-                    if len(matches) >= max_results:
-                        return
+                                        }
+                                    )
+                                    if len(matches) >= max_results:
+                                        return
+                    except Exception:
+                        continue
 
         await asyncio.to_thread(_scan)
-        return {"success": True, "matches": matches, "count": len(matches), "backend": "python"}
+        return {
+            "success": True,
+            "matches": matches,
+            "count": len(matches),
+            "backend": "python",
+        }

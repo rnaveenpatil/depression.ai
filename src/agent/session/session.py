@@ -12,9 +12,8 @@ import json
 import os
 import time
 import uuid
-from dataclasses import dataclass, field, asdict
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 from agent.utils.logging import get_logger
 from agent.utils.errors import SessionError
@@ -29,16 +28,7 @@ logger = get_logger(__name__)
 # ======================================================================
 
 class Session:
-    """
-    A single conversation session.
-
-    Holds:
-        - identity (id, name, created_at, updated_at)
-        - history (SessionHistory)
-        - runtime state (SessionState)
-        - optional context snapshot
-        - metadata / tags
-    """
+    """A single conversation session."""
 
     def __init__(
         self,
@@ -55,8 +45,6 @@ class Session:
 
         self.history = SessionHistory(max_entries=max_messages)
         self.state = SessionState()
-
-        # Optional: snapshot of context
         self.context_snapshot: Dict[str, Any] = {}
 
     # ------------------------------------------------------------------
@@ -91,8 +79,12 @@ class Session:
     def add_assistant_message(self, content: str, tokens: int = 0) -> HistoryEntry:
         return self.add_message("assistant", content, tokens=tokens)
 
-    def add_system_message(self, content: str, tokens: int = 0, pinned: bool = True) -> HistoryEntry:
-        return self.add_message("system", content, tokens=tokens, pinned=pinned)
+    def add_system_message(
+        self, content: str, tokens: int = 0, pinned: bool = True
+    ) -> HistoryEntry:
+        return self.add_message(
+            "system", content, tokens=tokens, pinned=pinned
+        )
 
     def add_tool_message(
         self,
@@ -117,11 +109,13 @@ class Session:
         self.updated_at = time.time()
         self.state.touch()
 
-    def set_status(self, status: str | SessionStatus) -> None:
+    def set_status(self, status: Any) -> None:
         self.state.set_status(status)
         self.touch()
 
-    def add_usage(self, tokens_in: int = 0, tokens_out: int = 0, cost: float = 0.0) -> None:
+    def add_usage(
+        self, tokens_in: int = 0, tokens_out: int = 0, cost: float = 0.0
+    ) -> None:
         self.state.add_usage(tokens_in, tokens_out, cost)
         self.touch()
 
@@ -200,14 +194,13 @@ class SessionManager:
 
     Storage layout:
         ~/.agent/sessions/
-            index.json             — fast listing (id, name, updated_at, ...)
+            index.json             — fast listing
             <session_id>.json      — full session
-            <session_id>.jsonl     — optional streaming history export
     """
 
     def __init__(
         self,
-        database: Any = None,                      # optional persistent DB
+        database: Any = None,
         config: Optional[Dict[str, Any]] = None,
     ):
         cfg = config or {}
@@ -224,17 +217,27 @@ class SessionManager:
         self.auto_save: bool = cfg.get("auto_save", True)
         self.save_interval: float = cfg.get("save_interval", 30.0)
         self.max_sessions: int = cfg.get("max_sessions", 100)
-        self.max_messages_per_session: int = cfg.get("max_messages_per_session", 5000)
+        self.max_messages_per_session: int = cfg.get(
+            "max_messages_per_session", 5000
+        )
         self.default_name: str = cfg.get("default_name", "session")
+        # Opt-in: on boot with no --session/--new-session, resume the most
+        # recent session. Default False (start fresh) to match most CLIs.
+        self.resume_last: bool = cfg.get("resume_last", False)
 
         self._current: Optional[Session] = None
         self._last_save: float = 0.0
         self._index: Dict[str, Dict[str, Any]] = {}
+        self._lock = asyncio.Lock()
+
         self._load_index()
 
         logger.info(
-            f"SessionManager initialized (dir={self.storage_dir}, "
-            f"auto_save={self.auto_save}, sessions={len(self._index)})"
+            "SessionManager initialized (dir=%s, auto_save=%s, resume_last=%s, sessions=%d)",
+            self.storage_dir,
+            self.auto_save,
+            self.resume_last,
+            len(self._index),
         )
 
     # ------------------------------------------------------------------
@@ -252,14 +255,19 @@ class SessionManager:
                 elif isinstance(data, list):
                     self._index = {s["id"]: s for s in data if "id" in s}
             except Exception as e:
-                logger.warning(f"Failed to load session index: {e}")
+                logger.warning("Failed to load session index: %s", e)
 
-    def _save_index(self) -> None:
-        try:
+    async def _save_index(self) -> None:
+        data = {"sessions": self._index}
+
+        def _write() -> None:
             with open(self.index_path, "w", encoding="utf-8") as f:
-                json.dump({"sessions": self._index}, f, indent=2, default=str)
+                json.dump(data, f, indent=2, default=str)
+
+        try:
+            await asyncio.to_thread(_write)
         except Exception as e:
-            logger.warning(f"Failed to save session index: {e}")
+            logger.warning("Failed to save session index: %s", e)
 
     def _path_for(self, session_id: str) -> Path:
         safe = "".join(c for c in session_id if c.isalnum() or c in "-_")
@@ -274,78 +282,90 @@ class SessionManager:
         name: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> Session:
-        session = Session(
-            name=name or self.default_name,
-            metadata=metadata or {},
-            max_messages=self.max_messages_per_session,
-        )
-        self._current = session
-        self._index[session.id] = session.to_summary()
-        self._save_index()
+        async with self._lock:
+            session = Session(
+                name=name or self.default_name,
+                metadata=metadata or {},
+                max_messages=self.max_messages_per_session,
+            )
+            self._current = session
+            self._index[session.id] = session.to_summary()
+        await self._save_index()
         await self.save_current_session()
-        logger.info(f"Created session: {session.id}")
+        logger.info("Created session: %s", session.id)
         return session
 
     async def load_session(self, session_id: str) -> Optional[Session]:
         path = self._path_for(session_id)
 
-        # Try database first
         if self.database is not None:
             try:
                 data = await self.database.load_session(session_id)
                 if data:
                     session = Session.from_dict(data)
-                    self._current = session
-                    logger.info(f"Loaded session from DB: {session_id}")
+                    async with self._lock:
+                        self._current = session
+                    logger.info("Loaded session from DB: %s", session_id)
                     return session
             except Exception as e:
-                logger.debug(f"DB load failed: {e}")
+                logger.debug("DB load failed: %s", e)
 
         if not path.exists():
             return None
 
-        try:
+        def _read() -> Optional[Dict[str, Any]]:
             with open(path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            session = Session.from_dict(data)
-            self._current = session
-            logger.info(f"Loaded session: {session_id}")
-            return session
+                return json.load(f)
+
+        try:
+            data = await asyncio.to_thread(_read)
         except Exception as e:
-            logger.error(f"Failed to load session {session_id}: {e}")
+            logger.error("Failed to load session %s: %s", session_id, e)
             return None
 
+        if not data:
+            return None
+
+        session = Session.from_dict(data)
+        async with self._lock:
+            self._current = session
+        logger.info("Loaded session: %s", session_id)
+        return session
+
     async def save_current_session(self) -> bool:
-        if not self._current:
+        session = self._current
+        if not session:
             return False
-        return await self.save_session(self._current)
+        return await self.save_session(session)
 
     async def save_session(self, session: Session) -> bool:
         session.touch()
         path = self._path_for(session.id)
+        data = session.to_dict()
+
+        def _write() -> None:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(data, f, default=str)
 
         try:
-            data = session.to_dict()
-            with open(path, "w", encoding="utf-8") as f:
-                json.dump(data, f, indent=2, default=str)
+            await asyncio.to_thread(_write)
         except Exception as e:
-            logger.error(f"Failed to save session {session.id}: {e}")
+            logger.error("Failed to save session %s: %s", session.id, e)
             return False
 
-        # Update index
-        self._index[session.id] = session.to_summary()
-        self._save_index()
+        async with self._lock:
+            self._index[session.id] = session.to_summary()
+        await self._save_index()
 
-        # Optional DB mirror
         if self.database is not None:
             try:
                 await self.database.save_session(session.to_dict())
             except Exception as e:
-                logger.debug(f"DB save failed: {e}")
+                logger.debug("DB save failed: %s", e)
 
         self._last_save = time.time()
         self._enforce_max_sessions()
-        logger.debug(f"Saved session: {session.id}")
+        logger.debug("Saved session: %s", session.id)
         return True
 
     async def autosave(self) -> bool:
@@ -377,13 +397,13 @@ class SessionManager:
                 path.unlink()
                 removed = True
         except Exception as e:
-            logger.warning(f"Failed to delete session file: {e}")
+            logger.warning("Failed to delete session file: %s", e)
 
-        self._index.pop(session_id, None)
-        self._save_index()
-
-        if self._current and self._current.id == session_id:
-            self._current = None
+        async with self._lock:
+            self._index.pop(session_id, None)
+            if self._current and self._current.id == session_id:
+                self._current = None
+        await self._save_index()
 
         if self.database is not None:
             try:
@@ -391,7 +411,7 @@ class SessionManager:
             except Exception:
                 pass
 
-        logger.info(f"Deleted session: {session_id} (removed={removed})")
+        logger.info("Deleted session: %s (removed=%s)", session_id, removed)
         return removed
 
     async def delete_all_sessions(self) -> int:
@@ -416,21 +436,31 @@ class SessionManager:
             except Exception:
                 pass
             self._index.pop(sid, None)
-        self._save_index()
+        # Fire-and-forget; index will be re-saved on next call.
+        try:
+            asyncio.get_running_loop().create_task(self._save_index())
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------
     # CURRENT SESSION
     # ------------------------------------------------------------------
 
     async def get_or_create_session(self) -> Session:
+        """
+        If resume_last is enabled and a prior session exists, load it.
+        Otherwise create a fresh session.
+        """
         if self._current:
             return self._current
-        # Try to load the most recently updated session
-        sessions = await self.list_sessions()
-        if sessions:
-            loaded = await self.load_session(sessions[0]["id"])
-            if loaded:
-                return loaded
+
+        if self.resume_last:
+            sessions = await self.list_sessions()
+            if sessions:
+                loaded = await self.load_session(sessions[0]["id"])
+                if loaded:
+                    return loaded
+
         return await self.create_session()
 
     @property
@@ -486,7 +516,9 @@ class SessionManager:
     # EXPORT / IMPORT
     # ------------------------------------------------------------------
 
-    async def export_session(self, session_id: Optional[str] = None) -> Dict[str, Any]:
+    async def export_session(
+        self, session_id: Optional[str] = None
+    ) -> Dict[str, Any]:
         session = self._current
         if session_id:
             session = await self.load_session(session_id)
@@ -496,9 +528,10 @@ class SessionManager:
 
     async def import_session(self, data: Dict[str, Any]) -> Session:
         session = Session.from_dict(data)
-        self._current = session
+        async with self._lock:
+            self._current = session
         await self.save_session(session)
-        logger.info(f"Imported session: {session.id}")
+        logger.info("Imported session: %s", session.id)
         return session
 
     # ------------------------------------------------------------------

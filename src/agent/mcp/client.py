@@ -14,7 +14,7 @@ Built-in presets:
     - github      : repositories, issues, PRs
     - browser     : research docs and websites
     - database    : SQL / SQLite / Postgres / MySQL queries
-    - aws         : AWS CLI MCP (optional)
+    - aws         : AWS CLI MCP (reads credentials from .env)
 
 Features:
     - Multi-server management
@@ -45,6 +45,10 @@ import httpx
 
 from agent.utils.logging import get_logger
 from agent.utils.errors import MCPError, MCPConnectionError, MCPTimeoutError
+from agent.mcp.aws_config import (
+    build_aws_mcp_config,
+    build_aws_cli_fallback_status,
+)
 
 logger = get_logger(__name__)
 
@@ -500,8 +504,6 @@ class MCPPresets:
             - list_directory, create_directory, move_file
             - search_files, get_file_info
             - directory_tree
-
-        Requires `npx` on PATH.
         """
         dirs = allowed_dirs or [os.getcwd()]
         return MCPServerConfig(
@@ -570,8 +572,6 @@ class MCPPresets:
             - search_repositories, search_code, search_issues
             - create_branch, list_commits, fork_repository
             - list_branches, get_commit
-
-        Requires a GitHub personal access token.
         """
         api_key = token or os.environ.get(token_env)
 
@@ -606,8 +606,6 @@ class MCPPresets:
             - browser_evaluate, browser_wait_for
             - browser_tab_new, browser_tab_close, browser_tab_list
             - browser_network_requests
-
-        Requires `npx` on PATH.
         """
         args = ["-y", "@playwright/mcp@latest"]
         if headless:
@@ -704,7 +702,7 @@ class MCPPresets:
         )
 
     # ------------------------------------------------------------------
-    # AWS — optional (agent already has terminal to run AWS CLI)
+    # AWS — delegates to agent.mcp.aws_config
     # ------------------------------------------------------------------
     @staticmethod
     def aws(
@@ -713,31 +711,35 @@ class MCPPresets:
         name: str = "aws",
     ) -> MCPServerConfig:
         """
-        AWS MCP server (community).
+        AWS MCP server.
 
-        Exposes:
-            - s3_list_buckets, s3_list_objects, s3_get_object
-            - ec2_describe_instances
-            - lambda_list_functions, lambda_invoke
-            - cloudwatch_get_metrics
-            - iam_list_users, iam_list_roles
-
-        Requires `uvx` on PATH and AWS credentials configured.
+        Reads credentials from .env and passes them to the child process
+        only. Returns a disabled stub if uvx or credentials are missing,
+        so the caller can decide to fall back to the bash tool.
         """
-        env = {}
-        if profile:
-            env["AWS_PROFILE"] = profile
-        if region:
-            env["AWS_REGION"] = region
-
+        cfg_dict = build_aws_mcp_config(
+            region=region, profile=profile, server_name=name,
+        )
+        if cfg_dict is None:
+            return MCPServerConfig(
+                name=name,
+                transport=MCPTransport.STDIO,
+                command="__unavailable__",
+                args=[],
+                enabled=False,
+                timeout=30.0,
+                auto_reconnect=False,
+            )
         return MCPServerConfig(
-            name=name,
+            name=cfg_dict["name"],
             transport=MCPTransport.STDIO,
-            command="uvx",
-            args=["awslabs.core-mcp-server@latest"],
-            env=env,
-            timeout=60.0,
-            auto_reconnect=True,
+            command=cfg_dict["command"],
+            args=cfg_dict["args"],
+            env=cfg_dict["env"],
+            timeout=cfg_dict["timeout"],
+            auto_reconnect=cfg_dict["auto_reconnect"],
+            max_reconnect_attempts=cfg_dict["max_reconnect_attempts"],
+            enabled=True,
         )
 
     # ------------------------------------------------------------------
@@ -982,15 +984,22 @@ class MCPClient:
             except Exception as e:
                 logger.error(f"Failed to build database preset: {e}")
 
-        # --- AWS (optional) ---
+        # --- AWS ---
         aws = presets.get("aws", {})
         if aws.get("enabled", False):
             try:
-                out.append(MCPPresets.aws(
+                cfg = MCPPresets.aws(
                     profile=aws.get("profile"),
                     region=aws.get("region"),
                     name=aws.get("name", "aws"),
-                ))
+                )
+                if cfg.enabled:
+                    out.append(cfg)
+                else:
+                    logger.info(
+                        "AWS preset requested but unavailable "
+                        "(missing creds or uvx); CLI fallback will be used"
+                    )
             except Exception as e:
                 logger.error(f"Failed to build aws preset: {e}")
 
@@ -1339,6 +1348,7 @@ class MCPClient:
             "tools_count": len(self.tools),
             "resources_count": len(self.resources),
             "prompts_count": len(self.prompts),
+            "aws_fallback": build_aws_cli_fallback_status(),
         }
 
     def __repr__(self) -> str:
