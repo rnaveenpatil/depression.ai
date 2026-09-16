@@ -387,7 +387,7 @@ class Agent:
                     "query": query, "result": result, "duration": elapsed,
                 })
 
-                return {
+                result_out = {
                     "success": result.get("success", True),
                     "response": response_text,
                     "iteration": result.get("iteration", 0),
@@ -395,6 +395,11 @@ class Agent:
                     "duration": elapsed,
                     "context": result.get("context", {}),
                 }
+                if not result_out["success"] and result.get("error"):
+                    # Never swallow the real failure (e.g. LLM API error) behind
+                    # a bare success=False; the TUI/CLI shows this to the user.
+                    result_out["error"] = str(result.get("error"))
+                return result_out
 
             except PermissionDeniedError as e:
                 self.status = AgentStatus.ERROR
@@ -523,7 +528,7 @@ class Agent:
                 self.context.tasks_completed += 1 if result.get("success") else 0
                 self.status = AgentStatus.IDLE
                 
-                return {
+                result_out = {
                     "success": result.get("success", True),
                     "response": response_text,
                     "iteration": result.get("iteration", 0),
@@ -531,6 +536,9 @@ class Agent:
                     "duration": elapsed,
                     "context": result.get("context", {}),
                 }
+                if not result_out["success"] and result.get("error"):
+                    result_out["error"] = str(result.get("error"))
+                return result_out
                 
             except Exception as e:
                 logger.error(f"Main query failed: {e}", exc_info=True)
@@ -549,6 +557,21 @@ class Agent:
         """Execute a tool through the permission gate + registry."""
         if self.is_shutting_down:
             return {"success": False, "error": "Agent shutting down"}
+
+        # Authoritative tool names only — never permission-gate a name the
+        # model invented/misspelled; surface "tool not found" so it can retry.
+        if self.tool_registry and not self.tool_registry.has_tool(tool_name):
+            from difflib import get_close_matches as _gcm
+            available = list(self.tool_registry.tools or {}) + list(
+                getattr(self.tool_registry, "_external", {}) or {})
+            suggestion = _gcm(tool_name, available, n=1)
+            hint = f" Did you mean '{suggestion[0]}'?" if suggestion else ""
+            logger.warning(f"Unknown tool '{tool_name}' requested by model.{hint}")
+            return {
+                "success": False,
+                "error": f"Tool not found: {tool_name}.{hint}",
+                "tool": tool_name,
+            }
 
         # Permission gate
         if require_permission and self.permission_manager:

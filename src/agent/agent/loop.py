@@ -11,7 +11,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Awaitable, Callable, Dict, List, Optional
 from agent.agent.planner import Plan, Planner, TaskStatus
-from agent.llm.provider import LLMProvider, Message, ToolCall
+from agent.llm.provider import LLMProvider, Message, ToolCall, MODEL_METADATA
 from agent.tools.registry import ToolRegistry
 from agent.utils.errors import TimeoutError
 from agent.utils.logging import get_logger
@@ -43,6 +43,7 @@ class AgentLoop:
         self.max_iterations=config.get("max_iterations",50); self.max_tool_calls_per_iteration=config.get("max_tool_calls",5); self.max_history_length=config.get("max_history_length",40); self.enable_planning=config.get("enable_planning",True); self.enable_caching=config.get("enable_caching",True); self.default_timeout=config.get("timeout",60)
         self.state=LoopState.IDLE; self.context=LoopContext(); self.current_plan=None; self.pending_tool_calls=[]; self.completed_tool_calls=[]
         self.performance_history=deque(maxlen=100); self.tool_execution_times={}; self.tool_result_cache={}; self.event_handlers={}; self.should_stop=False; self.is_paused=False
+        self._project_ctx=None; self._project_ctx_ts=0.0
 
     @property
     def model_context(self):
@@ -50,6 +51,7 @@ class AgentLoop:
 
     async def run(self, query: str, context=None, tool_outputs=None, max_turns=None):
         self.context=LoopContext(); self.current_plan=None; self.pending_tool_calls=[]; self.completed_tool_calls=[]; self.should_stop=False; self.is_paused=False
+        self._project_ctx=None; self._project_ctx_ts=0.0
         if max_turns is not None: self.max_iterations=max_turns
         try:
             self.state=LoopState.INITIALIZING
@@ -61,6 +63,9 @@ class AgentLoop:
                 if thought.get("tool_calls"):
                     self.state=LoopState.ACTING; results=await self._act(thought["tool_calls"]); self.state=LoopState.OBSERVING; await self._observe(results); self.state=LoopState.EVALUATING
                     if not await self._evaluate(results): break
+                    fast=await self._maybe_fast_path(thought,results)
+                    if fast is not None:
+                        self.state=LoopState.STOPPED; return self._result(True,fast)
                     continue
                 self.state=LoopState.STOPPED; return self._result(True,thought.get("response", ""))
             self.state=LoopState.STOPPED
@@ -82,17 +87,27 @@ class AgentLoop:
     def _get_tools_description(self):
         return "\n".join(f"- {n}: {t.description}\n  Parameters: {json.dumps(t.parameters,default=str)}" for n,t in self.tool_registry.tools.items())
     async def _get_project_context(self):
-        if self.agent and hasattr(self.agent,"workspace"):
-            return {"project_path":str(self.agent.workspace.project_dir),"files":await self.agent.workspace.list_files(max_files=20),"git_info":await self.agent.workspace.get_git_info() if hasattr(self.agent.workspace,"get_git_info") else None}
-        return {}
+        now=time.time()
+        if self._project_ctx is not None and now-self._project_ctx_ts<5.0:
+            return self._project_ctx
+        if self.agent and getattr(self.agent,"workspace",None) is not None:
+            ctx={"project_path":str(self.agent.workspace.project_dir),"files":await self.agent.workspace.list_files(max_files=20),"git_info":await self.agent.workspace.get_git_info() if hasattr(self.agent.workspace,"get_git_info") else None}
+        else:
+            ctx={}
+        self._project_ctx=ctx; self._project_ctx_ts=now
+        return ctx
     def _get_permissions_context(self):
         p=getattr(self.agent,"permission_manager",None); return {"enabled":p.enabled,"auto_approve":p.auto_approve} if p else {"enabled":True,"auto_approve":False}
     async def _should_plan(self,q):
         return len(q.split())>20 or any(x in q.lower() for x in ("plan","steps","multiple","several"))
 
     async def _create_plan(self, query, context):
+        planner = getattr(self, "planner", None)
+        if planner is None:
+            # No planner wired (e.g. build agent): never an LLM call here.
+            return
         try:
-            self.state=LoopState.PLANNING; self.current_plan=await self.planner.create_plan(goal=query,context=context or {},constraints=self._get_plan_constraints())
+            self.state=LoopState.PLANNING; self.current_plan=await planner.create_plan(goal=query,context=context or {},constraints=self._get_plan_constraints())
             self.context.metadata["plan"]=self.current_plan.to_dict()
             await self.model_context.add_system_message("Execution plan guidance:\n"+json.dumps(self.current_plan.to_dict(),indent=2,default=str))
         except Exception as exc: logger.warning("Planning failed: %s",exc); self.current_plan=None
@@ -111,15 +126,55 @@ class AgentLoop:
         response=await self.llm.complete_with_tools(messages=messages,tools=self._get_available_tools(),temperature=0.7,max_tokens=2000)
         usage=getattr(response,"usage",{}) or {}
         self.context.tokens_used += getattr(usage,"total_tokens",0) if hasattr(usage,"total_tokens") else usage.get("total_tokens",0)
+        self.context.cost += self._compute_cost(usage)
         calls=list(getattr(response,"tool_calls",[]) or []); content=getattr(response,"content",None)
         if calls: await add_tool_call(self.model_context,content,calls)
         else: await self.model_context.add_assistant_message(content or "")
         self.context.tool_calls.extend(calls)
         return {"response":content,"tool_calls":calls}
 
+    def _compute_cost(self, usage) -> float:
+        """Estimate dollar cost from prompt/completion tokens using catalog pricing."""
+        usage = usage or {}
+        model = None
+        try:
+            model = self.llm.get_current_model()
+        except Exception:
+            pass
+        meta = MODEL_METADATA.get(model, {}) if model else {}
+        input_rate = meta.get("cost_input", 0.0) or 0.0
+        output_rate = meta.get("cost_output", 0.0) or 0.0
+        if not input_rate and not output_rate:
+            return 0.0
+        prompt_tokens = usage.get("prompt_tokens", 0) or 0
+        completion_tokens = usage.get("completion_tokens", 0) or 0
+        return (prompt_tokens / 1_000_000) * input_rate + (completion_tokens / 1_000_000) * output_rate
+
     def _get_available_tools(self): return [{"type":"function","function":{"name":n,"description":t.description,"parameters":t.parameters}} for n,t in self.tool_registry.tools.items()]
     async def _get_state_context(self): return {"iteration":self.context.iteration,"max_iterations":self.max_iterations,"actions_taken":len(self.context.actions_taken),"observations":len(self.context.observations),"completed_tool_calls":len(self.completed_tool_calls),"pending_tool_calls":len(self.pending_tool_calls)}
     def _get_plan_context(self): return {"plan_id":self.current_plan.id,"goal":self.current_plan.goal,"completion":self.current_plan.get_completion_percentage(),"pending_tasks":[t.to_dict() for t in self.current_plan.get_pending_tasks()],"completed_tasks":[t.to_dict() for t in self.current_plan.tasks if t.status==TaskStatus.COMPLETED]} if self.current_plan else {}
+
+    async def _maybe_fast_path(self,thought,results):
+        """Return a final response for a trivial single-tool turn (no 2nd LLM call).
+        Only when: first iteration, exactly one tool call, no assistant text, and the
+        tool succeeded with readable output. Otherwise return None (loop continues)."""
+        if self.context.iteration!=1: return None
+        calls=thought.get("tool_calls") or []
+        if len(calls)!=1 or len(results)!=1: return None
+        if thought.get("response"): return None
+        if getattr(calls[0],"name","") in ("question",): return None
+        outcome=results[0].get("result") or {}
+        if not outcome.get("success",False): return None
+        out=outcome.get("content") or outcome.get("output") or outcome.get("result") or outcome.get("text") or ""
+        if not out and outcome.get("path"):
+            # write/edit-style results carry no content field but did succeed
+            if outcome.get("bytes_written") is not None:
+                out = f"Wrote {outcome['bytes_written']} bytes to {outcome['path']}"
+            else:
+                out = f"Result written to {outcome['path']}"
+        if isinstance(out,str) and out.strip(): return out.strip()
+        if isinstance(out,(dict,list)): return json.dumps(out,ensure_ascii=False,default=str)
+        return None
 
     async def _act(self,calls):
         results=[]
@@ -134,8 +189,10 @@ class AgentLoop:
                 await add_tool_result(self.model_context,call,result)
                 if self.enable_caching and result.get("success",False): self.tool_result_cache[key]={"result":result,"timestamp":time.time()}
                 self.completed_tool_calls.append(call); results.append({"tool":call.name,"tool_call_id":call.id,"result":result,"execution_time":elapsed})
+                await self._trigger_event("on_tool_executed",{"tool":call.name,"tool_call_id":call.id,"params":call.arguments,"result":result,"execution_time":elapsed})
             except Exception as exc:
                 result={"success":False,"error":str(exc)}; await add_tool_result(self.model_context,call,result); self.pending_tool_calls.append(call); results.append({"tool":call.name,"tool_call_id":call.id,"result":result,"error":str(exc),"success":False})
+                await self._trigger_event("on_tool_executed",{"tool":call.name,"tool_call_id":call.id,"params":call.arguments,"result":result,"error":str(exc)})
         return results
     async def _observe(self,results):
         for x in results:
@@ -149,6 +206,8 @@ class AgentLoop:
         messages.append(Message(role="user",content="Provide the final response to the user's original request. State what was actually completed and mention any remaining issue; do not claim unverified success."))
         response=await self.llm.complete(messages=messages)
         content=getattr(response,"content","")
+        usage=getattr(response,"usage",{}) or {}
+        self.context.cost += self._compute_cost(usage)
         await self.model_context.add_assistant_message(content)
         return content
     async def _execute_plan_task(self,task):

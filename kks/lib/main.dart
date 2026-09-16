@@ -58,7 +58,8 @@ class KidsHomePage extends StatelessWidget {
   Widget _buildKidButton(BuildContext context, String label, IconData icon, Color color) {
     return ElevatedButton(
       style: ElevatedButton.styleFrom(
-        primary: color,
+        backgroundColor: color,
+        foregroundColor: Colors.white,
         padding: const EdgeInsets.symmetric(vertical: 24),
       ),
       onPressed: () {

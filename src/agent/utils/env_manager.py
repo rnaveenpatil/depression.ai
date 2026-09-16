@@ -57,6 +57,11 @@ AWS_ENVS = {
 SELECTED_MODEL_ENV = "DEPRESSION_SELECTED_MODEL"
 
 
+def default_env_path() -> Path:
+    """Current-working-directory env file, evaluated at call time (not import)."""
+    return Path.cwd() / ENV_FILE_NAME
+
+
 def find_env_file(start_path: Optional[Path] = None) -> Path:
     """Find the nearest .env file walking up from start_path."""
     path = start_path or Path.cwd()
@@ -64,7 +69,7 @@ def find_env_file(start_path: Optional[Path] = None) -> Path:
         env_file = parent / ENV_FILE_NAME
         if env_file.exists():
             return env_file
-    return DEFAULT_ENV_PATH
+    return default_env_path()
 
 
 def load_env_file(env_path: Optional[Path] = None) -> Dict[str, str]:
@@ -92,7 +97,7 @@ def load_env_file(env_path: Optional[Path] = None) -> Dict[str, str]:
 
 def write_env_file(env_vars: Dict[str, str], env_path: Optional[Path] = None) -> None:
     """Write environment variables to a .env file."""
-    path = env_path or DEFAULT_ENV_PATH
+    path = env_path or find_env_file()
     
     # Load existing to preserve comments and other vars
     existing = load_env_file(path)

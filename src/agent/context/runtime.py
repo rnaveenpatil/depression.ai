@@ -60,7 +60,10 @@ def _to_provider_message(cm: Any) -> Message:
     metadata = getattr(cm, "metadata", {}) or {}
     kwargs: dict[str, Any] = {"role": cm.role, "content": cm.content}
     if cm.role == "assistant" and metadata.get("tool_calls"):
+        # OpenAI-compatible spec: assistant messages carrying tool_calls must
+        # have "content": null (strict gateways like NIM/vLLM reject "").
         kwargs["tool_calls"] = metadata["tool_calls"]
+        kwargs["content"] = None
     if cm.role == "tool":
         kwargs["name"] = metadata.get("name")
         kwargs["tool_call_id"] = metadata.get("tool_call_id")

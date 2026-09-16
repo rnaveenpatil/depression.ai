@@ -1,14 +1,13 @@
 """
 Permission Manager - Central authorization gate.
 
-Flow:
-    LLM  →  Tool/Command  →  PermissionManager  →  { Safe | Dangerous }
-                                                       │         │
-                                                       ▼         ▼
-                                                    Execute   Ask user
+Default policy (this build):
+    - ALLOW everything.
+    - ASK only when the action looks like a delete/destroy/removal.
+    - DENY .env file reads (hard-coded safety).
 
-The manager asks each registered policy module (rules, filesystem, terminal,
-aws, …) for a verdict, then either auto-approves, prompts the user, or denies.
+Flow:
+    LLM  →  Tool/Command  →  PermissionManager  →  { Allow | Ask-if-delete | Deny-.env }
 """
 
 from __future__ import annotations
@@ -16,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import fnmatch
 import os
+import re
 import time
 from dataclasses import dataclass, field
 from enum import Enum
@@ -54,7 +54,7 @@ class RiskLevel(str, Enum):
 class PermissionRequest:
     """A request to execute a tool or command."""
     tool: str
-    action: str                     # e.g. "read", "write", "execute", "delete"
+    action: str
     params: Dict[str, Any] = field(default_factory=dict)
     context: Dict[str, Any] = field(default_factory=dict)
     timestamp: float = field(default_factory=time.time)
@@ -84,21 +84,91 @@ class PermissionVerdict:
 
 
 # ======================================================================
+# DESTRUCTIVE-ACTION DETECTION
+# ======================================================================
+
+# Words that indicate a delete/destroy style operation. If a tool name or
+# action string contains any of these, we ASK. Everything else is allowed.
+_DELETE_TOKENS = (
+    "delete", "remove", "rm ", "rmdir", "unlink", "drop", "truncate",
+    "purge", "destroy", "wipe", "prune", "erase",
+    "format", "kill", "terminate", "shutdown",
+    "deletefile", "removefile", "remove_file", "delete_file",
+)
+
+# Shell-level destructive patterns inside `command` / `cmd` params.
+_DELETE_SHELL_PATTERNS = [
+    re.compile(r"\brm\b"),
+    re.compile(r"\brmdir\b"),
+    re.compile(r"\bunlink\b"),
+    re.compile(r"\bshred\b"),
+    re.compile(r"\btruncate\b"),
+    re.compile(r"\bdd\b.*\bof="),
+    re.compile(r"\bmkfs\b"),
+    re.compile(r">\s*/dev/sd"),
+    re.compile(r"\bgit\s+reset\s+--hard\b"),
+    re.compile(r"\bgit\s+clean\s+-[a-z]*f"),
+    re.compile(r"\bkubectl\s+delete\b"),
+    re.compile(r"\baws\s+s3\s+rm\b"),
+    re.compile(r"\baws\s+s3api\s+delete"),
+    re.compile(r"\baws\s+ec2\s+terminate"),
+    re.compile(r"\baws\s+rds\s+delete"),
+    re.compile(r"\bdocker\s+rm\b"),
+    re.compile(r"\bdocker\s+rmi\b"),
+    re.compile(r"\bdocker\s+system\s+prune\b"),
+    re.compile(r"\bdocker\s+volume\s+rm\b"),
+]
+
+
+def _looks_destructive(tool: str, action: str, params: Dict[str, Any]) -> Tuple[bool, str]:
+    """Return (is_destructive, reason). Conservative but thorough."""
+    tool_l = (tool or "").lower()
+    action_l = (action or "").lower()
+    combined = f"{tool_l} {action_l}"
+
+    for tok in _DELETE_TOKENS:
+        if tok in combined:
+            return True, f"tool/action matches '{tok.strip()}'"
+
+    # Check string params for shell-style destructive commands.
+    for key in ("command", "cmd", "shell", "script", "input"):
+        val = params.get(key)
+        if isinstance(val, str) and val:
+            for pat in _DELETE_SHELL_PATTERNS:
+                if pat.search(val):
+                    return True, f"{key} matches destructive pattern '{pat.pattern}'"
+
+    # Git action strings like "reset_hard", "clean -f", "branch -D"
+    git_action = params.get("action")
+    if isinstance(git_action, str):
+        ga = git_action.lower()
+        if ga in ("delete", "remove", "reset", "clean", "drop", "prune",
+                  "delete_branch", "deletebranch", "branch_delete",
+                  "reset_hard", "reset-hard", "clean_force", "clean-force"):
+            return True, f"git action '{ga}' is destructive"
+
+    # Filesystem action strings
+    fs_action = params.get("action")
+    if isinstance(fs_action, str):
+        fa = fs_action.lower()
+        if fa in ("delete", "remove", "rm", "unlink", "rmdir", "purge", "wipe"):
+            return True, f"filesystem action '{fa}' is destructive"
+
+    return False, ""
+
+
+# ======================================================================
 # POLICY BASE
 # ======================================================================
 
-class Policy(ABC_MARKER := object):
-    """
-    Base class for all policy modules (rules, filesystem, terminal, aws).
-    Each policy inspects a PermissionRequest and returns an optional verdict.
-    Returning None means "no opinion" — the next policy is consulted.
-    """
-
+class Policy:
+    """Base class for all policy modules."""
     name: str = "policy"
 
-    async def evaluate(
-        self, request: PermissionRequest
-    ) -> Optional[PermissionVerdict]:
+    def __init__(self, config: Optional[Dict[str, Any]] = None):
+        self.config = config or {}
+
+    async def evaluate(self, request: PermissionRequest) -> Optional[PermissionVerdict]:
         return None
 
 
@@ -108,12 +178,11 @@ class Policy(ABC_MARKER := object):
 
 class PermissionManager:
     """
-    Orchestrates all policies and enforces the final decision.
+    Default-allow permission manager.
 
-    Modes:
-        manual  — ask the user for anything not explicitly allowed
-        auto    — auto-approve everything above SAFE (use with care)
-        deny    — deny everything not explicitly allowed (paranoid mode)
+    The only two situations that produce a non-ALLOW verdict:
+      1. Destructive action detected → ASK
+      2. .env / *.env file read      → DENY
     """
 
     def __init__(
@@ -128,43 +197,18 @@ class PermissionManager:
         self.input_handler = input_handler
 
         self.enabled: bool = cfg.get("enabled", True)
-        self.mode: str = cfg.get("mode", "manual")            # manual | auto | deny
+        self.mode: str = cfg.get("mode", "manual")   # kept for compat
         self.auto_approve: bool = cfg.get("auto_approve", False)
         self.allow_dangerous: bool = cfg.get("allow_dangerous", False)
-        self.default_decision: Decision = self._parse_default(cfg.get("default", "ask"))
+        self.default_decision: Decision = Decision.ALLOW
 
-        # opencode defaults: most allow, doom_loop/external_directory ask
-        self._opencode_defaults: Dict[str, str] = {
-            "read": "allow",
-            "edit": "allow",
-            "glob": "allow",
-            "grep": "allow",
-            "bash": "allow",
-            "task": "allow",
-            "skill": "allow",
-            "question": "allow",
-            "webfetch": "allow",
-            "websearch": "allow",
-            "lsp": "allow",
-            "todowrite": "allow",
-            "external_directory": "ask",
-            "doom_loop": "ask",
-        }
-
-        # Registered policies (order matters — first non-None verdict wins)
+        # No policy list is used — the manager decides directly.
         self.policies: List[Policy] = []
-        self._register_policies(cfg)
 
-        # Session memory: once approved in a session, don't re-ask
+        # Session memory for "always allow this exact delete this session"
         self._session_allows: Dict[str, float] = {}
         self._session_denies: Dict[str, float] = {}
         self._session_ttl: float = cfg.get("session_ttl", 3600.0)
-
-        # doom_loop tracking: last N tool calls
-        from collections import deque
-        self._recent_calls: deque = deque(maxlen=10)
-        # workspace root for external_directory
-        self._workspace_root: Optional[str] = cfg.get("cwd") or cfg.get("workspace_dir") or os.getcwd()
 
         # Statistics
         self.stats = {
@@ -176,15 +220,14 @@ class PermissionManager:
             "user_denied": 0,
         }
 
-        # Confirmation callback (injected by CLI)
+        # Confirmation callback — the TUI's modal hook goes here.
         self.confirm_callback: Optional[
             Callable[[PermissionRequest, PermissionVerdict], Awaitable[bool]]
         ] = None
 
         logger.info(
-            f"PermissionManager initialized "
-            f"(mode={self.mode}, auto_approve={self.auto_approve}, "
-            f"policies={[p.name for p in self.policies]})"
+            "PermissionManager initialized — default ALLOW, "
+            "ASK only on destructive actions, DENY .env reads"
         )
 
     # ------------------------------------------------------------------
@@ -192,36 +235,11 @@ class PermissionManager:
     # ------------------------------------------------------------------
 
     def _parse_default(self, val: str) -> Decision:
-        try:
-            return Decision(val.lower())
-        except ValueError:
-            return Decision.ASK
+        return Decision.ALLOW
 
     def _register_policies(self, cfg: Dict[str, Any]) -> None:
-        """Instantiate and register all policy modules."""
-        try:
-            from agent.permissions.rules import RulesPolicy
-            self.policies.append(RulesPolicy(cfg))
-        except Exception as e:
-            logger.debug(f"RulesPolicy not loaded: {e}")
-
-        try:
-            from agent.permissions.filesystem import FilesystemPolicy
-            self.policies.append(FilesystemPolicy(cfg, cwd=cfg.get("cwd")))
-        except Exception as e:
-            logger.debug(f"FilesystemPolicy not loaded: {e}")
-
-        try:
-            from agent.permissions.terminal import TerminalPolicy
-            self.policies.append(TerminalPolicy(cfg))
-        except Exception as e:
-            logger.debug(f"TerminalPolicy not loaded: {e}")
-
-        try:
-            from agent.permissions.aws import AWSPolicy
-            self.policies.append(AWSPolicy(cfg))
-        except Exception as e:
-            logger.debug(f"AWSPolicy not loaded: {e}")
+        # No policies. The manager handles everything directly.
+        return
 
     def set_confirm_callback(
         self,
@@ -242,12 +260,6 @@ class PermissionManager:
         context: Optional[Dict[str, Any]] = None,
         request_id: Optional[str] = None,
     ) -> Tuple[bool, str]:
-        """
-        Main entry point.
-
-        Returns:
-            (allowed: bool, reason: str)
-        """
         request = PermissionRequest(
             tool=tool,
             action=action,
@@ -267,7 +279,7 @@ class PermissionManager:
                 f"Permission denied for {tool}.{action}: {verdict.reason}"
             )
 
-        # Decision.ASK → consult user
+        # ASK — consult the user via the injected callback.
         approved = await self._ask_user(request, verdict)
         if approved:
             self.stats["user_approved"] += 1
@@ -286,269 +298,77 @@ class PermissionManager:
         params: Dict[str, Any],
         context: Optional[Dict[str, Any]] = None,
     ) -> Tuple[bool, str]:
-        """
-        Compatibility wrapper used by agent.py / loop.py.
-        Derives action from tool_name and params.
-        """
         action = self._infer_action(tool_name, params)
         try:
             return await self.check(tool_name, action, params, context)
         except PermissionDeniedError as e:
             return False, str(e)
 
-    def _is_external_path(self, path_str: str) -> bool:
-        try:
-            p = Path(os.path.expanduser(path_str)).resolve()
-            root = Path(self._workspace_root).resolve()
-            try:
-                p.relative_to(root)
-                return False
-            except ValueError:
-                return True
-        except Exception:
-            return False
-
-    def _check_doom_loop(self, request: PermissionRequest) -> Optional[PermissionVerdict]:
-        # Track call signature for doom_loop (=3 identical tool calls)
-        import json as _json
-        try:
-            sig = f"{request.tool}:{_json.dumps(request.params, sort_keys=True)}"
-        except Exception:
-            sig = f"{request.tool}:{str(request.params)}"
-        self._recent_calls.append(sig)
-        if len(self._recent_calls) >= 3:
-            last3 = list(self._recent_calls)[-3:]
-            if len(set(last3)) == 1:
-                # check if permission doom_loop is allow via RulesPolicy
-                # If not explicitly allowed, ask
-                return PermissionVerdict.ask(
-                    "doom_loop detected: same tool 3x",
-                    risk=RiskLevel.HIGH,
-                    policy="doom_loop",
-                )
-        return None
-
-    def _default_for_tool(self, request: PermissionRequest) -> Optional[PermissionVerdict]:
-        # opencode permissive defaults
-        t = request.tool.lower()
-        # map aliases to canonical permission key
-        alias_map = {
-            "read": "read", "write": "edit", "edit": "edit", "apply_patch": "edit",
-            "patch": "edit", "glob": "glob", "grep": "grep", "search": "grep",
-            "bash": "bash", "terminal": "bash", "shell": "bash",
-            "task": "task", "skill": "skill", "question": "question",
-            "webfetch": "webfetch", "websearch": "websearch", "web": "webfetch",
-            "lsp": "lsp", "diagnostics": "lsp", "todowrite": "todowrite",
-            "todoread": "todowrite", "todo": "todowrite",
-        }
-        key = alias_map.get(t, t)
-        # opencode special: .env files denied for read even though default allow
-        if key == "read":
-            target = request.params.get("path") or request.params.get("filePath") or request.params.get("file") or ""
-            base = os.path.basename(target)
-            if base == ".env" or (base.startswith(".env.") and base != ".env.example"):
-                return PermissionVerdict.deny(f"default deny for .env: {target}", risk=RiskLevel.HIGH, policy="default")
-            if ".env" in base and base != ".env.example":
-                # deny *.env
-                import fnmatch as _fn
-                if _fn.fnmatch(base, "*.env") or _fn.fnmatch(base, "*.env.*"):
-                    if base != ".env.example":
-                        return PermissionVerdict.deny(f"default deny for {base}", risk=RiskLevel.HIGH, policy="default")
-        default_action = self._opencode_defaults.get(key)
-        if default_action == "allow":
-            return PermissionVerdict.allow(f"default allow for {key}", risk=RiskLevel.SAFE, policy="default")
-        if default_action == "ask":
-            return PermissionVerdict.ask(f"default ask for {key}", risk=RiskLevel.MEDIUM, policy="default")
-        return None
+    # ------------------------------------------------------------------
+    # EVALUATION — the entire decision logic
+    # ------------------------------------------------------------------
 
     async def evaluate(self, request: PermissionRequest) -> PermissionVerdict:
         """
-        Compute the verdict for a request without asking the user.
+        Default allow. The only overrides:
+          1. .env / *.env read → DENY
+          2. destructive action → ASK
         """
+
         if not self.enabled:
             return PermissionVerdict.allow("permissions disabled")
 
-        # Session memory shortcuts
+        # Session cache — a previous "always allow this delete" wins.
         cached = self._check_session_cache(request)
         if cached is not None:
             return cached
 
-        # Early default .env deny (opencode default) — must run before FilesystemPolicy allow
-        early_env = self._default_for_tool(request)
-        if early_env and early_env.decision == Decision.DENY and "env" in early_env.reason.lower():
-            return early_env
+        tool_l = (request.tool or "").lower()
+        action_l = (request.action or "").lower()
 
-        # doom_loop detection (before other policies)
-        doom = self._check_doom_loop(request)
-        if doom is not None:
-            # If policy explicitly allows doom_loop, that will override after
-            pass  # keep as fallback candidate
-
-        # external_directory detection (if path outside workspace)
-        ext_verdict: Optional[PermissionVerdict] = None
-        for pkey in ("path", "filePath", "file", "filepath"):
-            pval = request.params.get(pkey)
-            if isinstance(pval, str) and pval and self._is_external_path(pval):
-                # will be handled by RulesPolicy external_directory key; fallback ask
-                ext_verdict = PermissionVerdict.ask(
-                    f"external_directory: {pval}", risk=RiskLevel.MEDIUM, policy="external_directory"
+        # --- .env protection (hard deny) -----------------------------
+        if tool_l in ("read", "filesystem", "file") or action_l == "read":
+            target = (
+                request.params.get("path")
+                or request.params.get("filePath")
+                or request.params.get("file")
+                or ""
+            )
+            base = os.path.basename(str(target))
+            if base == ".env" or (base.startswith(".env.") and base != ".env.example"):
+                return PermissionVerdict.deny(
+                    f"default deny for .env: {target}",
+                    risk=RiskLevel.HIGH,
+                    policy="env_guard",
                 )
-                break
+            if base.endswith(".env") and base != ".env.example":
+                return PermissionVerdict.deny(
+                    f"default deny for {base}",
+                    risk=RiskLevel.HIGH,
+                    policy="env_guard",
+                )
 
-        # Global auto-approve (--yolo) bypasses all checks
-        if self.auto_approve:
-            self.stats["auto_approved"] += 1
-            return PermissionVerdict.allow(
-                "auto_approve enabled (yolo)",
-                risk=RiskLevel.MEDIUM,
-                policy="global_auto",
+        # --- destructive action guard --------------------------------
+        destructive, why = _looks_destructive(
+            request.tool, request.action, request.params
+        )
+        if destructive:
+            return PermissionVerdict.ask(
+                f"destructive action detected ({why})",
+                risk=RiskLevel.HIGH,
+                policy="delete_guard",
             )
 
-        # Mode shortcuts
-        if self.mode == "deny":
-            return PermissionVerdict.deny(
-                "mode=deny (paranoid mode)",
-                risk=RiskLevel.CRITICAL,
-                policy="mode",
-            )
-
-        # Check doom_loop permission override (if explicitly allow, ignore doom)
-        doom_allowed = False
-        if doom is not None:
-            # peek at RulesPolicy external check
-            for p in self.policies:
-                if p.name == "rules":
-                    rules = getattr(p, "permission_rules", {})
-                    doom_rules = rules.get("doom_loop") or rules.get("*")
-                    if doom_rules:
-                        # last rule wins
-                        last_act = doom_rules[-1][1] if doom_rules else None
-                        if last_act == "allow":
-                            doom_allowed = True
-                            doom = None
-                        elif last_act == "deny":
-                            doom = PermissionVerdict.deny("doom_loop denied by permission", risk=RiskLevel.HIGH, policy="rules")
-                    break
-
-        # Evaluate external_directory granular permission before generic policies
-        # Build ext verdict from permission_rules if exists
-        if ext_verdict is not None:
-            for p in self.policies:
-                if p.name == "rules":
-                    rules = getattr(p, "permission_rules", {})
-                    ext_rules = rules.get("external_directory") or rules.get("*")
-                    if ext_rules:
-                        # last matching rule wins — reuse same matching logic as rules
-                        from agent.permissions.rules import _wildcard_match as _wm
-                        target_path = None
-                        for k in ("path", "filePath", "file", "filepath"):
-                            if k in request.params:
-                                target_path = request.params[k]
-                                break
-                        matched = None
-                        for pat, act in ext_rules:
-                            if pat == "*":
-                                matched = act
-                            elif target_path and _wm(target_path, pat):
-                                matched = act
-                        if matched == "allow":
-                            ext_verdict = None  # allowed, clear
-                        elif matched == "deny":
-                            ext_verdict = PermissionVerdict.deny(f"external_directory denied: {target_path}", risk=RiskLevel.HIGH, policy="rules")
-                        elif matched == "ask":
-                            ext_verdict = PermissionVerdict.ask(f"external_directory: {target_path}", risk=RiskLevel.MEDIUM, policy="rules")
-                    break
-
-        # If external wants to deny, prioritize immediately
-        if ext_verdict is not None and ext_verdict.decision == Decision.DENY:
-            return ext_verdict
-
-        # If doom still active and no explicit allow, doom takes precedence over safe allow
-        doom_allowed = False
-        if doom is not None:
-            for p in self.policies:
-                if p.name == "rules":
-                    rules = getattr(p, "permission_rules", {})
-                    doom_rules = rules.get("doom_loop") or rules.get("*")
-                    if doom_rules:
-                        last_act = doom_rules[-1][1] if doom_rules else None
-                        if last_act == "allow":
-                            doom_allowed = True
-                            doom = None
-                        elif last_act == "deny":
-                            doom = PermissionVerdict.deny("doom_loop denied by permission", risk=RiskLevel.HIGH, policy="rules")
-                    break
-
-        pending_doom = doom if not doom_allowed else None
-        pending_ext = ext_verdict
-
-        # Ask each policy in order
-        for policy in self.policies:
-            try:
-                verdict = await policy.evaluate(request)
-            except Exception as e:
-                logger.warning(f"Policy '{policy.name}' raised: {e}")
-                continue
-
-            if verdict is None:
-                continue
-
-            # If policy would allow but we have pending doom/external ask, prefer that ask/deny
-            if verdict.decision == Decision.ALLOW and (pending_doom or pending_ext):
-                # doom takes priority over external over allow
-                if pending_doom:
-                    if self.mode == "auto" and pending_doom.risk != RiskLevel.CRITICAL:
-                        self.stats["auto_approved"] += 1
-                        return PermissionVerdict.allow(f"auto doom_loop", risk=pending_doom.risk, policy="doom_loop")
-                    return pending_doom
-                if pending_ext:
-                    if self.mode == "auto":
-                        self.stats["auto_approved"] += 1
-                        return PermissionVerdict.allow(f"auto external_directory", risk=pending_ext.risk, policy="external_directory")
-                    return pending_ext
-
-            # Policy made a decision
-            if verdict.decision == Decision.ASK and self.mode == "auto":
-                # auto mode upgrades ASK to ALLOW except for CRITICAL risk or explicit deny
-                if verdict.risk != RiskLevel.CRITICAL or self.allow_dangerous:
-                    # but if doom/external pending, keep ask
-                    if pending_doom or pending_ext:
-                        return pending_doom or pending_ext  # type: ignore
-                    self.stats["auto_approved"] += 1
-                    return PermissionVerdict.allow(
-                        f"auto (policy={policy.name}, was ask)",
-                        risk=verdict.risk,
-                        policy=policy.name,
-                    )
-            return verdict
-
-        # No policy had an opinion → use doom/ext defaults
-        if pending_doom is not None:
-            if self.mode == "auto" and pending_doom.risk != RiskLevel.CRITICAL:
-                self.stats["auto_approved"] += 1
-                return PermissionVerdict.allow(f"auto doom_loop", risk=pending_doom.risk, policy="doom_loop")
-            return pending_doom
-        if pending_ext is not None:
-            if self.mode == "auto":
-                self.stats["auto_approved"] += 1
-                return PermissionVerdict.allow(f"auto external_directory", risk=pending_ext.risk, policy="external_directory")
-            return pending_ext
-
-        # opencode permissive defaults (pass full request for .env handling)
-        default_by_tool = self._default_for_tool(request)
-        if default_by_tool is not None:
-            return default_by_tool
-
-        # No policy had an opinion → default
-        return PermissionVerdict(
-            decision=self.default_decision,
-            reason="no policy matched; using default",
-            risk=RiskLevel.MEDIUM,
-            policy="default",
+        # --- everything else is allowed ------------------------------
+        self.stats["auto_approved"] += 1
+        return PermissionVerdict.allow(
+            "default allow",
+            risk=RiskLevel.SAFE,
+            policy="default_allow",
         )
 
     # ------------------------------------------------------------------
-    # USER CONFIRMATION
+    # USER CONFIRMATION (only reached for destructive ASK verdicts)
     # ------------------------------------------------------------------
 
     async def _ask_user(
@@ -558,14 +378,23 @@ class PermissionManager:
     ) -> bool:
         self.stats["asked"] += 1
 
-        # Prefer the injected callback
         if self.confirm_callback is not None:
             try:
-                return bool(await self.confirm_callback(request, verdict))
+                cb = self.confirm_callback
+                try:
+                    import threading as _th
+                    logger.debug(
+                        f"confirm_callback invoked on thread="
+                        f"{_th.current_thread().name}"
+                    )
+                except Exception:
+                    pass
+                result = await cb(request, verdict)
+                return bool(result)
             except Exception as e:
-                logger.error(f"Confirm callback failed: {e}")
+                logger.error(f"Confirm callback failed: {e}", exc_info=True)
 
-        # Fall back to UI + input handler
+        # Fall back to UI/input handler if wired
         if self.ui:
             self._render_prompt(request, verdict)
 
@@ -573,8 +402,7 @@ class PermissionManager:
             try:
                 if hasattr(self.input_handler, "get_confirmation"):
                     return await self.input_handler.get_confirmation(
-                        f"Allow {request.tool}.{request.action}?",
-                        default=False,
+                        f"Allow {request.tool}.{request.action}?", default=False,
                     )
                 if hasattr(self.input_handler, "get_input"):
                     ans = await self.input_handler.get_input(prompt="Allow? [y/N] ")
@@ -582,10 +410,10 @@ class PermissionManager:
             except Exception as e:
                 logger.warning(f"Input handler error: {e}")
 
-        # Last resort: deny
+        # No mechanism to ask → deny the destructive action.
         logger.warning(
-            f"No confirmation mechanism available for {request.tool}.{request.action} — denying. "
-            f"Risk: {verdict.risk.value}. Configure input_handler or set permissions.auto_approve=true"
+            f"No confirmation mechanism available for "
+            f"{request.tool}.{request.action} — denying destructive action."
         )
         return False
 
@@ -595,17 +423,7 @@ class PermissionManager:
         if not self.ui:
             return
         try:
-            from agent.cli.ui import Icons, Palette
-
-            risk_colors = {
-                RiskLevel.SAFE: Palette.SUCCESS,
-                RiskLevel.LOW: Palette.INFO,
-                RiskLevel.MEDIUM: Palette.WARNING,
-                RiskLevel.HIGH: Palette.ERROR,
-                RiskLevel.CRITICAL: Palette.ERROR,
-            }
-            color = risk_colors.get(verdict.risk, Palette.WARNING)
-
+            from agent.cli.ui import Palette
             self.ui.print_warning(
                 f"Permission requested: {request.tool}.{request.action}"
             )
@@ -626,7 +444,6 @@ class PermissionManager:
     # ------------------------------------------------------------------
 
     def _cache_key(self, request: PermissionRequest) -> str:
-        # Group by tool + action + primary target (e.g. path/command)
         target = (
             request.params.get("path")
             or request.params.get("command")
@@ -635,9 +452,7 @@ class PermissionManager:
         )
         return f"{request.tool}:{request.action}:{target}"
 
-    def _check_session_cache(
-        self, request: PermissionRequest
-    ) -> Optional[PermissionVerdict]:
+    def _check_session_cache(self, request: PermissionRequest) -> Optional[PermissionVerdict]:
         key = self._cache_key(request)
         now = time.time()
 
@@ -660,14 +475,10 @@ class PermissionManager:
         return None
 
     def _remember_allow(self, request: PermissionRequest) -> None:
-        self._session_allows[self._cache_key(request)] = (
-            time.time() + self._session_ttl
-        )
+        self._session_allows[self._cache_key(request)] = time.time() + self._session_ttl
 
     def _remember_deny(self, request: PermissionRequest) -> None:
-        self._session_denies[self._cache_key(request)] = (
-            time.time() + self._session_ttl
-        )
+        self._session_denies[self._cache_key(request)] = time.time() + self._session_ttl
 
     # ------------------------------------------------------------------
     # RUNTIME CONTROL
@@ -681,7 +492,6 @@ class PermissionManager:
 
     def set_auto_approve(self, enabled: bool) -> None:
         self.auto_approve = bool(enabled)
-        logger.info(f"Auto-approve set to: {self.auto_approve}")
 
     def add_allow_rule(self, pattern: str) -> None:
         self._session_allows[pattern] = time.time() + self._session_ttl
@@ -692,9 +502,6 @@ class PermissionManager:
     def reset_rules(self) -> None:
         self._session_allows.clear()
         self._session_denies.clear()
-        for policy in self.policies:
-            if hasattr(policy, "reset"):
-                policy.reset()
 
     def get_status(self) -> Dict[str, Any]:
         return {
@@ -703,20 +510,20 @@ class PermissionManager:
             "auto_approve": self.auto_approve,
             "allow_dangerous": self.allow_dangerous,
             "default": self.default_decision.value,
-            "policies": [p.name for p in self.policies],
+            "policies": [],
             "session_allows": len(self._session_allows),
             "session_denies": len(self._session_denies),
             "stats": dict(self.stats),
         }
 
     def _infer_action(self, tool: str, params: Dict[str, Any]) -> str:
-        """Best-effort action inference for compatibility callers."""
+        """Best-effort action inference."""
         t = tool.lower()
         if "read" in t or t in ("filesystem_read",):
             return "read"
         if "write" in t or "edit" in t:
             return "write"
-        if "delete" in t or "remove" in t or "rm" in t:
+        if "delete" in t or "remove" in t or t.startswith("rm") or t in ("del", "rmdir", "unlink"):
             return "delete"
         if "execute" in t or t == "terminal" or "shell" in t:
             return "execute"

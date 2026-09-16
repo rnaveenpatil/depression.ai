@@ -140,6 +140,10 @@ class ToolRegistry:
     def get_tool(self, name: str) -> Optional[BaseTool]:
         return self.tools.get(name)
 
+    def has_tool(self, name: str) -> bool:
+        """True if a tool (registered or external) accepts this name."""
+        return name in self.tools or name in self._external
+
     # ------------------------------------------------------------------
     # EXECUTION
     # ------------------------------------------------------------------

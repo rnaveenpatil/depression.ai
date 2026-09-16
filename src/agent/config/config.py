@@ -463,8 +463,14 @@ class PermissionsConfig:
 
 @dataclass
 class ToolsConfig:
+    # OpenCode-style: every tool is available by default. Only the tools listed
+    # here are registered; an empty list would mean "all tools" in legacy paths,
+    # so keep the full catalog explicit. Restrict with `disabled`/`enabled`.
     enabled: List[str] = field(default_factory=lambda: [
-        "terminal", "filesystem", "git", "web", "task"
+        "terminal", "filesystem", "read", "write", "edit", "apply_patch",
+        "search", "grep", "glob", "git", "web", "webfetch", "websearch",
+        "diagnostics", "todo", "todowrite", "todoread", "skill", "question",
+        "lsp", "bash", "process", "patch", "browser", "task",
     ])
     disabled: List[str] = field(default_factory=list)
     timeout: float = 60.0

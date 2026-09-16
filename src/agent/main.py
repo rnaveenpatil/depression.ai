@@ -106,6 +106,7 @@ class CLIAgent:
         self.start_time = datetime.now()
 
         # Signal handling
+        self._signals = 0
         signal.signal(signal.SIGINT, self._on_signal)
         signal.signal(signal.SIGTERM, self._on_signal)
 
@@ -114,14 +115,18 @@ class CLIAgent:
     # ------------------------------------------------------------------
 
     def _on_signal(self, signum, frame):
+        self._signals += 1
+        if self._signals > 1:
+            # Hard escape hatch: a second ^C always gets us out.
+            os._exit(128 + signum)
         if self.ui:
             self.ui.print_warning(f"\nReceived signal {signum}, shutting down...")
         self.running = False
-        if self.agent_coordinator:
-            try:
-                asyncio.create_task(self.agent_coordinator.shutdown())
-            except RuntimeError:
-                pass
+        # Unwind the running coroutine so shutdown() runs along the normal
+        # exit path (run.py's boot().finally awaits cli.shutdown()). A custom
+        # SIGINT handler suppresses the default KeyboardInterrupt, so raise it
+        # explicitly instead of leaving a dangling coordinator.shutdown() task.
+        raise KeyboardInterrupt
 
     # ------------------------------------------------------------------
     # ARGUMENTS
@@ -725,9 +730,9 @@ Examples:
 # ======================================================================
 
 def _launch_tui() -> int:
-    """Launch the futuristic TUI interface."""
+    """Launch the agent-connected TUI (bootstrap lives in agent.tui.run)."""
     try:
-        from agent.tui.app import DepressionTUI
+        from agent.tui.run import main as tui_main
     except ImportError as e:
         print(
             f"❌ TUI requires 'textual' package. Install with:\n"
@@ -737,28 +742,7 @@ def _launch_tui() -> int:
             file=sys.stderr,
         )
         return 1
-
-    # Parse CLI args for TUI
-    from agent.main import CLIAgent
-    app_cli = CLIAgent()
-    args = app_cli.parse_arguments()
-
-    # Build TUI kwargs from CLI args
-    tui_kwargs = {}
-    if hasattr(args, "project") and args.project:
-        tui_kwargs["project_dir"] = args.project
-    if hasattr(args, "model") and args.model:
-        tui_kwargs["model_override"] = args.model
-    if hasattr(args, "provider") and args.provider:
-        tui_kwargs["provider_override"] = args.provider
-    if hasattr(args, "yolo") and args.yolo:
-        tui_kwargs["yolo"] = True
-    if hasattr(args, "no_sidebar") and args.no_sidebar:
-        tui_kwargs["no_sidebar"] = True
-
-    # Run the TUI directly in-process
-    app = DepressionTUI(**tui_kwargs)
-    app.run()
+    tui_main()
     return 0
 
 

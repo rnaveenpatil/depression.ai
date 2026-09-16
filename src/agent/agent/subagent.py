@@ -172,6 +172,8 @@ class SubAgentManager:
         
         # Initialize subagent's LLM
         subagent.llm = self.llm_registry
+        prev_model = self.llm_registry.get_current_model()
+        prev_provider = self.llm_registry.get_current_provider()
         if cfg.model:
             subagent.llm.set_model(cfg.model)
         
@@ -213,6 +215,14 @@ class SubAgentManager:
                 "subagent_id": subagent_id,
             }
         finally:
+            # Restore the parent session's model selection (shared singleton).
+            if cfg.model and prev_model and self.llm_registry.get_current_model() != prev_model:
+                try:
+                    self.llm_registry.set_model(prev_model)
+                    if prev_provider:
+                        self.llm_registry.set_provider(prev_provider)
+                except Exception as exc:
+                    logger.debug(f"Failed to restore registry model '{prev_model}': {exc}")
             # Cleanup
             if subagent_id in self.subagents:
                 del self.subagents[subagent_id]

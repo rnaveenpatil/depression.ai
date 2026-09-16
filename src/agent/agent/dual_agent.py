@@ -61,33 +61,29 @@ class AgentRole(str, Enum):
 # PERMISSION RULESETS (OpenCode style)
 # ======================================================================
 
-# Tools that READ-ONLY agents can use (Plan agent - matches opencode's Plan agent)
-# opencode Plan agent: grep, glob, list, bash, read, webfetch, websearch
 PLAN_AGENT_TOOLS: Set[str] = {
-    "filesystem",   # read, list, stat (read-only actions only)
-    "search",       # grep, find (read-only)
-    "git",          # status, log, diff, show, branch, blame, remote (read-only actions)
-    "diagnostics",  # lint, typecheck (read-only)
-    "web",          # search, fetch (read-only)
+    "filesystem",
+    "search",
+    "git",
+    "diagnostics",
+    "web",
 }
 
-# Tools that BUILD agents can use (all tools - matches opencode's Build agent)
 BUILD_AGENT_TOOLS: Set[str] = {
-    "terminal",     # execute commands
-    "filesystem",   # read, write, edit, delete, mkdir, move, copy
-    "search",       # grep, find
-    "git",          # all git operations
-    "patch",        # apply patches
-    "process",      # process management
-    "web",          # search, fetch
-    "browser",      # browser automation
-    "task",         # spawn subagents
-    "diagnostics",  # lint, typecheck
-    "todo",         # task management
-    "mcp",          # MCP tools
+    "terminal",
+    "filesystem",
+    "search",
+    "git",
+    "patch",
+    "process",
+    "web",
+    "browser",
+    "task",
+    "diagnostics",
+    "todo",
+    "mcp",
 }
 
-# Tool descriptions for LLM
 TOOL_DESCRIPTIONS: Dict[str, str] = {
     "terminal": "Execute shell commands (bash, sh, zsh)",
     "filesystem": "Read, write, edit, list, search files",
@@ -153,6 +149,7 @@ class BaseAgent:
         self.status = "idle"
         self.context = {"turn_count": 0, "tokens_used": 0}
         self.is_shutting_down = False
+        self._shutdown_done = False
         self._initialized = False
         
         # Metrics
@@ -214,8 +211,15 @@ class BaseAgent:
         )
         await self.plugin_loader.initialize()
         
-        # 7. Permission callback
-        if self.permission_manager and self.input_handler:
+        # 7. Permission callback — ONLY install the CLI fallback if nothing
+        #    is registered yet. The TUI registers its modal callback during
+        #    DepressionApp.on_mount(), which runs before this. Overwriting it
+        #    here would silently route every ASK verdict to input_handler
+        #    (which the TUI sets to None), causing every permission to auto-deny
+        #    without ever showing the modal.
+        if (self.permission_manager
+                and self.permission_manager.confirm_callback is None
+                and self.input_handler):
             async def _confirm(request, verdict):
                 msg = f"Allow {request.tool}.{request.action}? [{verdict.risk.value}]"
                 if hasattr(self.input_handler, "get_confirmation"):
@@ -229,37 +233,54 @@ class BaseAgent:
     async def _resolve_role_model(self) -> None:
         """Resolve model based on agent role with fallback chains"""
         cfg_obj = self._get_config_object()
-        
+
+        # Persisted runtime connection from the TUI /connect panel wins:
+        # both agents share the registry singleton, so keep it on the
+        # user-supplied endpoint instead of clobbering it with defaults.
+        from agent.llm.runtime import RUNTIME_PROVIDER, load_runtime_config
+        runtime = load_runtime_config()
+        if (runtime.get("provider") == RUNTIME_PROVIDER
+                and runtime.get("model") and runtime.get("base_url")
+                and runtime.get("api_key")):
+            model = runtime["model"]
+            try:
+                self.llm.set_model(model)
+                self._fallback_chain = [model]
+                logger.info(
+                    f"{self.role.value} agent using persisted runtime provider: {model}"
+                )
+                return
+            except Exception as exc:
+                logger.warning(
+                    f"Failed to apply persisted runtime model {model}: {exc}"
+                )
+
         if self.role == AgentRole.BUILD:
-            # Build Agent: NVIDIA NIM - Nemotron 3 Ultra for complex reasoning/coding
             provider = "nvidia"
             model = "nvidia/nemotron-3-ultra-550b-a55b"
             fallback_chain = [
-                "nvidia/nemotron-3-ultra-550b-a55b",      # Best for complex reasoning/coding (1M ctx)
-                "nvidia/nemotron-3-super-120b-a12b",      # Balanced reasoning/coding (256K ctx)
-                "nvidia/nemotron-3.5-lightning-30b-a3b",  # Fast execution, tool calls (1M ctx)
-                "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning",  # Lightweight reasoning
-                "nvidia/nemotron-4-340b-instruct",        # Large model for complex tasks
-                "openai/gpt-oss-20b",                     # Fallback: GPT-OSS on NVIDIA
+                "nvidia/nemotron-3-ultra-550b-a55b",
+                "nvidia/nemotron-3-super-120b-a12b",
+                "nvidia/nemotron-3.5-lightning-30b-a3b",
+                "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning",
+                "nvidia/nemotron-4-340b-instruct",
+                "openai/gpt-oss-20b",
             ]
             logger.info(f"Build agent using NVIDIA NIM (Nemotron 3 Ultra) with fallback chain ({len(fallback_chain)} models)")
         else:
-            # Plan Agent: NVIDIA NIM - Nemotron 3.5 Lightning for fast planning
             provider = "nvidia"
             model = "nvidia/nemotron-3.5-lightning-30b-a3b"
             fallback_chain = [
-                "nvidia/nemotron-3.5-lightning-30b-a3b",  # Fast planning, 1M ctx
-                "nvidia/nemotron-3-super-120b-a12b",      # Balanced reasoning fallback
-                "nvidia/nemotron-3-ultra-550b-a55b",      # Deep reasoning fallback
-                "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning",  # Lightweight
-                "openai/gpt-oss-20b",                     # Fallback: GPT-OSS
+                "nvidia/nemotron-3.5-lightning-30b-a3b",
+                "nvidia/nemotron-3-super-120b-a12b",
+                "nvidia/nemotron-3-ultra-550b-a55b",
+                "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning",
+                "openai/gpt-oss-20b",
             ]
             logger.info(f"Plan agent using NVIDIA NIM (Nemotron 3.5 Lightning) with fallback chain ({len(fallback_chain)} models)")
         
-        # Store fallback chain for retry logic
         self._fallback_chain = fallback_chain
         
-        # Set the model
         if provider and hasattr(self.llm, 'providers') and provider in self.llm.providers:
             self.llm.set_model(model)
             logger.info(f"Set {self.role.value} agent model: {provider}/{model}")
@@ -281,12 +302,7 @@ class BaseAgent:
         }
     
     async def _initialize_tools(self) -> None:
-        """Initialize role-specific tool registry (opencode-compatible)
-
-        Plan agent: registers all tools but write/edit/bash are gated by
-        PermissionManager (edit:deny, bash:deny) — matches opencode semantics
-        where tool exists but is denied. This keeps schemas stable.
-        """
+        """Initialize role-specific tool registry (opencode-compatible)"""
         from agent.tools import (
             TerminalTool, FileSystemTool, SearchTool, GitTool,
             ProcessTool, PatchTool, WebTool, BrowserTool, TaskTool,
@@ -299,7 +315,6 @@ class BaseAgent:
         self.tool_registry = ToolRegistry(agent=self)
         tools_cfg = self.config.get("tools", {})
         
-        # All tools — permission layer + BaseAgent plan guard enforces read-only
         tool_instances = [
             FileSystemTool(self.workspace),
             ReadTool(self.workspace),
@@ -331,8 +346,6 @@ class BaseAgent:
         if self.mcp_client is not None:
             tool_instances.append(MCPTool(self.mcp_client))
         
-        # Opencode-style: plan still sees all tool schemas (permission denies writes)
-        # but filter by global enabled/disabled only — not by PLAN_AGENT_TOOLS
         enabled = set(tools_cfg.get("enabled") or [])
         disabled = set(tools_cfg.get("disabled") or [])
         
@@ -343,7 +356,6 @@ class BaseAgent:
                 continue
             await self.tool_registry.register_tool(tool)
         
-        # Register external MCP tools
         if self.role == AgentRole.BUILD and self.mcp_client is not None:
             for tool_def in self.mcp_client.list_tools():
                 fn = tool_def["function"]
@@ -367,16 +379,13 @@ class BaseAgent:
         params: Dict[str, Any],
         require_permission: bool = True,
     ) -> Dict[str, Any]:
-        """Execute a tool through permission gate + registry (opencode plan enforcement)"""
+        """Execute a tool through permission gate + registry"""
         if self.is_shutting_down:
             return {"success": False, "error": "Agent shutting down"}
 
-        # Opencode Plan mode: deny writes/bash even if manager lacks explicit rule
         if self.role == AgentRole.PLAN:
             t = tool_name.lower()
-            # deny all edit/write/patch and bash/terminal/process writes
             if t in ("write", "edit", "apply_patch", "filesystem", "patch", "process", "bash", "terminal", "shell", "git"):
-                # for filesystem/git, only deny write-like actions
                 if t in ("filesystem", "git"):
                     act = params.get("action", "").lower()
                     write_actions = ("write", "append", "edit", "delete", "mkdir", "move", "copy", "add", "commit", "push", "checkout", "reset", "stash")
@@ -384,8 +393,20 @@ class BaseAgent:
                         return {"success": False, "error": f"Action '{act}' not allowed in plan mode (read-only)", "permission_denied": True, "tool": tool_name}
                 else:
                     return {"success": False, "error": f"Tool '{tool_name}' not allowed in plan mode (read-only)", "permission_denied": True, "tool": tool_name}
+
+        if self.tool_registry and not self.tool_registry.has_tool(tool_name):
+            from difflib import get_close_matches as _gcm
+            available = list(self.tool_registry.tools or {}) + list(
+                getattr(self.tool_registry, "_external", {}) or {})
+            suggestion = _gcm(tool_name, available, n=1)
+            hint = f" Did you mean '{suggestion[0]}'?" if suggestion else ""
+            logger.warning(f"Unknown tool '{tool_name}' requested by model.{hint}")
+            return {
+                "success": False,
+                "error": f"Tool not found: {tool_name}.{hint}",
+                "tool": tool_name,
+            }
         
-        # Permission gate
         if require_permission and self.permission_manager:
             action = self._infer_action(tool_name, params)
             allowed, reason = await self.permission_manager.check_permission(
@@ -401,7 +422,6 @@ class BaseAgent:
                     "tool": tool_name,
                 }
         
-        # Execute
         try:
             result = await self.tool_registry.execute(tool_name, params)
         except Exception as e:
@@ -412,7 +432,6 @@ class BaseAgent:
                 "tool": tool_name,
             }
         
-        # Record
         self.context["tool_calls"] = self.context.get("tool_calls", 0) + 1
         if self.context_manager:
             await self.context_manager.add_tool_output(tool_name, params, result)
@@ -460,7 +479,6 @@ class BaseAgent:
         if self.is_shutting_down:
             return {"success": False, "error": "Agent shutting down"}
         
-        # Check for @subagent invocations (OpenCode style)
         if self.subagent_manager:
             subagent_calls = self.subagent_manager.parse_subagent_invocation(query)
             if subagent_calls:
@@ -472,22 +490,18 @@ class BaseAgent:
             self.context["turn_count"] = self.context.get("turn_count", 0) + 1
             self.metrics["total_queries"] += 1
             
-            # Record user message
             if self.context_manager:
                 await self.context_manager.add_user_message(query, context)
             if self.session:
                 self.session.add_user_message(query)
             
-            # Compact if needed
             if self.context_manager and await self.context_manager.needs_compaction():
                 await self.context_manager.compact()
             
-            # Get live context
             live_context = {}
             if self.context_manager:
                 live_context = await self.context_manager.get_context()
             
-            # Run the loop
             result = await self.loop.run(
                 query=query,
                 context=live_context,
@@ -498,14 +512,12 @@ class BaseAgent:
                 max_turns=self.max_turns,
             )
             
-            # Save response
             response_text = result.get("response", "")
             if self.context_manager and response_text:
                 await self.context_manager.add_assistant_message(response_text)
             if self.session and response_text:
                 self.session.add_assistant_message(response_text)
             
-            # Update metrics
             elapsed = time.time() - start
             tokens = result.get("context", {}).get("tokens_used", 0)
             self.context["tokens_used"] = self.context.get("tokens_used", 0) + tokens
@@ -524,7 +536,7 @@ class BaseAgent:
             if self.session:
                 self.session.set_status("idle")
             
-            return {
+            result_out = {
                 "success": result.get("success", True),
                 "response": response_text,
                 "iteration": result.get("iteration", 0),
@@ -533,6 +545,9 @@ class BaseAgent:
                 "context": result.get("context", {}),
                 "plan": result.get("plan"),
             }
+            if not result_out["success"] and result.get("error"):
+                result_out["error"] = str(result.get("error"))
+            return result_out
             
         except PermissionDeniedError as e:
             self.status = "error"
@@ -555,7 +570,6 @@ class BaseAgent:
         remaining_query = original_query
         
         for agent_name, sub_query in subagent_calls:
-            # Map agent name to role
             role_map = {
                 "general": SubAgentRole.GENERAL,
                 "explore": SubAgentRole.EXPLORE,
@@ -571,10 +585,8 @@ class BaseAgent:
                 })
                 continue
             
-            # Remove this invocation from remaining query
             remaining_query = remaining_query.replace(f"@{agent_name} {sub_query}", "").strip()
             
-            # Invoke subagent
             result = await self.subagent_manager.invoke_subagent(
                 role=role,
                 query=sub_query,
@@ -582,12 +594,10 @@ class BaseAgent:
             )
             results.append(result)
         
-        # If there's remaining query after subagent invocations, process it normally
         if remaining_query:
             main_result = await self._process_main_query(remaining_query, context)
             results.append({"main": main_result})
         
-        # Combine results
         combined_response = "\n\n".join([
             f"--- @{r.get('subagent', 'main')} ---\n{r.get('result', r.get('error', str(r.get('main', {}))))}"
             for r in results
@@ -655,7 +665,7 @@ class BaseAgent:
             
             self.status = "idle"
             
-            return {
+            result_out = {
                 "success": result.get("success", True),
                 "response": response_text,
                 "iteration": result.get("iteration", 0),
@@ -663,12 +673,18 @@ class BaseAgent:
                 "duration": elapsed,
                 "context": result.get("context", {}),
             }
+            if not result_out["success"] and result.get("error"):
+                result_out["error"] = str(result.get("error"))
+            return result_out
             
         except Exception as e:
             logger.error(f"Main query failed: {e}", exc_info=True)
             return {"success": False, "error": str(e)}
     
     async def shutdown(self) -> None:
+        if self._shutdown_done:
+            return
+        self._shutdown_done = True
         self.is_shutting_down = True
         logger.info(f"Shutting down {self.role.value} agent...")
         
@@ -690,28 +706,12 @@ class BaseAgent:
 
 
 # ======================================================================
-# PLAN AGENT - Read-only analysis and planning (uses Groq GPT-OSS-120B)
+# PLAN AGENT
 # ======================================================================
 
 class PlanAgent(BaseAgent):
     """
     Plan Agent - Read-only architect (Groq GPT-OSS-120B for fast planning)
-    
-    Capabilities:
-    - Analyze codebase
-    - Create detailed plans
-    - Suggest changes
-    - Research and investigate
-    
-    Restrictions:
-    - NO terminal/shell execution
-    - NO file writes/edits
-    - NO git mutations
-    - NO process management
-    - NO subagent spawning
-    
-    Model: Groq GPT-OSS-120B (fast reasoning, structured output)
-    Fallback: GPT-OSS-20B → Llama-3.3-70B → Mixtral → Gemma → NVIDIA
     """
     
     def __init__(self, *args, **kwargs):
@@ -744,29 +744,12 @@ class PlanAgent(BaseAgent):
 
 
 # ======================================================================
-# BUILD AGENT - Full execution capabilities (uses NVIDIA Nemotron 3 Ultra - 1M context)
+# BUILD AGENT
 # ======================================================================
 
 class BuildAgent(BaseAgent):
     """
     Build Agent - Full execution (NVIDIA Nemotron 3 Ultra for LARGE CONTEXT WINDOW)
-    
-    Capabilities:
-    - Execute terminal commands
-    - Read/write/edit files
-    - Git operations (commit, push, etc.)
-    - Process management
-    - Spawn subagents
-    - Run linters, tests
-    - Browser automation
-    
-    Model: NVIDIA Nemotron 3 Ultra 550B (1M context window)
-    Fallback: Super 120B (256K) → Lightning 30B (1M) → Nano 30B (256K) → Groq
-    
-    WHY NVIDIA FOR BUILD:
-    - 1M context handles: tool outputs, file contents, execution history
-    - Large codebases fit in context
-    - Multi-step execution without context loss
     """
     
     def __init__(self, *args, **kwargs):
@@ -777,29 +760,20 @@ class BuildAgent(BaseAgent):
 
 
 # ======================================================================
-# AGENT COORDINATOR - Manages Plan + Build agents (OpenCode style)
+# AGENT COORDINATOR
 # ======================================================================
 
 @dataclass
 class AgentCoordinator:
     """
     Coordinates Plan and Build agents (OpenCode style)
-    
-    Workflow (matching opencode):
-    - Two primary agents: Plan (read-only) and Build (full tools)
-    - User can switch between them explicitly
-    - Subagents can be invoked with @syntax
-    
-    Modes:
-    - "plan": Use Plan agent for analysis/planning
-    - "build": Use Build agent for execution
-    - "auto": Automatic Plan -> Build loop (legacy)
     """
     
     plan_agent: PlanAgent
     build_agent: BuildAgent
     config: Dict[str, Any]
-    current_mode: str = "build"  # Default to build like opencode
+    current_mode: str = "build"
+    _shutdown_done: bool = False
     
     async def initialize(self) -> None:
         await self.plan_agent.initialize()
@@ -828,11 +802,6 @@ class AgentCoordinator:
     ) -> Dict[str, Any]:
         """
         Process query with the current agent (or specified mode).
-        
-        Args:
-            mode: "plan", "build", or "auto" (default: current_mode)
-            auto_execute: If True and mode="plan", auto-execute with Build agent
-            max_iterations: For "auto" mode only
         """
         effective_mode = mode or self.current_mode
         
@@ -842,14 +811,12 @@ class AgentCoordinator:
         agent = self.plan_agent if effective_mode == "plan" else self.build_agent
         logger.info(f"Processing query with {effective_mode} agent: {query[:100]}...")
         
-        # For plan agent, add context about available build tools
         if effective_mode == "plan":
             context = context or {}
             context["build_agent_tools"] = self.build_agent.get_available_tools()
         
         result = await agent.process_query(query=query, context=context)
         
-        # If plan agent and auto_execute, run the plan with build agent
         if effective_mode == "plan" and auto_execute and result.get("success"):
             plan_data = result.get("response", "")
             if plan_data:
@@ -872,7 +839,7 @@ class AgentCoordinator:
             context=context,
         )
         
-        return {
+        result = {
             "success": build_result.get("success", True),
             "plan": plan,
             "execution": build_result.get("response", ""),
@@ -880,6 +847,9 @@ class AgentCoordinator:
             "iterations": 1,
             "tool_calls": build_result.get("tool_calls", 0),
         }
+        if not result["success"] and build_result.get("error"):
+            result["error"] = build_result.get("error")
+        return result
     
     async def _process_auto(
         self,
@@ -895,63 +865,71 @@ class AgentCoordinator:
         plan_data = ""
         execution_history = []
         final_execution = ""
+        first_error: Optional[str] = None
         
         for iteration in range(max_iterations):
             logger.info(f"=== Iteration {iteration + 1}/{max_iterations} ===")
-            
-            # Phase 1: Plan Agent creates/updates plan
-            if iteration == 0:
-                plan_prompt = (
-                    f"Create a detailed execution plan for: {query}\n\n"
-                    f"Context: {json.dumps(current_context)}\n\n"
-                    f"Available tools for Build agent: {', '.join(self.build_agent.get_available_tools())}\n\n"
-                    f"Output format: JSON with tasks array, each with description, tools, dependencies, validation."
+
+            plan_loop = getattr(self.plan_agent, "loop", None)
+            prev_planning = getattr(plan_loop, "enable_planning", True) if plan_loop else True
+            try:
+                if plan_loop:
+                    plan_loop.enable_planning = False
+
+                if iteration == 0:
+                    plan_prompt = (
+                        f"Create a detailed execution plan for: {query}\n\n"
+                        f"Context: {json.dumps(current_context)}\n\n"
+                        f"Available tools for Build agent: {', '.join(self.build_agent.get_available_tools())}\n\n"
+                        f"Output format: JSON with tasks array, each with description, tools, dependencies, validation."
+                    )
+                else:
+                    prev_results = "\n\n".join([
+                        f"--- Iteration {i+1} Results ---\n{exec_hist.get('execution', '')[:2000]}"
+                        for i, exec_hist in enumerate(execution_history)
+                    ])
+                    plan_prompt = (
+                        f"Previous plan execution results:\n{prev_results}\n\n"
+                        f"Original goal: {query}\n\n"
+                        f"Review the results above. Some tasks may have failed or be incomplete.\n"
+                        f"Create an UPDATED plan to complete the remaining work.\n"
+                        f"Focus on fixing failures and completing unfinished tasks.\n\n"
+                        f"Available tools: {', '.join(self.build_agent.get_available_tools())}\n\n"
+                        f"Output format: JSON with tasks array (description, tools, dependencies, validation)."
+                    )
+
+                plan_result = await self.plan_agent.process_query(
+                    query=plan_prompt,
+                    context=current_context,
                 )
-            else:
-                prev_results = "\n\n".join([
-                    f"--- Iteration {i+1} Results ---\n{exec_hist.get('execution', '')[:2000]}"
-                    for i, exec_hist in enumerate(execution_history)
-                ])
-                plan_prompt = (
-                    f"Previous plan execution results:\n{prev_results}\n\n"
-                    f"Original goal: {query}\n\n"
-                    f"Review the results above. Some tasks may have failed or be incomplete.\n"
-                    f"Create an UPDATED plan to complete the remaining work.\n"
-                    f"Focus on fixing failures and completing unfinished tasks.\n\n"
-                    f"Available tools: {', '.join(self.build_agent.get_available_tools())}\n\n"
-                    f"Output format: JSON with tasks array (description, tools, dependencies, validation)."
+
+                plan_data = plan_result.get("response", "")
+                logger.info(f"Plan created (iteration {iteration + 1}): {len(plan_data)} chars")
+
+                if not auto_execute:
+                    return {
+                        "success": True,
+                        "plan": plan_data,
+                        "execution": None,
+                        "iteration": iteration + 1,
+                        "message": "Plan created. Use execute_plan() to run it.",
+                    }
+
+                build_prompt = (
+                    f"Execute this plan step by step:\n\n{plan_data}\n\n"
+                    f"For each task, call the appropriate tool(s). Report results after each step.\n"
+                    f"Continue until all tasks are complete or you encounter blockers.\n"
+                    f"Be specific about what you did and any errors encountered."
                 )
-            
-            plan_result = await self.plan_agent.process_query(
-                query=plan_prompt,
-                context=current_context,
-            )
-            
-            plan_data = plan_result.get("response", "")
-            logger.info(f"Plan created (iteration {iteration + 1}): {len(plan_data)} chars")
-            
-            if not auto_execute:
-                return {
-                    "success": True,
-                    "plan": plan_data,
-                    "execution": None,
-                    "iteration": iteration + 1,
-                    "message": "Plan created. Use execute_plan() to run it.",
-                }
-            
-            # Phase 2: Build Agent executes plan
-            build_prompt = (
-                f"Execute this plan step by step:\n\n{plan_data}\n\n"
-                f"For each task, call the appropriate tool(s). Report results after each step.\n"
-                f"Continue until all tasks are complete or you encounter blockers.\n"
-                f"Be specific about what you did and any errors encountered."
-            )
-            
-            build_result = await self.build_agent.process_query(
-                query=build_prompt,
-                context=current_context,
-            )
-            
+
+                build_result = await self.build_agent.process_query(
+                    query=build_prompt,
+                    context=current_context,
+                )
+            finally:
+                if plan_loop:
+                    plan_loop.enable_planning = prev_planning
+
             execution_result = build_result.get("response", "")
             execution_history.append({
                 "iteration": iteration + 1,
@@ -960,19 +938,26 @@ class AgentCoordinator:
                 "success": build_result.get("success", True),
                 "tool_calls": build_result.get("tool_calls", 0),
             })
-            
+
             final_execution = execution_result
-            
-            if build_result.get("success", True) and self._is_plan_complete(execution_result, plan_data):
+
+            if build_result.get("success", True):
                 logger.info(f"Plan completed successfully in {iteration + 1} iterations")
                 break
-            
+
+            if first_error is None and build_result.get("error"):
+                first_error = build_result.get("error")
+            if first_error is None and plan_result.get("error"):
+                first_error = plan_result.get("error")
+
+            logger.debug(f"Build did not complete cleanly; heuristic={self._is_plan_complete(execution_result, plan_data)}")
+
             current_context["previous_execution"] = execution_result
             current_context["iteration"] = iteration + 1
         
         overall_success = all(h.get("success", True) for h in execution_history)
         
-        return {
+        result = {
             "success": overall_success,
             "plan": plan_data,
             "execution": final_execution,
@@ -981,6 +966,9 @@ class AgentCoordinator:
             "tool_calls": sum(h.get("tool_calls", 0) for h in execution_history),
             "mode": "auto",
         }
+        if not overall_success and first_error:
+            result["error"] = first_error
+        return result
     
     def _is_plan_complete(self, execution: str, plan: str) -> bool:
         execution_lower = execution.lower()
@@ -1003,6 +991,9 @@ class AgentCoordinator:
         return await self._execute_plan_with_build(plan, context)
     
     async def shutdown(self) -> None:
+        if self._shutdown_done:
+            return
+        self._shutdown_done = True
         await self.plan_agent.shutdown()
         await self.build_agent.shutdown()
     

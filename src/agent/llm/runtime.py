@@ -45,7 +45,7 @@ def configure_runtime_provider(registry: Any, base_url: str, api_key: str,
     save_runtime_config(base_url, api_key, model)
     provider = OpenAICompatibleProvider({
         "api_key": api_key.strip(), "base_url": base_url.strip().rstrip("/"),
-        "timeout": 120.0, "max_retries": 3,
+        "timeout": 30.0, "max_retries": 2,
     })
     registry.providers[RUNTIME_PROVIDER] = provider
     registry._api_keys[RUNTIME_PROVIDER] = api_key.strip()
