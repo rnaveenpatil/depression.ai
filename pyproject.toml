@@ -41,8 +41,8 @@ dev = [
 ]
 
 [project.scripts]
-depression = "agent.main:main"
-depression_ai = "agent.main:main"
+depression = "agent.tui.run:main"
+depression_ai = "agent.tui.run:main"
 depression-tui = "agent.tui.run:main"
 
 [project.urls]
