@@ -27,25 +27,33 @@ from agent.tui.theme import (
     MATRIX_THEME,
 )
 from agent.tui.widgets.aws_panel import AWSPanel
+from agent.tui.widgets.empty_banner import EmptyBanner
+from agent.tui.widgets.sidebar import Sidebar
 from agent.tui.widgets.thinking import ThinkingIndicator
 from agent.tui.widgets.todo_panel import TodoPanel
 from agent.tui.widgets.tool_call import ToolCallWidget
 
-
-BANNER_LINES = [
-    "  ██████╗ ███████╗██████╗ ██████╗ ███████╗███████╗███████╗██╗ ██████╗ ███╗   ██╗",
-    "  ██╔══██╗██╔════╝██╔══██╗██╔══██╗██╔════╝██╔════╝██╔════╝██║██╔═══██╗████╗  ██║",
-    "  ██║  ██║█████╗  ██████╔╝██████╔╝█████╗  ███████╗███████╗██║██║   ██║██╔██╗ ██║",
-    "  ██║  ██║██╔══╝  ██╔═══╝ ██╔═══╝ ██╔══╝  ╚════██║╚════██║██║██║   ██║██║╚██╗██║",
-    "  ██████╔╝███████╗██║     ██║     ███████╗███████║███████║██║╚██████╔╝██║ ╚████║",
-    "  ╚═════╝ ╚══════╝╚═╝     ╚═╝     ╚══════╝╚══════╝╚══════╝╚═╝ ╚═════╝ ╚═╝  ╚═══╝",
-]
 
 SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
 MODE_ICONS = {"plan": "◇", "build": "◆"}
 MODE_ORDER = ["build", "plan"]
 
 DEFAULT_TURN_TIMEOUT = 900.0
+
+
+def _esc(text: Any) -> str:
+    """Escape a value for safe embedding inside a Textual markup string."""
+    if text is None:
+        return ""
+    return str(text).replace("[", r"\[")
+
+
+def _fmt(n: int) -> str:
+    """Format an integer with thousands separators."""
+    try:
+        return f"{int(n):,}"
+    except Exception:
+        return "0"
 
 
 # ======================================================================
@@ -132,8 +140,7 @@ class ContextPanel(Vertical):
 
     def refresh_values(self) -> None:
         try:
-            model = self._app.cfg.get("model") or "—"
-            model = str(model).replace("[", r"\[")
+            model = _esc(self._app.cfg.get("model") or "—")
             self.query_one("#ctx-model", Static).update(
                 f"[{MUTED}]model[/]   [{TEXT}]{model}[/]")
             self.query_one("#ctx-window", Static).update(
@@ -187,6 +194,7 @@ class HelpPanel(Vertical):
         yield Static("/quit      exit", classes="help-row")
         yield Static("Keys", classes="help-section")
         yield Static("Tab        cycle mode (build ↔ plan)", classes="help-row")
+        yield Static("Ctrl+B     show / hide the sidebar", classes="help-row")
         yield Static("Esc        interrupt running agent (also denies modal)", classes="help-row")
         yield Static("e          expand / collapse the last tool block", classes="help-row")
         yield Static("Ctrl+L     clear transcript", classes="help-row")
@@ -240,11 +248,6 @@ class PermissionModal(ModalScreen[bool]):
         self._verdict = verdict
         self._done = False
 
-    def _esc(self, text: Any) -> str:
-        if text is None:
-            return ""
-        return str(text).replace("[", r"\[")
-
     def compose(self) -> ComposeResult:
         req, v = self._request, self._verdict
         risk = getattr(v, "risk", "safe")
@@ -253,17 +256,17 @@ class PermissionModal(ModalScreen[bool]):
         risk_color = ERROR if risk in ("high", "critical") else GREEN
         lines = [
             f"[bold {GREEN}]▌ PERMISSION REQUEST[/]",
-            f"[{risk_color}]risk: {self._esc(str(risk).upper())}[/]",
-            f"[bold {GREEN}]{self._esc(req.tool)}.{self._esc(req.action)}[/]",
+            f"[{risk_color}]risk: {_esc(str(risk).upper())}[/]",
+            f"[bold {GREEN}]{_esc(req.tool)}.{_esc(req.action)}[/]",
         ]
         if getattr(v, "reason", None):
-            lines.append(f"[{MUTED}]{self._esc(v.reason)}[/]")
+            lines.append(f"[{MUTED}]{_esc(v.reason)}[/]")
         if getattr(req, "params", None):
             for k, val in list(req.params.items())[:4]:
                 sval = str(val)
                 if len(sval) > 60:
                     sval = sval[:57] + "…"
-                lines.append(f"[{DIM}]{self._esc(k)}: {self._esc(sval)}[/]")
+                lines.append(f"[{DIM}]{_esc(k)}: {_esc(sval)}[/]")
         lines.append("")
         lines.append(f"[{MUTED}][A] allow   [D] deny   (enter = default)[/]")
 
@@ -328,52 +331,30 @@ class DepressionApp(App):
     #body {{ height: 1fr; layout: horizontal; }}
     #main-col {{ width: 1fr; height: 1fr; layout: vertical; }}
 
-    #banner-area {{ height: 8; padding: 1 2 0 2; background: {BG}; }}
-    #banner {{ height: 6; width: 100%; }}
-    #banner-sub {{ height: 1; color: {GREEN_DIM}; padding: 0 0 0 2; }}
-
+    #transcript-wrap {{
+        height: 1fr;
+        width: 100%;
+        layout: vertical;
+    }}
     #transcript {{
-        height: 1fr; width: 100%;
+        height: 1fr;
+        width: 100%;
         padding: 1 2 0 2;
         scrollbar-background: {BG};
         scrollbar-color: {BORDER};
     }}
+    #empty-banner {{
+        height: 1fr;
+        width: 100%;
+        display: block;
+    }}
+
     .user       {{ color: {GREEN_GLOW}; margin-bottom: 1; }}
     .agent      {{ color: {TEXT}; margin-bottom: 1; }}
     .agent-head {{ color: {GREEN}; text-style: bold; }}
     .system     {{ color: {MUTED}; margin-bottom: 1; }}
     .error      {{ color: {ERROR}; margin-bottom: 1; }}
     .queued     {{ color: {AMBER}; margin-bottom: 1; }}
-
-    #sidebar {{
-        width: 46; min-width: 46; max-width: 46;
-        height: 1fr; background: {BG};
-        border-left: solid {BORDER}; layout: vertical;
-    }}
-    #side-title {{
-        height: 1; padding: 0 1;
-        background: {BG}; color: {GREEN}; text-style: bold;
-        border-bottom: solid {BORDER};
-    }}
-    #side-tabs {{
-        height: 1; layout: horizontal;
-        background: {BG}; border-bottom: solid {BORDER};
-    }}
-    .side-tab {{
-        width: 1fr; min-width: 8; height: 1;
-        background: transparent; border: none;
-        color: {DIM}; text-style: bold;
-    }}
-    .side-tab:hover {{ color: {MUTED}; }}
-    .side-tab.active {{ color: {GREEN}; }}
-
-    #side-content {{
-        height: 1fr; overflow-y: auto; overflow-x: hidden;
-        background: {BG}; padding: 1 0;
-    }}
-    #panel-llm, #panel-aws, #panel-context, #panel-todo, #panel-help {{
-        width: 100%; height: auto;
-    }}
 
     #prompt-wrap {{
         dock: bottom; height: auto;
@@ -393,7 +374,13 @@ class DepressionApp(App):
     #prompt:focus {{ border: none; }}
     #prompt.busy {{ color: {AMBER}; }}
     #mode-chip {{ height: 1; padding: 0 0 0 2; color: {MUTED}; background: {BG}; }}
-    #hint {{ height: 1; padding: 0 0 0 2; color: {DIM}; background: {BG}; margin-bottom: 0; }}
+    #hint {{ height: 1; padding: 0 0 0 2; color: {DIM}; background: {BG}; }}
+
+    #token-bar {{
+        height: 1;
+        padding: 0 0 0 2;
+        background: {BG};
+    }}
 
     #thinking-bar {{ height: 1; background: {BG}; }}
     """
@@ -404,6 +391,7 @@ class DepressionApp(App):
         Binding("ctrl+c", "cancel", "Cancel", priority=True),
         Binding("escape", "interrupt", "Interrupt", priority=False),
         Binding("ctrl+l", "clear", "Clear", priority=True),
+        Binding("ctrl+b", "toggle_sidebar", "Sidebar", priority=True),
         Binding("tab", "cycle_mode", "Mode", priority=True),
         Binding("e", "toggle_expand_tool", "Expand", priority=False),
     ]
@@ -414,6 +402,10 @@ class DepressionApp(App):
     message_count: reactive[int] = reactive(0)
     context_window: reactive[int] = reactive(200_000)
     queue_depth: reactive[int] = reactive(0)
+
+    live_input_tokens: reactive[int] = reactive(0)
+    live_output_tokens: reactive[int] = reactive(0)
+    live_total_tokens: reactive[int] = reactive(0)
 
     def __init__(
         self,
@@ -426,12 +418,12 @@ class DepressionApp(App):
         self.aws = get_aws_credentials()
 
         self.busy = False
-        self._banner_phase = 0
         self._active_panel = "llm"
         self._agent_worker = None
         self._prompt_queue: list[str] = []
         self._draining = False
         self._is_shutting_down = False
+        self._has_messages = False
 
         import os as _os
         try:
@@ -452,31 +444,21 @@ class DepressionApp(App):
     def compose(self) -> ComposeResult:
         with Horizontal(id="body"):
             with Vertical(id="main-col"):
-                with Vertical(id="banner-area"):
-                    yield Static(self._banner_markup(), id="banner", markup=True)
-                    yield Static(
-                        f"  [{GREEN_DIM}]✧  a  t  e  r  m  i  n  a  l  "
-                        f"c  o  d  i  n  g  a  g  e  n  t  ✧[/]",
-                        id="banner-sub", markup=True,
-                    )
-                yield VerticalScroll(id="transcript")
+                with Vertical(id="transcript-wrap"):
+                    yield EmptyBanner(id="empty-banner")
+                    yield VerticalScroll(id="transcript")
                 yield ThinkingIndicator(id="thinking-bar")
 
-            with Vertical(id="sidebar"):
-                yield Static("▌ SIDEBAR", id="side-title", markup=True)
-                with Horizontal(id="side-tabs"):
-                    yield Button("CONNECT", id="tab-llm",
-                                 classes="side-tab active")
-                    yield Button("AWS", id="tab-aws", classes="side-tab")
-                    yield Button("CTX", id="tab-context", classes="side-tab")
-                    yield Button("TODO", id="tab-todo", classes="side-tab")
-                    yield Button("HELP", id="tab-help", classes="side-tab")
-                with VerticalScroll(id="side-content"):
-                    yield LLMPanel(self, id="panel-llm")
-                    yield AWSPanel(self, id="panel-aws")
-                    yield ContextPanel(self, id="panel-context")
-                    yield TodoPanel(session=self._session(), id="panel-todo")
-                    yield HelpPanel(id="panel-help")
+            yield Sidebar(
+                panels=[
+                    ("llm", LLMPanel(self, id="panel-llm")),
+                    ("aws", AWSPanel(self, id="panel-aws")),
+                    ("context", ContextPanel(self, id="panel-context")),
+                    ("todo", TodoPanel(session=self._session(), id="panel-todo")),
+                    ("help", HelpPanel(id="panel-help")),
+                ],
+                id="sidebar",
+            )
 
         with Vertical(id="prompt-wrap"):
             with Horizontal(id="prompt-row"):
@@ -484,10 +466,11 @@ class DepressionApp(App):
                 yield Input(placeholder="ask the agent…", id="prompt")
             yield Static(self._mode_chip(), id="mode-chip", markup=True)
             yield Static(
-                "tab mode  ·  esc interrupt  ·  e expand  ·  ctrl+c exit  ·  "
-                "/connect /model /aws /context /todo /help",
+                f"[{DIM}]tab mode  ·  ctrl+b sidebar  ·  esc interrupt  ·  "
+                f"e expand  ·  ctrl+q quit[/]",
                 id="hint", markup=True,
             )
+            yield Static(self._token_bar(), id="token-bar", markup=True)
 
         yield Footer()
 
@@ -508,7 +491,7 @@ class DepressionApp(App):
         self.register_theme(MATRIX_THEME)
         self.theme = "matrix"
 
-        self._show_panel("llm")
+        self._set_active_panel("llm")
 
         for w in self.query("#sidebar Button, .side-tab"):
             try:
@@ -516,18 +499,16 @@ class DepressionApp(App):
             except Exception:
                 pass
 
+        try:
+            self.query_one("#transcript", VerticalScroll).display = False
+        except Exception:
+            pass
+
         self._wire_events()
 
-        self._system(
-            "welcome. type a prompt to run the agent — "
-            "/connect to set LLM, /model to discover, /aws for AWS, "
-            "/context for tokens, /todo for tasks, /help for all commands."
-        )
-
         self.query_one("#prompt", Input).focus()
-        self.set_interval(1.50, self._tick_banner)
-
         self._refresh_aws_status()
+        self._refresh_token_bar()
 
     def _wire_events(self) -> None:
         if self._event_handlers_registered:
@@ -538,6 +519,7 @@ class DepressionApp(App):
             self._events.set_ui_loop(asyncio.get_running_loop())
             self._events.attach(self.coordinator)
             self._events.subscribe("on_tool_executed", self._on_tool_event)
+            self._events.subscribe("on_plan_updated", self._on_plan_updated)
             self._event_handlers_registered = True
         except Exception as exc:
             self._error(f"event wiring failed: {exc}")
@@ -560,6 +542,8 @@ class DepressionApp(App):
         except Exception:
             return
 
+        self._show_transcript()
+
         widget = ToolCallWidget(tool=tool, params=params)
         await transcript.mount(widget)
         widget.set_running(execution_time=duration)
@@ -571,6 +555,8 @@ class DepressionApp(App):
         self._active_tool_widget = widget
         self.call_after_refresh(lambda: transcript.scroll_end(animate=False))
 
+        self._sync_tokens_from_loop()
+
         if tool in ("aws",) or tool.startswith("mcp__aws__"):
             try:
                 self.query_one("#panel-aws", AWSPanel).refresh_mcp_status()
@@ -579,6 +565,140 @@ class DepressionApp(App):
 
         try:
             self._refresh_context_panel()
+        except Exception:
+            pass
+
+    async def _on_plan_updated(self, event: AgentEvent) -> None:
+        """
+        The model wrote a checklist in its response. Mirror it into the
+        shared TodoTool store so the sidebar updates live, and — only the
+        first time — render an inline 'plan' block in the transcript.
+        """
+        if self._is_shutting_down:
+            return
+        data = event.payload or {}
+        entries = data.get("entries") or []
+        render_inline = bool(data.get("render", True))
+        if not entries:
+            return
+
+        try:
+            from agent.tools.todo import TodoTool, TodoItem
+            session = self._session()
+            sid = TodoTool._session_key(session)
+            store = TodoTool._strong_keys.setdefault(sid, {})
+            store.clear()
+            prio_map = {"high": 1, "medium": 3, "low": 5}
+            for i, e in enumerate(entries):
+                tid = f"plan_{i}"
+                status = str(e.get("status") or "pending").lower()
+                if status in ("completed", "done"):
+                    status = "done"
+                elif status in ("in_progress", "running"):
+                    status = "in_progress"
+                store[tid] = TodoItem(
+                    id=tid,
+                    title=str(e.get("content") or "")[:120],
+                    status=status,
+                    priority=prio_map.get(str(e.get("priority") or "medium"), 3),
+                )
+        except Exception:
+            pass
+
+        if not render_inline:
+            return
+
+        self._show_transcript()
+        self._write(self._render_plan_block(entries), "agent")
+
+    def _render_plan_block(self, entries: list) -> str:
+        """Format the checklist as a single markup block, colour-coded."""
+        glyph_map = {
+            "pending":     ("○", MUTED),
+            "in_progress": ("▶", AMBER),
+            "completed":   ("●", GREEN),
+            "done":        ("●", GREEN),
+            "blocked":     ("◼", ERROR),
+            "cancelled":   ("✕", DIM),
+        }
+        lines = [f"[bold {GREEN}]▌ plan[/]"]
+        for e in entries:
+            status = str(e.get("status") or "pending").lower()
+            if status == "done":
+                status = "completed"
+            glyph, color = glyph_map.get(status, ("○", MUTED))
+            content = _esc(str(e.get("content") or ""))
+            if status in ("completed", "done"):
+                lines.append(
+                    f"[{color}]{glyph}[/] [{DIM}][strike]{content}[/strike][/]"
+                )
+            elif status == "in_progress":
+                lines.append(f"[{color}]{glyph}[/] [{GREEN_GLOW}]{content}[/]")
+            else:
+                lines.append(f"[{color}]{glyph}[/] [{TEXT}]{content}[/]")
+        return "\n".join(lines)
+
+    # ------------------------------------------------------------------
+    # TOKEN COUNTER
+    # ------------------------------------------------------------------
+
+    def _sync_tokens_from_loop(self) -> None:
+        loop_obj = None
+        if self.coordinator is not None:
+            try:
+                agent = self.coordinator.get_current_agent()
+            except Exception:
+                agent = getattr(self.coordinator, "build_agent", None)
+            loop_obj = getattr(agent, "loop", None)
+        if loop_obj is None:
+            return
+        ctx = getattr(loop_obj, "context", None)
+        if ctx is None:
+            return
+        try:
+            self.live_input_tokens = int(getattr(ctx, "input_tokens", 0) or 0)
+            self.live_output_tokens = int(getattr(ctx, "output_tokens", 0) or 0)
+            total = getattr(ctx, "tokens_used", 0) or 0
+            if not total:
+                total = self.live_input_tokens + self.live_output_tokens
+            self.live_total_tokens = int(total)
+        except Exception:
+            pass
+        self._refresh_token_bar()
+
+    def _token_bar(self) -> str:
+        ti = self.live_input_tokens
+        to = self.live_output_tokens
+        tt = self.live_total_tokens or (ti + to)
+        return (
+            f"[{DIM}]tokens[/]  "
+            f"[{MUTED}]in[/] [{TEXT}]{_fmt(ti)}[/]  "
+            f"[{DIM}]·[/]  "
+            f"[{MUTED}]out[/] [{TEXT}]{_fmt(to)}[/]  "
+            f"[{DIM}]·[/]  "
+            f"[{MUTED}]total[/] [{GREEN}]{_fmt(tt)}[/]"
+        )
+
+    def _refresh_token_bar(self) -> None:
+        try:
+            self.query_one("#token-bar", Static).update(self._token_bar())
+        except Exception:
+            pass
+
+    # ------------------------------------------------------------------
+    # TRANSCRIPT / BANNER VISIBILITY
+    # ------------------------------------------------------------------
+
+    def _show_transcript(self) -> None:
+        if self._has_messages:
+            return
+        self._has_messages = True
+        try:
+            self.query_one("#empty-banner", EmptyBanner).display = False
+        except Exception:
+            pass
+        try:
+            self.query_one("#transcript", VerticalScroll).display = True
         except Exception:
             pass
 
@@ -602,22 +722,15 @@ class DepressionApp(App):
                     pass
 
     # ------------------------------------------------------------------
-    # BANNER / MODE CHIP
+    # MODE CHIP
     # ------------------------------------------------------------------
-
-    def _banner_markup(self) -> str:
-        greens = [GREEN_GLOW, GREEN, GREEN, GREEN, GREEN_DIM, GREEN_DIM]
-        return "\n".join(
-            f"[bold {greens[i]}]{line}[/]"
-            for i, line in enumerate(BANNER_LINES)
-        )
 
     def _mode_chip(self) -> str:
         icon = MODE_ICONS.get(self.current_mode, "◆")
         model = self.cfg.get("model") or "no model selected"
         if len(model) > 28:
             model = model[:28] + "…"
-        model = str(model).replace("[", r"\[")
+        model = _esc(model)
 
         prefix = ""
         if self.busy:
@@ -681,7 +794,7 @@ class DepressionApp(App):
     # PANEL SWITCHING
     # ------------------------------------------------------------------
 
-    def _show_panel(self, which: str) -> None:
+    def _set_active_panel(self, which: str) -> None:
         self._active_panel = which
         for name in ("llm", "aws", "context", "todo", "help"):
             try:
@@ -700,51 +813,42 @@ class DepressionApp(App):
         if which == "aws":
             self._refresh_aws_status()
 
-    @on(Button.Pressed, ".side-tab")
-    def _on_tab(self, event: Button.Pressed) -> None:
-        self._show_panel(event.button.id.replace("tab-", ""))
-        self._refocus_prompt()
-
-    def _tick_banner(self) -> None:
-        if self._is_shutting_down:
-            return
-        self._banner_phase = (self._banner_phase + 1) % 3
-        greens = [
-            [GREEN_GLOW, GREEN, GREEN, GREEN, GREEN_DIM, GREEN_DIM],
-            [GREEN, GREEN_GLOW, GREEN, GREEN_DIM, GREEN, GREEN_DIM],
-            [GREEN, GREEN, GREEN_GLOW, GREEN_DIM, GREEN_DIM, GREEN],
-        ][self._banner_phase]
-        rows = "\n".join(
-            f"[bold {greens[i]}]{line}[/]"
-            for i, line in enumerate(BANNER_LINES)
-        )
+    def _show_panel(self, which: str) -> None:
+        self._set_active_panel(which)
         try:
-            self.query_one("#banner", Static).update(rows)
+            sidebar = self.query_one("#sidebar", Sidebar)
+            if not sidebar.is_open:
+                sidebar.toggle()
         except Exception:
             pass
 
+    @on(Button.Pressed, ".side-tab")
+    def _on_tab(self, event: Button.Pressed) -> None:
+        self._set_active_panel(event.button.id.replace("tab-", ""))
+        self._refocus_prompt()
+
     # ------------------------------------------------------------------
-    # TRANSCRIPT
+    # TRANSCRIPT WRITES
     # ------------------------------------------------------------------
 
     _CTRL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 
     def _sanitize(self, text: str) -> str:
         clean = self._CTRL_RE.sub("", str(text))
-        # Textual markup treats [ as the start of a tag. Escape only the
-        # opening bracket; a bare ] is a literal in Textual's parser.
-        # Do NOT use markup_escape — some Textual versions escape both
-        # brackets in a way the parser rejects on round-trip.
         return clean.replace("[", r"\[")
 
     def _write(self, text: str, cls: str = "agent") -> None:
         if self._is_shutting_down:
             return
+        self._show_transcript()
         try:
             transcript = self.query_one("#transcript", VerticalScroll)
         except Exception:
             return
-        transcript.mount(Static(self._sanitize(text), classes=cls, markup=True))
+        try:
+            transcript.mount(Static(self._sanitize(text), classes=cls, markup=True))
+        except Exception:
+            transcript.mount(Static(str(text), classes=cls, markup=False))
         self.call_after_refresh(
             lambda: transcript.scroll_end(animate=False)
         )
@@ -761,17 +865,21 @@ class DepressionApp(App):
     def _user(self, text: str) -> None:
         if self._is_shutting_down:
             return
+        self._show_transcript()
         try:
             transcript = self.query_one("#transcript", VerticalScroll)
         except Exception:
             return
-        safe = str(text).replace("[", r"\[")
-        transcript.mount(
-            Static(
-                f"[bold {GREEN}]›[/] [bold {TEXT}]{safe}[/]",
-                classes="user", markup=True,
+        safe = _esc(text)
+        try:
+            transcript.mount(
+                Static(
+                    f"[bold {GREEN}]›[/] [bold {TEXT}]{safe}[/]",
+                    classes="user", markup=True,
+                )
             )
-        )
+        except Exception:
+            transcript.mount(Static(f"› {text}", classes="user", markup=False))
         self.message_count = self.message_count + 1
         self.call_after_refresh(
             lambda: transcript.scroll_end(animate=False)
@@ -807,9 +915,14 @@ class DepressionApp(App):
             self._refresh_mode_chip()
             preview = text if len(text) <= 60 else text[:60] + "…"
             self._queued(
-                f"queued ({len(self._prompt_queue)} ahead): {preview}"
+                f"queued ({len(self._prompt_queue)} ahead): {_esc(preview)}"
             )
             return
+
+        self.live_input_tokens = 0
+        self.live_output_tokens = 0
+        self.live_total_tokens = 0
+        self._refresh_token_bar()
 
         self._agent_worker = self._run_agent(text)
 
@@ -841,6 +954,19 @@ class DepressionApp(App):
                 self.query_one("#transcript", VerticalScroll).remove_children()
             except Exception:
                 pass
+            self._has_messages = False
+            try:
+                self.query_one("#empty-banner", EmptyBanner).display = True
+            except Exception:
+                pass
+            try:
+                self.query_one("#transcript", VerticalScroll).display = False
+            except Exception:
+                pass
+            self.live_input_tokens = 0
+            self.live_output_tokens = 0
+            self.live_total_tokens = 0
+            self._refresh_token_bar()
         elif command == "/plan":
             self._switch_mode("plan")
         elif command == "/build":
@@ -892,6 +1018,8 @@ class DepressionApp(App):
                 timeout=self.turn_timeout,
             )
 
+            self._sync_tokens_from_loop()
+
             if result.get("success"):
                 output = (
                     result.get("execution")
@@ -917,23 +1045,23 @@ class DepressionApp(App):
                 self._refresh_context_panel()
                 self._refresh_mode_chip()
             else:
-                self._error(str(result.get("error", "agent request failed")))
+                self._error(_esc(str(result.get("error", "agent request failed"))))
         except asyncio.TimeoutError:
             mins = self.turn_timeout / 60.0
             self._error(
                 f"agent timed out after {mins:.0f} min with no result. "
-                "Press Esc if you want to keep waiting, or raise "
-                "TUI_TURN_TIMEOUT in the environment."
+                "Raise TUI_TURN_TIMEOUT in the environment to extend."
             )
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            self._error(f"agent error: {exc}")
+            self._error(f"agent error: {_esc(exc)}")
         finally:
             self.busy = False
             self._set_busy_visual(False)
             self._refresh_mode_chip()
             self._refocus_prompt()
+            self._refresh_token_bar()
             self._schedule_drain()
 
     def _schedule_drain(self) -> None:
@@ -990,12 +1118,12 @@ class DepressionApp(App):
                 get_llm_registry(), base_url, api_key, model
             )
             self.cfg = load_runtime_config()
-            status.update(f"connected · {model}")
+            status.update(f"connected · {_esc(model)}")
             self._refresh_mode_chip()
             self._refresh_context_panel()
-            self._system(f"LLM connected: {base_url} · {model}")
+            self._system(f"LLM connected: {_esc(base_url)} · {_esc(model)}")
         except Exception as exc:
-            status.update(f"error: {exc}")
+            status.update(f"error: {_esc(exc)}")
 
     @on(Button.Pressed, "#discover")
     def discover_llm(self) -> None:
@@ -1022,13 +1150,13 @@ class DepressionApp(App):
             if ids:
                 self.query_one("#model-id", Input).value = ids[0]
                 status.update(
-                    f"discovered {len(ids)} model(s); selected {ids[0]}"
+                    f"discovered {len(ids)} model(s); selected {_esc(ids[0])}"
                 )
-                self._system("models: " + ", ".join(ids[:12]))
+                self._system("models: " + _esc(", ".join(ids[:12])))
             else:
                 status.update("/models returned no model IDs")
         except Exception as exc:
-            status.update(f"discovery failed: {exc}; enter model manually")
+            status.update(f"discovery failed: {_esc(exc)}")
 
     # ------------------------------------------------------------------
     # AWS PANEL ACTIONS
@@ -1077,15 +1205,14 @@ class DepressionApp(App):
                     if install_aws_preset_into_config(mcp_cfg, region=region):
                         note = " · MCP config updated (restart to apply)"
             except Exception as exc:
-                note = f" · MCP config refresh skipped: {exc}"
+                note = f" · MCP config refresh skipped: {_esc(exc)}"
 
             panel.refresh_mcp_status()
             self._system(
-                f"AWS credentials saved to .env ({region}){note}; "
-                "secret is not displayed."
+                f"AWS credentials saved to .env ({region}){note}"
             )
         except Exception as exc:
-            panel.set_status(f"error: {exc}")
+            panel.set_status(f"error: {_esc(exc)}")
             panel.start_trace(ok=False)
 
     # ------------------------------------------------------------------
@@ -1127,11 +1254,30 @@ class DepressionApp(App):
         self._is_shutting_down = True
         self.exit()
 
+    def action_toggle_sidebar(self) -> None:
+        try:
+            self.query_one("#sidebar", Sidebar).toggle()
+        except Exception:
+            pass
+
     def action_clear(self) -> None:
         try:
             self.query_one("#transcript", VerticalScroll).remove_children()
         except Exception:
             pass
+        self._has_messages = False
+        try:
+            self.query_one("#empty-banner", EmptyBanner).display = True
+        except Exception:
+            pass
+        try:
+            self.query_one("#transcript", VerticalScroll).display = False
+        except Exception:
+            pass
+        self.live_input_tokens = 0
+        self.live_output_tokens = 0
+        self.live_total_tokens = 0
+        self._refresh_token_bar()
 
     def action_toggle_expand_tool(self) -> None:
         widget = self._active_tool_widget

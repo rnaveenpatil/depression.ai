@@ -25,10 +25,7 @@ from agent.context.runtime import add_tool_call, add_tool_result, get_model_mess
 logger = get_logger(__name__)
 
 
-# Minimum number of tasks for a plan to trigger plan-driven execution.
 PLAN_DRIVEN_MIN_TASKS = 3
-
-# Maximum attempts per task before we drop back to free-form mode.
 PLAN_TASK_MAX_ATTEMPTS = 3
 
 
@@ -130,6 +127,10 @@ class AgentLoop:
         self._project_ctx_ts = 0.0
         self._system_prompt_cache: Optional[str] = None
 
+        # Checklist tracking.
+        self._checklist_rendered = False           # inline block printed once
+        self._last_checklist_signature: Optional[tuple] = None
+
     @property
     def model_context(self):
         return self.agent.context_manager
@@ -150,6 +151,8 @@ class AgentLoop:
         self._project_ctx = None
         self._project_ctx_ts = 0.0
         self._system_prompt_cache = None
+        self._checklist_rendered = False
+        self._last_checklist_signature = None
 
         if max_turns is not None:
             self.max_iterations = max_turns
@@ -203,14 +206,9 @@ class AgentLoop:
                         role="system",
                         content=(
                             "Classify the user's request into exactly one "
-                            "category:\n"
-                            "  feature   — add new functionality\n"
-                            "  bugfix    — fix broken behavior\n"
-                            "  refactor  — restructure without behavior change\n"
-                            "  analysis  — investigate/explain existing code\n"
-                            "  question  — factual question, no action needed\n"
-                            "  ambiguous — request is unclear or underspecified\n"
-                            "Reply with only the category word, lowercase."
+                            "category: feature, bugfix, refactor, analysis, "
+                            "question, or ambiguous. Reply with only the "
+                            "category word, lowercase."
                         ),
                     ),
                     Message(role="user", content=query),
@@ -225,7 +223,6 @@ class AgentLoop:
                 "question", "ambiguous",
             ):
                 return word
-            logger.debug("Intent classifier returned unexpected %r", raw)
             return "unknown"
         except Exception as exc:
             logger.debug("Intent classification failed: %s", exc)
@@ -309,7 +306,6 @@ class AgentLoop:
 
         while not plan.is_complete():
             if self.should_stop:
-                logger.info("Plan-driven execution stopped by signal")
                 stalled = True
                 break
 
@@ -320,10 +316,6 @@ class AgentLoop:
                 ]
                 if not remaining:
                     break
-                logger.warning(
-                    "Plan-driven: deadlock with %d pending task(s)",
-                    len(remaining),
-                )
                 self.planner._resolve_deadlock(plan)
                 if not plan.get_pending_tasks():
                     for t in remaining:
@@ -336,7 +328,6 @@ class AgentLoop:
             self.context.iteration += 1
 
             if self.context.iteration > self.max_iterations:
-                logger.warning("Plan-driven: iteration cap reached")
                 stalled = True
                 break
 
@@ -344,23 +335,10 @@ class AgentLoop:
             task_attempts[task.id] = attempt
 
             if attempt > PLAN_TASK_MAX_ATTEMPTS:
-                logger.warning(
-                    "Plan-driven: task %s exceeded %d attempts; aborting plan",
-                    task.id,
-                    PLAN_TASK_MAX_ATTEMPTS,
-                )
                 task.status = TaskStatus.FAILED
                 task.error = "exceeded max attempts"
                 stalled = True
                 break
-
-            logger.info(
-                "Plan task %s (%d/%d): %s",
-                task.id,
-                attempt,
-                PLAN_TASK_MAX_ATTEMPTS,
-                task.description[:80],
-            )
 
             turn_result = await self._execute_task_turn(
                 task=task,
@@ -397,12 +375,6 @@ class AgentLoop:
         )
         total = len(plan._all_tasks())
         all_done = plan.is_complete()
-
-        logger.info(
-            "Plan-driven execution finished: %d/%d tasks completed",
-            completed,
-            total,
-        )
 
         if all_done or stalled:
             summary = await self._summarize_plan(plan, system_prompt)
@@ -468,11 +440,7 @@ class AgentLoop:
             if not tool_calls:
                 upper = content.upper()
                 if upper.startswith("TASK FAILED"):
-                    return {
-                        "success": False,
-                        "retry": True,
-                        "error": content,
-                    }
+                    return {"success": False, "retry": True, "error": content}
 
                 summary = content
                 if "TASK COMPLETE" in upper:
@@ -483,11 +451,6 @@ class AgentLoop:
                 if qa and self.enable_qa_verification:
                     verdict = await self._verify_task_qa(task, summary, qa)
                     if not verdict.get("passed", True):
-                        logger.warning(
-                            "QA failed for task %s: %s",
-                            task.id,
-                            verdict.get("reason", "no reason"),
-                        )
                         return {
                             "success": False,
                             "retry": True,
@@ -497,6 +460,7 @@ class AgentLoop:
                 task.status = TaskStatus.COMPLETED
                 task.result = summary or task.description
                 task.actual_time = time.time() - task.created_at
+                self._update_todo_status(task, "done")
                 return {"success": True, "summary": task.result}
 
             serialized = [
@@ -551,13 +515,8 @@ class AgentLoop:
                     Message(
                         role="system",
                         content=(
-                            "You are a strict verifier. Given a task, its QA "
-                            "criterion, and the reported result, decide if the "
-                            "QA criterion was actually satisfied.\n"
-                            "Reply exactly:\n"
-                            "  PASS\n"
-                            "or\n"
-                            "  FAIL: <short reason>"
+                            "You are a strict verifier. Reply PASS or "
+                            "FAIL: <short reason>."
                         ),
                     ),
                     Message(
@@ -581,7 +540,6 @@ class AgentLoop:
             if upper.startswith("FAIL"):
                 reason = raw.split(":", 1)[1].strip() if ":" in raw else raw
                 return {"passed": False, "reason": reason}
-            logger.debug("QA verifier returned unexpected %r", raw)
             return {"passed": True, "reason": "unrecognized verdict"}
         except Exception as exc:
             logger.warning("QA verification failed for task %s: %s", task.id, exc)
@@ -602,10 +560,9 @@ class AgentLoop:
             snippet = snippet[0] if snippet else ""
             if len(snippet) > 120:
                 snippet = snippet[:117] + "…"
-            bullets.append(f"- ✓ {t.description}: {snippet}")
-
+            bullets.append(f"- {t.description}: {snippet}")
         for t in failed:
-            bullets.append(f"- ✗ {t.description}: {t.error or 'failed'}")
+            bullets.append(f"- {t.description}: {t.error or 'failed'}")
 
         body = "\n".join(bullets) if bullets else "(no tasks executed)"
 
@@ -616,16 +573,16 @@ class AgentLoop:
                     Message(
                         role="user",
                         content=(
-                            "Summarize the following plan execution for the user. "
-                            "State what was completed, what failed, and any "
-                            "follow-ups. Do not add unverified claims.\n\n"
+                            "Write a short closing summary: 2–4 sentences "
+                            "describing what you did, why, and anything the "
+                            "user should know. Do not repeat the step list.\n\n"
                             f"Plan: {plan.goal}\n\n"
                             f"Task outcomes:\n{body}"
                         ),
                     ),
                 ],
                 temperature=0.3,
-                max_tokens=1200,
+                max_tokens=800,
             )
             summary = (getattr(response, "content", "") or "").strip()
             self._record_usage(getattr(response, "usage", None))
@@ -674,164 +631,90 @@ class AgentLoop:
     async def _get_system_prompt(self) -> str:
         if self._system_prompt_cache is not None:
             return self._system_prompt_cache
+
         project = await self._get_project_context()
         perms = self._get_permissions_context()
-        tool_guide = self._build_tool_guide()
-        environment = self._build_environment_block()
-        aws_guidance = self._build_aws_guidance()
+
+        env_block = self._build_environment_block()
+        aws_block = self._build_aws_guidance()
 
         self._system_prompt_cache = (
-            "You are an advanced AI CLI agent. Your mission is to complete the "
-            "user's request accurately and verifiably.\n\n"
-            "## Core Responsibilities\n"
-            "1. **Understand before acting**: Read relevant files and search the "
-            "codebase before making changes.\n"
-            "2. **Verify every claim**: Never state something is done, fixed, or "
-            "working unless a tool result proves it.\n"
-            "3. **Report honestly**: If something failed, say it failed. If "
-            "something is uncertain, say it's uncertain.\n"
-            "4. **Use the right tool**: Prefer a purpose-built tool over "
-            "`bash` whenever one exists. The Tool Selection Guide below "
-            "tells you which to pick.\n\n"
-            "## Workflow\n"
-            "### Phase 1: Explore\n"
-            "1. Identify which files are relevant to the request.\n"
-            "2. Read them using the `read` or `filesystem` tool.\n"
-            "3. Search for related code with `grep` or `search`.\n"
-            "4. Do NOT modify anything yet.\n\n"
-            "### Phase 2: Act\n"
-            "1. Make the smallest change that solves the problem.\n"
-            "2. Use `edit` or `write` for file changes, not `bash`.\n"
-            "3. Run the relevant verification (tests, linter, build).\n\n"
-            "### Phase 3: Verify\n"
-            "1. Re-read the modified files to confirm the change landed.\n"
-            "2. Run the command that proves the fix works.\n"
-            "3. Report the actual command output, not a summary of it.\n\n"
-            + tool_guide
-            + "\n\n"
-            + environment
-            + aws_guidance
-            + "\n\n## Output Format\n"
-            "When you finish, structure your response as:\n"
-            "### What I did\n"
-            "- Bullet list of changes with file paths\n"
-            "### Evidence\n"
-            "- Exact command run and its result\n"
-            "### Status\n"
-            "SUCCESS | PARTIAL | FAILED — one line, with reason if not SUCCESS\n\n"
-            "## Anti-Patterns to Avoid\n"
-            "- **Claiming success without evidence**: If you didn't run a command "
-            "that proves it, you can't claim it.\n"
-            "- **Editing files you haven't read**: Always read first.\n"
-            "- **Running destructive commands without checking**: `rm`, `git reset`, "
-            "`git checkout .` — confirm before executing.\n"
-            "- **Running long-lived servers in `bash`/`terminal`**: This blocks the "
-            "UI. Use the `process` tool instead.\n"
-            "- **Inventing tool names**: If a tool doesn't exist, the registry will "
-            "say so. Use only tools from the list below.\n"
-            "- **Printing credentials**: Never `echo`, `cat`, or print API keys, "
-            "AWS credentials, or tokens. The runtime injects them where needed.\n\n"
-            "## Available Tools\n"
+            "You are an advanced AI CLI agent. Complete the user's request "
+            "accurately and verifiably.\n\n"
+
+            "## How you work\n"
+            "1. **Explore first** — read the relevant files before you change "
+            "anything. Use `read`, `grep`, `glob` instead of shelling out.\n"
+            "2. **Act minimally** — the smallest change that solves the "
+            "problem. Use `edit`/`write`, not `bash sed`/`echo >`.\n"
+            "3. **Verify** — run the command that proves it works and report "
+            "its actual output. Never claim success without evidence.\n"
+            "4. **Prefer purpose-built tools** over `bash`. Use `bash` only "
+            "for one-shot commands that exit on their own.\n"
+            "5. **Never run servers in `bash`** (dev servers, `flutter run`, "
+            "`npm run dev`, `vite`, `uvicorn`, `nodemon`) — use the "
+            "`process` tool with action='start'.\n"
+            "6. **Never print credentials** — API keys, AWS keys, tokens. "
+            "The runtime injects them where needed.\n\n"
+
+            "## Planning — VERY IMPORTANT\n"
+            "For any request that needs 2 or more steps, your FIRST response "
+
+            "MUST start with a checklist so the user knows what you are about "
+            "and tell the user whats problem you identifed in evry step and what action you re taking next"
+            "to do. This is not optional. Use this exact format — a markdown "
+            "checkbox list, one line per step, nothing else on those lines:\n\n"
+            "    - [ ] first step\n"
+            "    - [ ] second step\n"
+            "    - [ ] third step\n\n"
+            "Rules for the checklist:\n"
+            "- 3 to 8 steps. Short descriptions, one line each.\n"
+            "- Write it ONCE at the top of your FIRST response.\n"
+            "- Do NOT write a numbered list like `1. step` — the user's UI "
+            "only recognizes the `- [ ]` format.\n"
+            "- Do NOT wrap the checklist in a heading like `**Steps:**`.\n"
+            "- Do NOT repeat the checklist on later turns, after tool calls, "
+            "or before permission prompts.\n"
+            "- Do NOT ask permission for each step — just do the work.\n\n"
+
+            "## After you finish\n"
+            "Write a short closing summary: 2–4 sentences describing what "
+            "you actually did, why you chose that approach, and anything "
+            "the user should know. Do not repeat the checklist.\n\n"
+            + env_block
+            + aws_block
+            + "\n\n## Available Tools\n"
             + self._get_tools_description()
-            + "\n\n## Project Context\n"
+            + "\n\n## Project\n"
             + json.dumps(project, indent=2, default=str)
             + "\n\n## Permissions\n"
             + json.dumps(perms, indent=2, default=str)
         ).strip()
         return self._system_prompt_cache
 
-    def _build_tool_guide(self) -> str:
-        return (
-            "## Tool Selection Guide\n"
-            "Use the RIGHT tool. Do not default to `bash` for everything.\n\n"
-            "**Reading and searching**\n"
-            "- Read a specific file: `read` (NOT `bash cat`)\n"
-            "- Find files by name/glob: `glob` (NOT `bash find` or `bash ls`)\n"
-            "- Search file contents: `grep` (NOT `bash grep` or `bash rg`)\n"
-            "- List a directory: `filesystem` with action='list'\n\n"
-            "**Editing**\n"
-            "- Replace an exact string in a file: `edit` (NOT `bash sed`)\n"
-            "- Create or overwrite a file: `write` (NOT `bash echo >`)\n"
-            "- Apply a unified diff or multi-file patch: `apply_patch`\n"
-            "- Preview a patch without applying: `apply_patch` with action='preview'\n\n"
-            "**Running commands**\n"
-            "- One-shot commands that exit (tests, build, lint, git, curl): `bash`\n"
-            "- Long-running servers (dev servers, watchers, `flutter run`, "
-            "`npm run dev`, `vite`, `uvicorn`, `gunicorn`, `nodemon`): "
-            "**use the `process` tool, NOT `bash`**. `bash` will block until "
-            "the process exits, which for a server is never.\n\n"
-            "**Process tool cheat-sheet**\n"
-            "- Start a server: `process` with action='start' and command='<cmd>'\n"
-            "- Check it's running: `process` with action='list'\n"
-            "- Read its output: `process` with action='logs' and process_id='<id>'\n"
-            "- Stop it: `process` with action='stop' and process_id='<id>'\n"
-            "- Wait for a short command to finish: `process` with action='wait'\n\n"
-            "**Web and browser**\n"
-            "- Fetch a URL (static HTML): `webfetch`\n"
-            "- Search the web: `websearch`\n"
-            "- Interact with a page (click, type, JS): `realtime_browser`\n\n"
-            "**Planning and tracking**\n"
-            "- Track multi-step work: `todowrite` (once at the start) and "
-            "`todoread` (to check status)\n"
-            "- Ask the user a question: `question` (do NOT guess)\n\n"
-            "**Rules of thumb**\n"
-            "- Prefer a specific tool over `bash` whenever one exists.\n"
-            "- If a command will not exit on its own, use `process start`.\n"
-            "- If you are about to run a shell command, pause and ask: is "
-            "there a purpose-built tool for this? Usually yes."
-        )
-
     def _build_environment_block(self) -> str:
-        """
-        Describe the runtime environment so the model knows what's
-        available: AWS credentials, package managers, the filesystem.
-        """
-        lines = ["## Environment\n"]
-        lines.append(
-            "You are running inside an agent runtime with a working "
-            "directory, filesystem access, and a set of tools. The user's "
-            "credentials for external services are stored securely and "
-            "injected into tool calls where needed — you do not need to "
-            "ask for them."
-        )
-
-        # Detect a few things about the environment so the model doesn't
-        # waste turns probing.
         import shutil as _shutil
-        import os as _os
         package_managers = []
         for pm in ("npm", "yarn", "pnpm", "bun", "pip", "uv", "cargo", "go"):
             if _shutil.which(pm):
                 package_managers.append(pm)
+
+        if not package_managers and not _shutil.which("git"):
+            return ""
+
+        lines = ["\n## Environment"]
         if package_managers:
             lines.append(
-                "\nPackage managers available on PATH: "
-                + ", ".join(package_managers)
-                + "."
-            )
-
-        if _shutil.which("aws"):
-            lines.append(
-                "\nThe AWS CLI (`aws`) is installed. You can run AWS "
-                "commands directly via `bash` when the `aws` tool or MCP "
-                "path is unavailable."
+                "Package managers on PATH: " + ", ".join(package_managers) + "."
             )
         if _shutil.which("git"):
-            lines.append("\nGit is available for version control operations.")
-
+            lines.append("Git is available.")
         return "\n".join(lines)
 
     def _build_aws_guidance(self) -> str:
-        """
-        Tell the model whether AWS is available and how to reach it.
-        Covers three paths: MCP server, unified `aws` helper, and raw CLI.
-        """
         try:
             mcp_client = getattr(self.agent, "mcp_client", None)
-            from agent.mcp.aws_config import build_aws_cli_fallback_status
-            fallback = build_aws_cli_fallback_status()
-
-            mcp_aws_tools = []
+            mcp_aws_tools: List[str] = []
             if mcp_client is not None:
                 try:
                     mcp_aws_tools = [
@@ -842,66 +725,29 @@ class AgentLoop:
                 except Exception:
                     mcp_aws_tools = []
 
-            header = "\n## AWS access\n"
-            lines: List[str] = []
+            from agent.mcp.aws_config import build_aws_cli_fallback_status
+            fallback = build_aws_cli_fallback_status()
 
+            if not mcp_aws_tools and not fallback.get("usable"):
+                return ""
+
+            lines = ["\n## AWS"]
             if mcp_aws_tools:
                 lines.append(
-                    "The AWS MCP server is CONNECTED. Prefer MCP tools for "
-                    "structured, audited calls: "
+                    "AWS MCP tools available: "
                     + ", ".join(sorted(mcp_aws_tools))
-                    + "."
-                )
-            elif fallback.get("usable"):
-                lines.append(
-                    "The AWS MCP server is not available, but the AWS CLI "
-                    "and credentials are. Use the `aws` tool, or run "
-                    "`aws <service> <operation>` through `bash`."
+                    + ". Use the `aws` tool for any AWS operation."
                 )
             else:
                 lines.append(
-                    "No AWS credentials or CLI are configured yet. If the "
-                    "user asks for AWS work, tell them to open the TUI "
-                    "`/aws` panel and save their credentials first."
+                    "AWS CLI + credentials available. Use the `aws` tool, "
+                    "or `aws <service> <operation>` via `bash`. Credentials "
+                    "are injected automatically — never print them."
                 )
-
-            lines.append(
-                "\n**Credentials**\n"
-                "- AWS access keys are stored securely by the runtime and "
-                "injected into `aws` tool calls and `bash` subprocesses "
-                "automatically. You do NOT need to ask the user for them.\n"
-                "- NEVER print, echo, or `cat` credentials. The runtime "
-                "redacts them from tool output before it reaches you, but "
-                "do not try.\n"
-                "- To check which AWS account you are acting as, call the "
-                "`aws` tool with action='identity'. That runs "
-                "`sts get-caller-identity` and returns the account ID, "
-                "user ARN, and region.\n"
-                "- To list available AWS services you can drive, call the "
-                "`aws` tool with action='list_services'.\n"
-            )
-
-            lines.append(
-                "\n**How to run AWS operations**\n"
-                "1. Preferred: `aws` tool with action='call', service='s3', "
-                "operation='list-buckets' (structured result, redacted "
-                "credentials).\n"
-                "2. Fallback: `bash` with `aws s3 ls` (used when the aws "
-                "tool reports MCP or helper unavailable).\n"
-                "3. For long-running AWS operations (e.g. `aws s3 sync` on "
-                "a large bucket), use `process` with action='start' and "
-                "poll with `logs`.\n"
-            )
-
-            return header + "\n".join(lines)
+            return "\n".join(lines)
         except Exception as exc:
             logger.debug("AWS guidance build failed: %s", exc)
-            return (
-                "\n## AWS access\n"
-                "AWS credentials are stored securely by the runtime. Use "
-                "the `aws` tool for any AWS operation; it handles "
-                "credentials, MCP routing, and CLI fallback.\n"
-            )
+            return ""
 
     def _get_tools_description(self) -> str:
         lines = []
@@ -993,9 +839,65 @@ class AgentLoop:
                 "Execution plan guidance:\n"
                 + json.dumps(self.current_plan.to_dict(), indent=2, default=str)
             )
+
+            self._mirror_plan_to_todos(self.current_plan)
+            self._checklist_rendered = True
+
+            await self._trigger_event(
+                "on_plan_created",
+                {
+                    "plan_id": self.current_plan.id,
+                    "goal": self.current_plan.goal,
+                    "tasks": [
+                        {"id": t.id, "description": t.description}
+                        for t in self.current_plan.tasks
+                    ],
+                    "count": len(self.current_plan.tasks),
+                },
+            )
         except Exception as exc:
             logger.warning("Planning failed: %s", exc)
             self.current_plan = None
+
+    def _mirror_plan_to_todos(self, plan: Plan) -> None:
+        try:
+            from agent.tools.todo import TodoTool, TodoItem
+            import uuid as _uuid
+        except Exception:
+            return
+
+        session = getattr(self.agent, "session", None)
+        sid = TodoTool._session_key(session)
+        store = TodoTool._strong_keys.setdefault(sid, {})
+        store.clear()
+
+        for idx, task in enumerate(plan.tasks):
+            status = "in_progress" if idx == 0 else "pending"
+            tid = task.id or str(_uuid.uuid4())[:8]
+            item = TodoItem(
+                id=tid,
+                title=task.description,
+                status=status,
+                priority=getattr(task.priority, "value", 3),
+            )
+            store[tid] = item
+            task.metadata["todo_id"] = tid
+
+    def _update_todo_status(self, task: Any, status: str) -> None:
+        try:
+            from agent.tools.todo import TodoTool
+        except Exception:
+            return
+        todo_id = (task.metadata or {}).get("todo_id")
+        if not todo_id:
+            return
+        session = getattr(self.agent, "session", None)
+        sid = TodoTool._session_key(session)
+        store = TodoTool._strong_keys.get(sid) or {}
+        item = store.get(todo_id)
+        if item is None:
+            return
+        item.status = status
 
     def _get_plan_constraints(self, intent: str = "unknown") -> Dict[str, Any]:
         return {
@@ -1057,6 +959,34 @@ class AgentLoop:
             content = getattr(response, "content", None) or ""
 
         self._record_usage(getattr(response, "usage", None))
+
+        # Parse a checklist from the model's text. Emit:
+        #   - render=True the FIRST time we see a valid checklist (inline block)
+        #   - render=False on any later emission with a different signature
+        #     (sidebar updates in place, no duplicate inline block)
+        if content and not calls:
+            try:
+                from agent.tui.plan_parser import parse_plan_from_text
+                parsed = parse_plan_from_text(content)
+                if parsed and parsed.is_valid:
+                    signature = tuple(
+                        (e.content[:80], e.status) for e in parsed.entries
+                    )
+                    if signature != self._last_checklist_signature:
+                        self._last_checklist_signature = signature
+                        should_render = not self._checklist_rendered
+                        self._checklist_rendered = True
+                        await self._trigger_event(
+                            "on_plan_updated",
+                            {
+                                "entries": parsed.to_list(),
+                                "count": parsed.count,
+                                "raw": content,
+                                "render": should_render,
+                            },
+                        )
+            except Exception as exc:
+                logger.debug("Plan parse failed: %s", exc)
 
         if calls:
             await add_tool_call(self.model_context, content, calls)
@@ -1379,11 +1309,10 @@ class AgentLoop:
             Message(
                 role="user",
                 content=(
-                    "Provide the final response to the user's original request. "
-                    "Use the Output Format from the system prompt "
-                    "(### What I did / ### Evidence / ### Status). "
-                    "State what was actually completed and mention any remaining issue; "
-                    "do not claim unverified success."
+                    "Provide the final response to the user. Include a "
+                    "short closing summary (2–4 sentences) of what you "
+                    "actually did, why, and anything they should know. "
+                    "Do not claim unverified success."
                 ),
             )
         )
@@ -1433,6 +1362,8 @@ class AgentLoop:
         self.is_paused = False
         self.state = LoopState.IDLE
         self._system_prompt_cache = None
+        self._checklist_rendered = False
+        self._last_checklist_signature = None
 
     def pause(self) -> None:
         self.is_paused = True

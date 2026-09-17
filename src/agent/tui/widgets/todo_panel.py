@@ -1,82 +1,121 @@
 """
-Todo panel - live task checklist from the session's TodoTool store.
+Todo panel — status-driven list with distinct colours per state.
 
-States:
-    pending      ○   (muted)
-    in_progress  ▶   (amber)
-    done         ✓   (green)
-    blocked      ✗   (error)
-    cancelled    –   (dim)
+Rendering:
+    ▶  in-progress     amber   (#ffcc44)
+    ○  pending         muted   (#3d8c5c)
+    ●  done            green   (#00ff66), struck through
+    ◼  blocked         red     (#ff4466)
+    ✕  cancelled       dim     (#1a5c33)
+
+Header shows `X/Y done`. Polls the shared TodoTool store every 0.5s.
+
+The colour of the DONE glyph is bright green (not dim) so it stands out
+against pending items. The task title for done items is dimmed so the
+list reads as "these are behind us".
 """
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Dict, List
 
+from textual.app import ComposeResult
+from textual.containers import Vertical
 from textual.widgets import Static
 
-from agent.tools.todo import TodoTool
 
 GREEN = "#00ff66"
 GREEN_DIM = "#00aa44"
+GREEN_GLOW = "#88ffbb"
 AMBER = "#ffcc44"
 ERROR = "#ff4466"
 TEXT = "#aaffcc"
 MUTED = "#3d8c5c"
 DIM = "#1a5c33"
 
-_STATUS_GLYPH = {
-    "pending": "○",
-    "in_progress": "▶",
-    "done": "✓",
-    "blocked": "✗",
-    "cancelled": "–",
-}
 
-_STATUS_COLOR = {
-    "pending": MUTED,
-    "in_progress": AMBER,
-    "done": GREEN_DIM,
-    "blocked": ERROR,
-    "cancelled": DIM,
+_GLYPH = {
+    "pending":     ("○", MUTED),
+    "in_progress": ("▶", AMBER),
+    "done":        ("●", GREEN),
+    "completed":   ("●", GREEN),
+    "blocked":     ("◼", ERROR),
+    "cancelled":   ("✕", DIM),
 }
 
 
-class TodoPanel(Static):
-    """Renders the current session's todo items, refreshed live."""
-
+class TodoPanel(Vertical):
     DEFAULT_CSS = f"""
     TodoPanel {{
-        width: 100%;
         height: auto;
+        width: 100%;
         padding: 0 1;
-        color: {TEXT};
+    }}
+    TodoPanel > Static {{
+        height: auto;
+        width: 100%;
     }}
     """
 
     def __init__(self, session: Any = None, **kwargs: Any):
-        super().__init__("", **kwargs)
+        super().__init__(**kwargs)
         self._session = session
-        self._tool = TodoTool(session)
+        self._store: Dict[str, Any] = {}
+        self._header: Static | None = None
+        self._body: Static | None = None
+        self._last_render = ""
+
+    def compose(self) -> ComposeResult:
+        self._header = Static(
+            f"[bold {GREEN}]▌ TODO[/]", markup=True
+        )
+        self._body = Static("", markup=True)
+        yield self._header
+        yield self._body
 
     def on_mount(self) -> None:
-        self.set_interval(2.0, self.refresh_todos)
-        self.refresh_todos()
+        self._resolve_store()
+        self.set_interval(0.5, self._refresh)
 
-    def refresh_todos(self) -> None:
-        self.update(self._render())
+    def _resolve_store(self) -> None:
+        try:
+            from agent.tools.todo import TodoTool
+            sid = TodoTool._session_key(self._session)
+            self._store = TodoTool._strong_keys.get(sid, {})
+        except Exception:
+            self._store = {}
 
-    def _render(self) -> str:
-        items = self._tool._list().get("items", [])
+    def _refresh(self) -> None:
+        if self._body is None:
+            return
+        self._resolve_store()
+
+        items: List[Any] = sorted(
+            self._store.values(),
+            key=lambda i: (i.status != "in_progress", i.priority, i.created_at),
+        )
+
         if not items:
-            return (
-                f"[{MUTED}]no tasks yet — the agent adds todos as it plans.[/]"
-            )
-        lines = []
-        for it in items:
-            status = str(it.get("status", "pending") or "pending")
-            glyph = _STATUS_GLYPH.get(status, "○")
-            color = _STATUS_COLOR.get(status, MUTED)
-            title = str(it.get("title", "")).replace("[", r"\[")
-            lines.append(f"  [{color}]{glyph}[/] [{GREEN}]{title}[/]")
-        return "\n".join(lines)
+            markup = f"[{DIM}]no tasks yet[/]"
+        else:
+            done = sum(1 for i in items if i.status in ("done", "completed"))
+            total = len(items)
+            lines = [f"[{MUTED}]{done}/{total} done[/]", ""]
+            for it in items:
+                glyph, color = _GLYPH.get(it.status, ("○", MUTED))
+                title = str(it.title).replace("[", r"\[")
+                if len(title) > 32:
+                    title = title[:29] + "…"
+                if it.status in ("done", "completed"):
+                    lines.append(
+                        f"[{color}]{glyph}[/] [{DIM}][strike]{title}[/strike][/]"
+                    )
+                elif it.status == "in_progress":
+                    lines.append(f"[{color}]{glyph}[/] [{GREEN_GLOW}]{title}[/]")
+                else:
+                    lines.append(f"[{color}]{glyph}[/] [{TEXT}]{title}[/]")
+            markup = "\n".join(lines)
+
+        if markup != self._last_render:
+            self._last_render = markup
+            self._body.update(markup)

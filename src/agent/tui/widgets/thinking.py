@@ -1,26 +1,41 @@
 """
-Thinking indicator - animated status while the agent is reasoning.
+Thinking indicator — a shrinking dot trail that pulses while the agent
+is reasoning. Deliberately not a spinner; the visual rhythm is
+dim → bright → dim across five characters, so the eye lands on the
+centre dot. One shared clock drives every instance.
 """
 
 from __future__ import annotations
 
-from textual.app import ComposeResult
 from textual.widgets import Static
 
 AMBER = "#ffcc44"
 GREEN = "#00ff66"
 MUTED = "#3d8c5c"
+DIM = "#1a5c33"
 
-_SPINNER = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+# Frame sequence for the trail. Each string is 9 chars wide.
+_TRAIL = [
+    "·   ·   ·",
+    "·   •   ·",
+    "·  • •  ·",
+    "•  ●  •",
+    "●  •  ●",
+    "• ● ● •",
+    "· • • ·",
+    "·  •  ·",
+    "·   ·   ·",
+]
 
-_PHASES = [
+_PHASES = (
     "thinking",
     "reasoning",
     "planning",
     "considering",
-    "analyzing",
+    "analysing",
     "reflecting",
-]
+    "weighing",
+)
 
 
 class ThinkingIndicator(Static):
@@ -28,7 +43,8 @@ class ThinkingIndicator(Static):
     ThinkingIndicator {{
         height: 1;
         width: 100%;
-        padding: 0 1;
+        padding: 0 2;
+        background: transparent;
         color: {AMBER};
     }}
     """
@@ -40,7 +56,7 @@ class ThinkingIndicator(Static):
 
     def on_mount(self) -> None:
         self.display = False
-        self.set_interval(0.10, self._tick)
+        self.set_interval(0.14, self._tick)
 
     def start(self) -> None:
         self._active = True
@@ -56,7 +72,8 @@ class ThinkingIndicator(Static):
         if not self._active:
             return
         self._i += 1
-        spin = _SPINNER[self._i % len(_SPINNER)]
-        phase = _PHASES[(self._i // 20) % len(_PHASES)]
-        dots = "." * ((self._i // 5) % 4)
-        self.update(f"[{AMBER}]{spin}[/] [{MUTED}]{phase}{dots}[/]")
+        trail = _TRAIL[self._i % len(_TRAIL)]
+        phase = _PHASES[(self._i // 12) % len(_PHASES)]
+        # Slow trailing ellipsis so it reads as "still going", not "stuck".
+        dots = "." * ((self._i // 6) % 4)
+        self.update(f"[{MUTED}]{trail}[/]  [{AMBER}]{phase}{dots}[/]")

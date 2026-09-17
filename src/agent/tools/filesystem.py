@@ -1,5 +1,8 @@
 """
 Filesystem Tool - Read / write / edit / list / delete files inside the workspace.
+
+Write and edit operations capture the pre-image and post-image (capped at
+50 KB) so the TUI can render an inline diff without a separate round-trip.
 """
 
 from __future__ import annotations
@@ -14,6 +17,9 @@ from agent.tools.registry import BaseTool
 from agent.utils.logging import get_logger
 
 logger = get_logger(__name__)
+
+
+DIFF_SIZE_CAP = 50 * 1024  # bytes per side
 
 
 class FileSystemTool(BaseTool):
@@ -41,10 +47,14 @@ class FileSystemTool(BaseTool):
             "recursive": {"type": "boolean", "default": False},
             "max_bytes": {"type": "integer", "default": 1048576},
             "max_files": {"type": "integer", "default": 500},
-            # Optional: include before/after content in the response so the
-            # TUI can render a red/green diff. Off by default to keep the
-            # LLM prompt small; on when requested by an explicit flag.
-            "include_diff": {"type": "boolean", "default": False},
+            "include_diff": {
+                "type": "boolean",
+                "default": True,
+                "description": (
+                    "Capture before/after content for diff rendering. "
+                    "Defaults to true; capped at 50 KB per side."
+                ),
+            },
         },
         "required": ["action", "path"],
     }
@@ -56,7 +66,6 @@ class FileSystemTool(BaseTool):
     # ------------------------------------------------------------------
 
     def _resolve(self, path: str) -> Path:
-        # Temp paths are allowed outside the workspace.
         expanded = os.path.expanduser(path)
         if expanded.startswith(("/tmp/", "/tmp\\", "/var/tmp/")):
             return Path(expanded).resolve()
@@ -113,7 +122,7 @@ class FileSystemTool(BaseTool):
 
         max_bytes = int(params.get("max_bytes", 1_048_576))
 
-        def _read_bytes() -> tuple[bytes, bool, int]:
+        def _read_bytes():
             with open(target, "rb") as f:
                 raw = f.read(max_bytes + 1)
             truncated = len(raw) > max_bytes
@@ -136,9 +145,8 @@ class FileSystemTool(BaseTool):
 
     async def _write(self, target: Path, params: Dict[str, Any], mode: str) -> Dict[str, Any]:
         content = params.get("content", "")
-        include_diff = bool(params.get("include_diff", False))
+        include_diff = bool(params.get("include_diff", True))
 
-        # Capture pre-image for append/write when a diff was requested.
         before = ""
         existed = target.exists()
         if include_diff and existed and target.is_file():
@@ -167,9 +175,13 @@ class FileSystemTool(BaseTool):
                 after = target.read_text(encoding="utf-8", errors="replace")
             except Exception:
                 after = ""
-            result["before"] = before
-            result["after"] = after
-            result["created"] = not existed
+            # Apply size cap — if either side is too large, omit both.
+            if len(before) <= DIFF_SIZE_CAP and len(after) <= DIFF_SIZE_CAP:
+                result["before"] = before
+                result["after"] = after
+                result["created"] = not existed
+            else:
+                result["diff_omitted"] = True
         return result
 
     async def _edit(self, target: Path, params: Dict[str, Any]) -> Dict[str, Any]:
@@ -193,9 +205,13 @@ class FileSystemTool(BaseTool):
             "path": str(target),
             "replacements": count if replace_all else 1,
         }
-        if bool(params.get("include_diff", False)):
-            result["before"] = text
-            result["after"] = updated
+        include_diff = bool(params.get("include_diff", True))
+        if include_diff:
+            if len(text) <= DIFF_SIZE_CAP and len(updated) <= DIFF_SIZE_CAP:
+                result["before"] = text
+                result["after"] = updated
+            else:
+                result["diff_omitted"] = True
         return result
 
     async def _list(self, target: Path, params: Dict[str, Any]) -> Dict[str, Any]:
