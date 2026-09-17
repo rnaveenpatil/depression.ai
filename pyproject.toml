@@ -3,8 +3,8 @@ requires = ["setuptools>=61.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "depression"
-version = "1.0.1"
+name = "depression.ai"
+version = "1.0.0"
 description = "AI agent for everything — development, deployment, and analysis"
 readme = "README.md"
 license = "ISC"
