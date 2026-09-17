@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "depression"
-version = "1.0.0"
+version = "1.0.1"
 description = "AI agent for everything — development, deployment, and analysis"
 readme = "README.md"
 license = "ISC"
@@ -31,7 +31,7 @@ browser = [
     "playwright>=1.40.0",
 ]
 tui = [
-    "textual-dev>=1.1.1",
+    "textual-dev>=1.0.0",
 ]
 dev = [
     "pytest>=7.0",
@@ -41,8 +41,8 @@ dev = [
 ]
 
 [project.scripts]
-depression = "agent.tui.run:main"
-depression_ai = "agent.tui.run:main"
+depression = "agent.main:main"
+depression_ai = "agent.main:main"
 depression-tui = "agent.tui.run:main"
 
 [project.urls]
