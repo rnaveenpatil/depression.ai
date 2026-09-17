@@ -11,3 +11,14 @@ htmlcov/
 *.db
 *.sqlite
 *.sqlite3
+
+# Build artifacts
+dist/
+build/
+*.egg-info/
+
+# Virtual environments
+src/agent/depression/
+deprssion/
+.venv/
+venv/
