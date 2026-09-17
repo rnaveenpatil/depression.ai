@@ -45,12 +45,14 @@ async def test_project_context_is_cached():
 
     class Agent:
         workspace = WS()
+        context_manager = SimpleNamespace(messages=[])
 
     class LLM:
         def get_current_model(self):
             return "test/model"
 
-    loop = AgentLoop(Agent(), LLM(), SimpleNamespace(tools={}), None, {})
+    registry = SimpleNamespace(tools={})
+    loop = AgentLoop(Agent(), LLM(), registry, None, {})
     first = await loop._get_project_context()
     second = await loop._get_project_context()
     assert first == second
@@ -84,7 +86,7 @@ class ReadLLM:
 
 
 class ExecAgent:
-    context_manager = SimpleNamespace()
+    context_manager = SimpleNamespace(messages=[])
     workspace = None
     permission_manager = None
 
@@ -97,7 +99,7 @@ async def test_single_read_tool_uses_fast_path():
     llm = ReadLLM()
     loop = AgentLoop(ExecAgent(), llm, SimpleNamespace(tools={}), None, {})
     result = await loop.run("read a.txt")
-    assert result["success"] is True
+    assert result["success"] is True, result
     assert result["response"] == "hello world file content"
     assert result["tool_calls"] == 1
     assert llm.calls == 1
@@ -108,6 +110,6 @@ async def test_read_with_intermediate_content_continues():
     llm = ReadLLM(with_content=True)
     loop = AgentLoop(ExecAgent(), llm, SimpleNamespace(tools={}), None, {})
     result = await loop.run("read a.txt")
-    assert result["success"] is True
+    assert result["success"] is True, result
     assert result["response"] == "final summary"
     assert llm.calls == 2
