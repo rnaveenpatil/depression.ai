@@ -3,6 +3,8 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
+
 from agent.agent.dual_agent import AgentRole, BaseAgent
 from agent.agent.loop import AgentLoop
 from agent.llm.provider import ToolCall, get_llm_registry, reset_llm_registry
@@ -36,8 +38,17 @@ def test_role_model_resolution_keeps_user_selected_model():
     reset_llm_registry()
 
 
+class FakeContextManager:
+    def __init__(self):
+        self.messages = []
+
+    async def add_message(self, role, content, metadata=None, **kwargs):
+        self.messages.append(SimpleNamespace(role=role, content=content, metadata=metadata or {}))
+
+
 class FakeAgent:
-    context_manager = SimpleNamespace()
+    def __init__(self):
+        self.context_manager = FakeContextManager()
 
     async def execute_tool(self, name, params):
         return {"success": True, "tool": name, "output": "ok"}
@@ -48,8 +59,10 @@ class FakeLLM:
         return "test/model"
 
 
+@pytest.mark.asyncio
 async def test_loop_emits_tool_event():
-    loop = AgentLoop(FakeAgent(), FakeLLM(), None, None, {})
+    agent = FakeAgent()
+    loop = AgentLoop(agent, FakeLLM(), None, None, {})
     seen = []
 
     async def handler(data):
