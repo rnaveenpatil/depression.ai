@@ -266,7 +266,8 @@ class EmptyBanner(Static):
                 yield self._sub_widget
                 self._note_widget = Static(
                     f"[{MUTED}]AI agent capable of doing everything — "
-                    f"development, analysis, system handling and deployment[/]",
+                    f"development, analysis, system handling AWS deployment,[/]",
+                    
                     classes="banner-note",
                     markup=True,
                 )
