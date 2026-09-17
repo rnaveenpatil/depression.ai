@@ -11,22 +11,27 @@ class FakeRegistry:
         self._current_provider = None
         self._current_model = None
 
+    def install_provider(self, name, provider, api_key, model, metadata=None):
+        self.providers[name] = provider
+        self._api_keys[name] = api_key
+        self._current_provider = name
+        self._current_model = model
+
 
 def test_runtime_provider_accepts_arbitrary_model_and_endpoint(tmp_path, monkeypatch):
-    env = tmp_path / ".env"
     monkeypatch.chdir(tmp_path)
     registry = FakeRegistry()
 
     provider = configure_runtime_provider(
-        registry, "https://llm.example/v1", "secret-test-key", "vendor/custom-agent"
+        registry, "https://llm.example/v1", "dummy-key", "vendor/custom-agent"
     )
 
     assert provider.base_url == "https://llm.example/v1"
-    assert provider.api_key == "secret-test-key"
+    assert provider.api_key == "dummy-key"
     assert registry._current_provider == "custom"
     assert registry._current_model == "vendor/custom-agent"
     assert load_runtime_config()["model"] == "vendor/custom-agent"
-    assert load_env_file(env)["DEPRESSION_API_KEY"] == "secret-test-key"
+    assert load_env_file(Path(tmp_path) / ".env")["DEPRESSION_API_KEY"] == "dummy-key"
 
 
 def test_aws_credentials_round_trip(tmp_path, monkeypatch):
