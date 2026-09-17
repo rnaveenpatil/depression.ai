@@ -91,6 +91,9 @@ class ReadContextManager:
     async def add_message(self, role, content, metadata=None, **kwargs):
         self.messages.append(SimpleNamespace(role=role, content=content, metadata=metadata or {}))
 
+    async def add_system_message(self, content, pinned=True, **kwargs):
+        await self.add_message("system", content, {"pinned": pinned})
+
 
 class ExecAgent:
     def __init__(self):
