@@ -51,8 +51,7 @@ async def test_project_context_is_cached():
         def get_current_model(self):
             return "test/model"
 
-    registry = SimpleNamespace(tools={})
-    loop = AgentLoop(Agent(), LLM(), registry, None, {})
+    loop = AgentLoop(Agent(), LLM(), SimpleNamespace(tools={}), None, {})
     first = await loop._get_project_context()
     second = await loop._get_project_context()
     assert first == second
@@ -97,7 +96,10 @@ class ExecAgent:
 @pytest.mark.asyncio
 async def test_single_read_tool_uses_fast_path():
     llm = ReadLLM()
-    loop = AgentLoop(ExecAgent(), llm, SimpleNamespace(tools={}), None, {})
+    loop = AgentLoop(
+        ExecAgent(), llm, SimpleNamespace(tools={}), None,
+        {"enable_intent_classification": False, "enable_planning": False},
+    )
     result = await loop.run("read a.txt")
     assert result["success"] is True, result
     assert result["response"] == "hello world file content"
@@ -108,7 +110,10 @@ async def test_single_read_tool_uses_fast_path():
 @pytest.mark.asyncio
 async def test_read_with_intermediate_content_continues():
     llm = ReadLLM(with_content=True)
-    loop = AgentLoop(ExecAgent(), llm, SimpleNamespace(tools={}), None, {})
+    loop = AgentLoop(
+        ExecAgent(), llm, SimpleNamespace(tools={}), None,
+        {"enable_intent_classification": False, "enable_planning": False},
+    )
     result = await loop.run("read a.txt")
     assert result["success"] is True, result
     assert result["response"] == "final summary"
