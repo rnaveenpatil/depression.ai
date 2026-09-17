@@ -84,10 +84,19 @@ class ReadLLM:
         return LLMResponse(content="final summary", model="test/model", provider="test")
 
 
+class ReadContextManager:
+    def __init__(self):
+        self.messages = []
+
+    async def add_message(self, role, content, metadata=None, **kwargs):
+        self.messages.append(SimpleNamespace(role=role, content=content, metadata=metadata or {}))
+
+
 class ExecAgent:
-    context_manager = SimpleNamespace(messages=[])
-    workspace = None
-    permission_manager = None
+    def __init__(self):
+        self.context_manager = ReadContextManager()
+        self.workspace = None
+        self.permission_manager = None
 
     async def execute_tool(self, tool_name, params):
         return {"success": True, "content": "hello world file content", "tool": tool_name}
