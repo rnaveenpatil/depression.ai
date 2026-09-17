@@ -1,9 +1,4 @@
-"""Tests for the current Plan/Build agent API.
-
-These tests mirror the current implementation: plan mode is read-only and
-build mode can execute mutation through the common tool interface.  Small
-fakes keep the tests independent of network services and real credentials.
-"""
+"""Tests for the current Plan/Build agent and execution-loop API."""
 from __future__ import annotations
 
 from types import SimpleNamespace
@@ -18,7 +13,14 @@ from agent.permissions.manager import PermissionManager
 
 class FakeRegistry:
     def __init__(self, names=("read", "write", "bash", "git", "filesystem")):
-        self.tools = {name: SimpleNamespace(name=name) for name in names}
+        self.tools = {
+            name: SimpleNamespace(
+                name=name,
+                description=f"fake {name} tool",
+                parameters={"type": "object"},
+            )
+            for name in names
+        }
         self.executed = []
 
     def has_tool(self, name):
@@ -46,11 +48,22 @@ class FakeSession:
 
 
 class FakeContextManager:
-    async def add_user_message(self, *args, **kwargs):
-        pass
+    def __init__(self):
+        self.messages = []
 
-    async def add_assistant_message(self, *args, **kwargs):
-        pass
+    async def add_message(self, role, content, metadata=None, **kwargs):
+        self.messages.append(
+            SimpleNamespace(role=role, content=content, metadata=metadata or {})
+        )
+
+    async def add_system_message(self, content, pinned=True, **kwargs):
+        await self.add_message("system", content, {"pinned": pinned})
+
+    async def add_user_message(self, content, **kwargs):
+        await self.add_message("user", content, kwargs)
+
+    async def add_assistant_message(self, content, **kwargs):
+        await self.add_message("assistant", content, kwargs)
 
     async def add_tool_output(self, *args, **kwargs):
         pass
@@ -88,7 +101,11 @@ class ScriptedLLM:
 
 def _agent(role):
     session = FakeSession()
-    pm = PermissionManager({"mode": "manual", "*": "allow", "default": "allow"}, ui=None, input_handler=None)
+    pm = PermissionManager(
+        {"mode": "manual", "*": "allow", "default": "allow"},
+        ui=None,
+        input_handler=None,
+    )
     agent = BaseAgent(
         role=role,
         config={},
@@ -155,12 +172,16 @@ async def test_agent_loop_executes_tool_and_returns_final_response():
         llm=llm,
         tool_registry=agent.tool_registry,
         planner=None,
-        config={"enable_planning": False, "enable_intent_classification": False},
+        config={
+            "enable_planning": False,
+            "enable_intent_classification": False,
+            "enable_qa_verification": False,
+        },
     )
     agent.llm = llm
     agent.loop = loop
     result = await loop.run("write something")
-    assert result["success"] is True
+    assert result["success"] is True, result
     assert result["response"] == "finished"
     assert result["tool_calls"] == 1
 
