@@ -85,14 +85,28 @@ class ReadLLM:
 
 
 class ReadContextManager:
+    """
+    Minimal fake of the real ContextManager.
+
+    Mirrors the API the loop actually calls:
+        add_message(role, content, metadata)
+        add_system_message(content, pinned)
+        add_assistant_message(content)
+    """
+
     def __init__(self):
         self.messages = []
 
     async def add_message(self, role, content, metadata=None, **kwargs):
-        self.messages.append(SimpleNamespace(role=role, content=content, metadata=metadata or {}))
+        self.messages.append(
+            SimpleNamespace(role=role, content=content, metadata=metadata or {})
+        )
 
     async def add_system_message(self, content, pinned=True, **kwargs):
         await self.add_message("system", content, {"pinned": pinned})
+
+    async def add_assistant_message(self, content, metadata=None, **kwargs):
+        await self.add_message("assistant", content, metadata or {})
 
 
 class ExecAgent:
@@ -121,6 +135,11 @@ async def test_single_read_tool_uses_fast_path():
 
 @pytest.mark.asyncio
 async def test_read_with_intermediate_content_continues():
+    """
+    When the model emits assistant text AND a tool call on the same turn,
+    the fast path is skipped (fast path requires no assistant text) and
+    the loop runs a second LLM turn for the final answer.
+    """
     llm = ReadLLM(with_content=True)
     loop = AgentLoop(
         ExecAgent(), llm, SimpleNamespace(tools={}), None,

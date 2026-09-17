@@ -156,6 +156,11 @@ async def test_process_query_requires_initialization():
 
 @pytest.mark.asyncio
 async def test_agent_loop_executes_tool_and_returns_final_response():
+    """
+    A single successful tool call with readable output takes the loop's
+    fast path: the tool result is returned directly and no second LLM
+    turn is consumed. This documents that behavior.
+    """
     agent = _agent(AgentRole.BUILD)
     llm = ScriptedLLM([
         LLMResponse(
@@ -182,8 +187,56 @@ async def test_agent_loop_executes_tool_and_returns_final_response():
     agent.loop = loop
     result = await loop.run("write something")
     assert result["success"] is True, result
+    # Fast path: the tool's `content` ("ok") is returned directly.
+    assert result["response"] == "ok"
+    assert result["tool_calls"] == 1
+    # Only one LLM turn was needed.
+    assert llm.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_agent_loop_continues_when_tool_output_has_no_readable_text():
+    """
+    When the tool result has no readable output field, the fast path is
+    skipped and the loop asks the LLM for a final answer.
+    """
+    agent = _agent(AgentRole.BUILD)
+
+    class OpaqueRegistry(FakeRegistry):
+        async def execute(self, name, params):
+            self.executed.append((name, params))
+            # No content / output / result / text field → fast path skips.
+            return {"success": True, "tool": name}
+
+    agent.tool_registry = OpaqueRegistry()
+    llm = ScriptedLLM([
+        LLMResponse(
+            content="",
+            model="test/model",
+            provider="test",
+            tool_calls=[ToolCall(id="1", name="write", arguments={"content": "x"})],
+            usage={"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+        ),
+        LLMResponse(content="finished", model="test/model", provider="test"),
+    ])
+    loop = AgentLoop(
+        agent=agent,
+        llm=llm,
+        tool_registry=agent.tool_registry,
+        planner=None,
+        config={
+            "enable_planning": False,
+            "enable_intent_classification": False,
+            "enable_qa_verification": False,
+        },
+    )
+    agent.llm = llm
+    agent.loop = loop
+    result = await loop.run("write something")
+    assert result["success"] is True, result
     assert result["response"] == "finished"
     assert result["tool_calls"] == 1
+    assert llm.calls == 2
 
 
 def test_coordinator_mode_switching():
