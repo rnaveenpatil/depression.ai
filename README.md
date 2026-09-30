@@ -2,17 +2,29 @@
 
 ### `You A-Z. AI depression.ai`
 
-## 👥 Team Depression
+<p align="center">
+  <img src="https://raw.githubusercontent.com/rnaveenpatil/depression.ai/main/assets/tui.png" alt="depression.ai TUI" width="900">
+</p>
 
-> **A team that builds first, breaks things second, and fixes them before anyone notices.**
+<p align="center">
+  <b>Terminal-native agentic AI for development, system operations, analysis, and cloud deployment.</b>
+</p>
 
-### 🧑‍💻 R Naveen Patil
+---
 
-<img src="https://media.licdn.com/dms/image/v2/D5603AQFPvuEfXgu3kw/profile-displayphoto-crop_800_800/B56ZvjDsyIIMAI-/0/1769040958923?e=1792627200&v=beta&t=88VVSkWxkIxiOZRLuEm3y38JJdodm61VwcNRfDHZgGQ" width="180" height="180" style="border-radius:50%;">
+# 👥 Team Depression
+
+> **A team that builds ON ETHICS**
+
+## 🧑‍💻 R Naveen Patil
+
+<p align="center">
+  <img src="https://raw.githubusercontent.com/rnaveenpatil/depression.ai/main/assets/patil.png" alt="R Naveen Patil" width="180" height="180">
+</p>
 
 **Lead Developer • AI & Agentic Systems • Cloud & Infrastructure**
 
-R Naveen Patil is the primary developer behind the `depression.ai` framework, responsible for the core architecture, agentic workflow, LLM integration, system tooling and overall development of the project.
+R Naveen Patil is the primary developer behind the `depression.ai` framework, responsible for the core architecture, agentic workflow, LLM integration, system tooling, cloud integration and overall development of the project.
 
 **Profiles**
 
@@ -23,13 +35,14 @@ R Naveen Patil is the primary developer behind the `depression.ai` framework, re
 
 ---
 
-### 🤝 Teammates
+## 🤝 Team Members
 
 <table>
 <tr>
-<td align="center" width="33%">
 
-<img src="https://media.licdn.com/dms/image/v2/D5603AQHETfTo9AbZhg/profile-displayphoto-crop_800_800/B56Z0cSxd9H0AI-/0/1774296177050?e=1792627200&v=beta&t=BI2xg5WhBCmr2IT9QCdM5bQaKlySbx3vaGbmwSt1UNs" width="110" height="110" style="border-radius:50%;">
+<td align="center" width="25%">
+
+<img src="https://raw.githubusercontent.com/rnaveenpatil/depression.ai/main/assets/rahul.jpeg" alt="Rahul Jadav" width="120" height="120">
 
 ### Rahul Jadav
 
@@ -41,9 +54,9 @@ R Naveen Patil is the primary developer behind the `depression.ai` framework, re
 
 </td>
 
-<td align="center" width="33%">
+<td align="center" width="25%">
 
-<img src="https://media.licdn.com/dms/image/v2/D5603AQGRWiuUJxvRAg/profile-displayphoto-crop_800_800/B56ZoKX7S5I4AQ-/0/1761110638482?e=1792627200&v=beta&t=3bO-r6Uze3TfRaILZaYJciFqfbSPLvgQhCtH-17XJx4" width="110" height="110" style="border-radius:50%;">
+<img src="https://raw.githubusercontent.com/rnaveenpatil/depression.ai/main/assets/meghasree.png" alt="K G Meghashree Naik" width="120" height="120">
 
 ### K G Meghashree Naik
 
@@ -55,7 +68,9 @@ R Naveen Patil is the primary developer behind the `depression.ai` framework, re
 
 </td>
 
-<td align="center" width="33%">
+<td align="center" width="25%">
+
+<img src="https://raw.githubusercontent.com/rnaveenpatil/depression.ai/main/assets/sumantha.jpeg" alt="SUMANTHA MS" width="120" height="120">
 
 ### SUMANTHA MS
 
@@ -64,6 +79,7 @@ R Naveen Patil is the primary developer behind the `depression.ai` framework, re
 [LinkedIn](https://www.linkedin.com/in/sumantha-ms-235ba2295/)
 
 </td>
+
 </tr>
 </table>
 
@@ -71,122 +87,225 @@ R Naveen Patil is the primary developer behind the `depression.ai` framework, re
 
 # 🧠 About depression.ai
 
-**depression.ai** is an agentic AI framework developed by **Team Depression**.
+**depression.ai** is an agentic AI framework developed and released by **Team Depression**.
 
-It is a terminal-native AI workspace designed to assist with the complete workflow from **development and analysis to system operations and cloud deployment**.
-
-```text
-                 ┌─────────────────────┐
-                 │        USER          │
-                 └──────────┬──────────┘
-                            │
-                            ▼
-                 ┌─────────────────────┐
-                 │   depression.ai     │
-                 │      TUI / CLI      │
-                 └──────────┬──────────┘
-                            │
-              ┌─────────────┴─────────────┐
-              ▼                           ▼
-       ┌──────────────┐           ┌──────────────┐
-       │  PLAN AGENT  │           │ BUILD AGENT  │
-       │  Read / Plan │           │ Execute      │
-       └──────┬───────┘           └──────┬───────┘
-              │                          │
-              └───────────┬──────────────┘
-                          ▼
-                 ┌─────────────────────┐
-                 │    TOOL SYSTEM      │
-                 ├─────────────────────┤
-                 │ Terminal            │
-                 │ Filesystem          │
-                 │ Git                 │
-                 │ Patch               │
-                 │ Search              │
-                 │ Web                 │
-                 │ Browser             │
-                 │ AWS                 │
-                 │ MCP                 │
-                 └─────────────────────┘
-```
-
-## 🚀 What Can It Do?
-
-### 💻 Development
-
-Work directly with software projects through the terminal.
-
-* Analyze existing projects
-* Read and understand source code
-* Create files
-* Modify existing files
-* Apply patches
-* Run commands
-* Debug development workflows
-* Work with Git
-* Manage project structure
-
-### 🖥️ System Operations
-
-The agent can interact with the local development environment through configured tools.
-
-Examples:
+It is a terminal-native AI workspace designed to assist with the complete workflow from:
 
 ```text
-"Check my project structure"
-
-"Find why this application is failing"
-
-"Install the required dependencies"
-
-"Run the tests and fix the errors"
-
-"Find all unused files"
-
-"Prepare this project for deployment"
+Development
+     ↓
+Analysis
+     ↓
+System Operations
+     ↓
+Testing & Debugging
+     ↓
+Git & Project Management
+     ↓
+AWS Operations
+     ↓
+Deployment
 ```
 
-The agent determines the required actions from the task rather than relying only on predefined command keywords.
+The framework is designed around an **LLM-driven agent architecture**, meaning the model acts as the reasoning layer while `depression.ai` provides the execution environment, tools, permissions, project context and session management.
+
+The framework is not simply a collection of predefined commands. The agent can inspect the current environment, understand the user's request, determine the required sequence of operations, execute available tools and verify the result.
+
+---
+
+# 🖥️ Terminal-Native TUI
+
+The primary interface is a terminal-native **Textual TUI** designed for interactive agent operation.
+
+<p align="center">
+  <img src="https://raw.githubusercontent.com/rnaveenpatil/depression.ai/main/assets/tui.png" alt="depression.ai Terminal User Interface" width="950">
+</p>
+
+The interface brings the agent workflow into a single workspace with features such as:
+
+* Interactive conversation
+* Plan / Build mode switching
+* LLM connection configuration
+* AWS configuration
+* Tool-call cards
+* Permission prompts
+* Todo tracking
+* Thinking indicators
+* Diff inspection
+* Session management
+* Project context
+* Agent execution feedback
+
+The goal is to provide a workflow similar to modern terminal-native coding agents while extending the scope beyond software development into system and cloud operations.
+
+---
+
+# 🏗️ Architecture
+
+```text
+                         USER
+                           │
+                           ▼
+                ┌─────────────────────┐
+                │   depression.ai     │
+                │       TUI / CLI     │
+                └──────────┬──────────┘
+                           │
+                ┌──────────┴──────────┐
+                │                     │
+                ▼                     ▼
+        ┌───────────────┐     ┌───────────────┐
+        │   PLAN AGENT  │     │  BUILD AGENT  │
+        │               │     │               │
+        │ Read / Analyze│     │ Execute Tools │
+        │ Plan Tasks    │     │ Modify System │
+        └───────┬───────┘     └───────┬───────┘
+                │                     │
+                └──────────┬──────────┘
+                           ▼
+                  ┌─────────────────┐
+                  │   TOOL SYSTEM   │
+                  ├─────────────────┤
+                  │ Terminal        │
+                  │ Filesystem      │
+                  │ Git             │
+                  │ Patch           │
+                  │ Search          │
+                  │ Web             │
+                  │ Browser         │
+                  │ AWS             │
+                  │ MCP             │
+                  │ Todo / Process  │
+                  └─────────────────┘
+```
 
 ---
 
 # 🧩 Plan + Build Architecture
 
-`depression.ai` uses two complementary agent modes.
+`depression.ai` separates planning from execution using two complementary agent modes.
 
-### PLAN
+## PLAN
 
-The Plan Agent focuses on understanding the problem before execution.
+The Plan Agent focuses on understanding the task before making system changes.
 
 ```text
 User Request
      ↓
 Project Inspection
      ↓
-Analysis
+Context Gathering
+     ↓
+Problem Analysis
      ↓
 Task Breakdown
      ↓
 Execution Plan
 ```
 
-### BUILD
+The planning stage can inspect project files, understand dependencies, analyze the environment and determine the steps required to complete the task.
 
-The Build Agent performs the required operations using available tools.
+## BUILD
+
+The Build Agent performs the required operations using the available tools.
 
 ```text
-Approved Plan
-     ↓
-Tool Selection
-     ↓
-Execution
-     ↓
-Verification
-     ↓
-Result
+Approved / Selected Plan
+          ↓
+     Tool Selection
+          ↓
+       Execution
+          ↓
+      Verification
+          ↓
+        Result
 ```
 
-This separation helps distinguish **reasoning/planning** from **actual system modifications**.
+This separation provides a clear distinction between **reasoning and execution**.
+
+---
+
+# 💻 Development Capabilities
+
+`depression.ai` can operate directly on software projects through its tool system.
+
+### Project Understanding
+
+* Analyze existing projects
+* Inspect project structure
+* Read source code
+* Understand dependencies
+* Search through files
+* Identify configuration problems
+* Analyze build errors
+
+### Code Operations
+
+* Create files
+* Modify existing files
+* Apply patches
+* Refactor code
+* Debug applications
+* Run tests
+* Verify changes
+* Work with Git
+
+### Example
+
+```text
+User:
+"Analyze this project and find why the application is failing."
+
+Agent:
+    ↓
+Inspect project
+    ↓
+Read configuration
+    ↓
+Inspect source code
+    ↓
+Run relevant commands
+    ↓
+Identify failure
+    ↓
+Create fix
+    ↓
+Run verification
+    ↓
+Report result
+```
+
+The agent determines the required actions based on the task, available tools and connected model.
+
+---
+
+# 🖥️ System Operations
+
+The framework can interact with the local development environment through its configured tools.
+
+Example tasks include:
+
+```text
+"Check my project structure."
+
+"Find why this application is failing."
+
+"Install the required dependencies."
+
+"Run the tests and fix the errors."
+
+"Find unused files."
+
+"Check the running processes."
+
+"Prepare this project for deployment."
+
+"Inspect the Git changes."
+
+"Create a clean patch for this issue."
+```
+
+System-level operations are controlled through the permission system where required.
 
 ---
 
@@ -194,51 +313,69 @@ This separation helps distinguish **reasoning/planning** from **actual system mo
 
 AWS is integrated into the agent workflow so cloud infrastructure can be handled from the same terminal-native environment.
 
-Instead of switching between multiple terminals, dashboards and command-line utilities, the user can communicate the intended task to the agent.
+<p align="center">
+  <img src="https://raw.githubusercontent.com/rnaveenpatil/depression.ai/main/assets/tui.png" alt="depression.ai AWS-capable TUI" width="900">
+</p>
+
+The architecture allows the agent to combine:
 
 ```text
-User
- │
- │ "Analyze my AWS environment"
- ▼
+User Request
+     ↓
 depression.ai
- │
- ├── AWS credentials
- ├── AWS tools
- ├── AWS CLI workflows
- └── Agent reasoning
- │
- ▼
+     ↓
+Agent Reasoning
+     ↓
+AWS Tools / AWS CLI
+     ↓
 AWS Environment
 ```
 
-Depending on the tools available, AWS permissions and configured credentials, the agent can assist with:
+Depending on the configured tools, AWS permissions and available credentials, the agent can assist with:
 
-* AWS resource inspection
+* AWS environment inspection
 * Infrastructure analysis
 * Resource management
+* AWS CLI workflows
 * Deployment workflows
 * Cloud operations
-* AWS CLI operations
 * Monitoring and troubleshooting workflows
-* Creating, modifying or removing supported resources
+* Creating supported resources
+* Modifying supported resources
+* Removing supported resources
 * Application deployment workflows
 
-### 🔐 AWS Permissions Matter
-
-`depression.ai` does not bypass AWS security.
-
-The operations available to the agent depend on the **AWS credentials and IAM permissions** provided by the user.
-
-For example, if the configured IAM identity cannot delete an EC2 resource, the agent cannot legitimately perform that deletion.
+The exact operations available depend on the AWS credentials, IAM permissions and tools configured in the environment.
 
 ---
 
-# 🔌 Connecting Your AWS Account
+# 🔐 AWS Security & Permissions
 
-AWS credentials can be configured through the TUI or the environment.
+`depression.ai` does **not bypass AWS security controls**.
 
-Example environment configuration:
+The agent operates using the AWS identity and permissions supplied by the user.
+
+For example:
+
+```text
+AWS IAM Permissions
+        ↓
+depression.ai
+        ↓
+Allowed AWS Operations
+```
+
+If the configured AWS identity does not have permission to perform an operation, the agent cannot legitimately perform that operation.
+
+This allows AWS access to remain controlled through standard AWS authentication and IAM authorization.
+
+---
+
+# 🔌 Connecting an AWS Account
+
+AWS credentials can be configured through the TUI or supported environment variables.
+
+Example:
 
 ```bash
 export AWS_ACCESS_KEY_ID="your-access-key"
@@ -252,9 +389,31 @@ Then start:
 depression
 ```
 
-The TUI provides an AWS configuration panel where the AWS environment can be connected and used by the agent.
+The TUI can be used to configure the AWS environment when supported by the installed version.
 
-> **Never commit AWS credentials, secret keys or `.env` files to Git.**
+### AWS Access Key Setup
+
+A typical AWS access-key workflow is:
+
+```text
+AWS Console
+    ↓
+IAM
+    ↓
+Users
+    ↓
+Select User
+    ↓
+Security Credentials
+    ↓
+Access Keys
+    ↓
+Create Access Key
+```
+
+> **Never commit AWS access keys, secret keys, `.env` files or other credentials to GitHub.**
+
+For production deployments, use the AWS credential mechanism appropriate for the deployment environment and apply least-privilege IAM permissions.
 
 ---
 
@@ -262,7 +421,23 @@ The TUI provides an AWS configuration panel where the AWS environment can be con
 
 The framework separates the **agent runtime** from the **LLM provider**.
 
-The user can configure the model at runtime using:
+The model acts as the reasoning layer while `depression.ai` provides:
+
+```text
+LLM
+ ↓
+Agent Runtime
+ ↓
+Context
+ ↓
+Tools
+ ↓
+Permissions
+ ↓
+Execution
+```
+
+The user can configure an LLM through:
 
 ```text
 Provider
@@ -274,126 +449,299 @@ Model
 Example:
 
 ```text
-Provider: custom
-Base URL: https://api.example.com/v1
-API Key: ****************
-Model: your-model
+Provider : custom
+Base URL : https://api.example.com/v1
+API Key  : ****************
+Model    : your-model
 ```
 
-For a locally hosted model:
+This allows the framework to work with compatible remote model APIs.
+
+---
+
+# 🧠 OpenAI-Compatible & API-Based Models
+
+The framework can be configured around compatible API endpoints rather than forcing a single model provider.
+
+Example:
 
 ```text
-Provider: custom
-Base URL: http://localhost:11434/v1
-API Key: local
-Model: your-model
+depression.ai
+      │
+      ▼
+┌──────────────────┐
+│ Compatible API   │
+│ Endpoint         │
+└────────┬─────────┘
+         │
+         ▼
+       LLM
 ```
 
-This allows the same agent framework to work with remote APIs as well as locally hosted model servers when they expose a compatible interface.
+A compatible endpoint generally exposes the API format expected by the configured provider adapter.
+
+However:
+
+> **API compatibility does not automatically mean that every model will perform well as an agent.**
+
+Agentic workloads require more than simply generating text.
 
 ---
 
 # 🧠 Model Requirements
 
-API compatibility alone does not guarantee good agent performance.
+A model used with `depression.ai` should ideally provide:
 
-A model used with `depression.ai` should ideally support:
-
-* Chat/text generation
-* Long enough context
+* Chat / text generation
+* Sufficient context length
 * Strong instruction following
 * Code understanding
-* Structured output
-* Tool/function calling where available
-* Multi-turn conversations
+* Multi-turn conversation support
 * Reliable reasoning
+* Structured output capability
+* Tool / function calling where supported
 * Consistent responses
 
-For local deployment, hardware resources also matter.
+For agentic development workflows, model capability is especially important because the model is responsible for understanding the task and deciding how to use the available tools.
+
+---
+
+# 🏠 Local LLM Support
+
+One of the major directions for `depression.ai` is **local and self-hosted LLM execution**.
+
+A locally hosted model can be exposed through a local model server and connected to the same agent runtime.
+
+For example:
 
 ```text
 Local GPU
-   ↓
+    ↓
 Model Runtime
-   ↓
-Local LLM
-   ↓
+    ↓
+Local LLM Server
+    ↓
+Compatible API
+    ↓
 depression.ai
-   ↓
-Tools + Agent
+    ↓
+Agent
+    ↓
+Tools
 ```
 
-Larger models generally require more VRAM/RAM and compute resources.
+For a local endpoint, the configuration can conceptually look like:
+
+```text
+Provider : custom
+Base URL : http://localhost:11434/v1
+API Key  : local
+Model    : your-local-model
+```
+
+The exact URL, API format and model name depend on the local model runtime being used.
+
+---
+
+# ⚡ GPU-Based Local AI
+
+For local deployment, the model runs on infrastructure controlled by the organization.
+
+```text
+┌─────────────────────────────────────────┐
+│             LOCAL GPU SERVER             │
+│                                         │
+│        ┌──────────────────────┐         │
+│        │     GPU / VRAM       │         │
+│        └──────────┬───────────┘         │
+│                   ↓                     │
+│        ┌──────────────────────┐         │
+│        │    Local Model       │         │
+│        │      Runtime         │         │
+│        └──────────┬───────────┘         │
+│                   ↓                     │
+│             Local LLM API              │
+└───────────────────┬─────────────────────┘
+                    ↓
+             depression.ai
+                    ↓
+          Agents + Tools + Data
+```
+
+Model size, quantization, context length, concurrent users and workload determine the required GPU VRAM, RAM and compute capacity.
 
 ---
 
 # 🔒 Local & Self-Hosted AI
 
-The existing architecture keeps the **agent framework and tool execution on the user's system** while the model can be supplied through an API.
+The existing `depression.ai` architecture keeps the **agent framework and tool execution on the user's system**, while the LLM can be supplied through an API.
 
-Team Depression is extending this architecture toward **local LLM execution**.
-
-The target architecture is:
+The next stage of the architecture is to support the LLM itself running inside the organization's controlled infrastructure.
 
 ```text
-┌─────────────────────────────────────────┐
-│              ORGANIZATION               │
-│                                         │
-│  ┌─────────────┐     ┌───────────────┐ │
-│  │ depression  │────▶│  Local LLM    │ │
-│  │    .ai      │     │ GPU Server    │ │
-│  └──────┬──────┘     └───────────────┘ │
-│         │                               │
-│         ├── Filesystem                  │
-│         ├── Terminal                    │
-│         ├── Git                         │
-│         ├── Internal Tools              │
-│         └── Infrastructure              │
-│                                         │
-└─────────────────────────────────────────┘
+┌────────────────────────────────────────────────┐
+│              ORGANIZATION NETWORK              │
+│                                                │
+│  ┌───────────────┐                             │
+│  │ User / TUI    │                             │
+│  └───────┬───────┘                             │
+│          ↓                                     │
+│  ┌────────────────┐                            │
+│  │ depression.ai  │                            │
+│  │ Agent Runtime  │                            │
+│  └───────┬────────┘                            │
+│          ↓                                     │
+│  ┌────────────────┐                            │
+│  │ Local LLM      │                            │
+│  │ GPU Server     │                            │
+│  └───────┬────────┘                            │
+│          ↓                                     │
+│  ┌────────────────────────────────────────┐    │
+│  │ Internal Files / Tools / Infrastructure│    │
+│  └────────────────────────────────────────┘    │
+│                                                │
+└────────────────────────────────────────────────┘
 ```
 
-This architecture is intended to support environments where sensitive engineering documents, source code, internal correspondence and other confidential information need to remain within controlled infrastructure.
+This direction is intended for environments where sensitive engineering documents, source code, internal correspondence, financial information, designs and other confidential information need to remain within controlled infrastructure.
+
+---
+
+# 🏭 Sovereign / On-Prem AI Workbench
+
+The architecture can be adapted for organizations such as:
+
+* Refineries
+* Public Sector Undertakings
+* Defence-linked manufacturing
+* Government offices
+* Industrial organizations
+* Enterprises with sensitive internal infrastructure
+
+Potential confidential workloads include:
+
+```text
+P&IDs
+Engineering Documents
+Source Code
+Financial Information
+Vendor Negotiations
+Internal Correspondence
+Design Documents
+Inspection Reports
+Operational Documentation
+```
+
+Instead of sending these workloads to a public cloud AI assistant, the target architecture is:
+
+```text
+Confidential Data
+       ↓
+Internal Environment
+       ↓
+depression.ai
+       ↓
+Local Agent
+       ↓
+Local LLM
+       ↓
+GPU Infrastructure
+```
+
+The objective is to provide agentic AI capabilities while keeping the execution environment under organizational control.
+
+---
+
+# 🧠 Multiple Local Models
+
+A self-hosted deployment can potentially run multiple open-weight models for different workloads.
+
+```text
+                 depression.ai
+                       │
+          ┌────────────┼────────────┐
+          ↓            ↓            ↓
+     Code Model    General Model   Reasoning
+          │            │            │
+          └────────────┼────────────┘
+                       ↓
+                  GPU Server
+```
+
+Different tasks may require different model characteristics.
+
+For example:
+
+| Task               | Potential Model Requirement       |
+| ------------------ | --------------------------------- |
+| Code generation    | Strong code understanding         |
+| Code review        | Long context + reasoning          |
+| Document analysis  | Large context                     |
+| Planning           | Strong instruction following      |
+| Tool execution     | Reliable tool calling             |
+| General assistance | General-purpose instruction model |
+
+The model-selection layer can therefore evolve toward task-based model selection for self-hosted environments.
 
 ---
 
 # 🛠️ Tool System
 
-The framework provides the agent with tools for interacting with the working environment.
+The agent runtime provides tools for interacting with the working environment.
 
 Current tool categories include:
 
 ```text
-Terminal
-Filesystem
-Git
-Patch
-Search
-Web
-Todo
-Process
-Browser Automation
-AWS
-MCP
+┌─────────────────────────┐
+│       TOOL SYSTEM       │
+├─────────────────────────┤
+│ Terminal                │
+│ Filesystem              │
+│ Git                     │
+│ Patch                   │
+│ Search                  │
+│ Web                     │
+│ Todo                    │
+│ Process                 │
+│ Browser Automation      │
+│ AWS                     │
+│ MCP                     │
+└─────────────────────────┘
 ```
 
-The LLM decides which available tools are relevant to the current task.
+The LLM determines which available tools are relevant to the current task.
+
+This allows the same agent architecture to handle different workflows without requiring a separate application for every operation.
 
 ---
 
 # 🔗 MCP Support
 
-`depression.ai` includes Model Context Protocol support for connecting additional tool servers.
+`depression.ai` includes support for the **Model Context Protocol (MCP)**.
 
-This allows the framework to extend beyond its built-in capabilities without requiring every external integration to be hard-coded directly into the core agent.
+MCP allows additional tool servers to be connected to the agent runtime.
+
+```text
+depression.ai
+      │
+      ├── Built-in Tools
+      │
+      └── MCP
+           ├── Server 1
+           ├── Server 2
+           ├── Server 3
+           └── ...
+```
+
+This makes it possible to extend the agent with additional capabilities without hard-coding every external integration directly into the core framework.
 
 ---
 
 # 🔐 Permission System
 
-Agentic execution requires controlled access to the user's system.
+Agentic systems can execute operations that affect the user's files, system or infrastructure.
 
-`depression.ai` therefore provides permission handling for tool operations.
+`depression.ai` therefore includes permission handling for tool operations.
 
 Example:
 
@@ -403,13 +751,31 @@ filesystem.execute [medium]
 Allow? [y/N]
 ```
 
-This allows the user to review potentially sensitive or destructive operations before they are executed.
+The permission system allows users to review potentially sensitive or destructive actions before execution.
+
+Conceptually:
+
+```text
+Agent wants to execute action
+          ↓
+Permission Check
+          ↓
+┌─────────┴─────────┐
+│                   │
+▼                   ▼
+Allowed           Ask User
+                    │
+                 y / N
+                    │
+                    ▼
+                Execute
+```
 
 ---
 
 # 💾 Sessions & Recovery
 
-The framework includes persistent sessions and project state handling.
+The framework provides session and project-state handling.
 
 Features include:
 
@@ -422,7 +788,7 @@ Features include:
 * Todo tracking
 * Tool execution history
 
-Useful commands include:
+Useful commands:
 
 ```text
 /session
@@ -430,6 +796,29 @@ Useful commands include:
 /undo
 /compact
 ```
+
+This makes it possible to continue work across multiple interactions while maintaining relevant project state.
+
+---
+
+# 📋 Todo & Task Tracking
+
+Complex agentic workflows can involve multiple operations.
+
+The TUI provides task tracking to make the execution process easier to follow.
+
+```text
+TODO
+────────────────────────
+✓ Inspect project
+✓ Identify dependency issue
+→ Modify configuration
+○ Run tests
+○ Verify deployment
+────────────────────────
+```
+
+This helps separate the overall task into smaller execution steps.
 
 ---
 
@@ -473,23 +862,25 @@ PLAN ↔ BUILD
 
 # 🖥️ CLI
 
+Start the application:
+
 ```bash
 depression
 ```
 
-Project:
+Specify a project:
 
 ```bash
 depression -p /path/to/project
 ```
 
-Select model:
+Select a model:
 
 ```bash
 depression -m MODEL
 ```
 
-Select provider:
+Select a provider:
 
 ```bash
 depression --provider PROVIDER
@@ -513,7 +904,7 @@ Disable MCP:
 depression --no-mcp
 ```
 
-Maximum turns:
+Set maximum turns:
 
 ```bash
 depression --max-turns N
@@ -523,20 +914,20 @@ depression --max-turns N
 
 # 📦 Installation
 
-Clone the project:
+Clone the repository:
 
 ```bash
 git clone https://github.com/rnaveenpatil/depression.ai.git
 cd depression.ai
 ```
 
-Install:
+Install the package:
 
 ```bash
-pip install -e .
+pip install depressiom.ai .
 ```
 
-Optional development installation:
+For development:
 
 ```bash
 pip install -e ".[dev]"
@@ -559,7 +950,7 @@ pip install -e .
 depression
 ```
 
-Then configure the LLM through the TUI.
+After starting the TUI, configure the LLM:
 
 ```text
 LLM CONNECTION
@@ -571,11 +962,61 @@ Model       : ...
 ────────────────────────────
 ```
 
-Configure AWS when required through the AWS panel or supported environment configuration.
+For AWS workflows, configure the AWS credentials and region through the supported configuration mechanism.
+
+---
+
+# 🔧 Runtime Configuration
+
+Environment variables can be used where supported:
+
+```bash
+export DEPRESSION_PROVIDER=custom
+export DEPRESSION_BASE_URL=https://api.example.com/v1
+export DEPRESSION_API_KEY="your-api-key"
+export DEPRESSION_MODEL="your-model"
+
+export AWS_ACCESS_KEY_ID="your-access-key"
+export AWS_SECRET_ACCESS_KEY="your-secret-key"
+export AWS_DEFAULT_REGION="ap-south-1"
+```
+
+Local model example:
+
+```bash
+export DEPRESSION_PROVIDER=custom
+export DEPRESSION_BASE_URL=http://localhost:11434/v1
+export DEPRESSION_API_KEY=local
+export DEPRESSION_MODEL="your-local-model"
+```
+
+---
+
+# ⚙️ Configuration
+
+Configuration can be stored in:
+
+```text
+.agent/config.json
+```
+
+or:
+
+```text
+~/.agent/config.json
+```
+
+Initialize configuration:
+
+```bash
+depression --init-config
+```
 
 ---
 
 # 🎯 Example Agent Tasks
+
+### Development
 
 ```text
 Analyze this project and explain its architecture.
@@ -584,53 +1025,218 @@ Find the cause of this build error and fix it.
 
 Review the dependencies and identify unnecessary packages.
 
-Create a deployment plan for this application.
-
 Run the tests and fix the failing tests.
 
-Check the Git changes and prepare a clean commit.
+Refactor this module without changing its public API.
+```
 
+### System
+
+```text
+Check my project structure.
+
+Find the process using this port.
+
+Inspect the current environment.
+
+Check why this command is failing.
+
+Prepare this project for deployment.
+```
+
+### Git
+
+```text
+Review my Git changes.
+
+Explain the current diff.
+
+Create a clean patch for this change.
+
+Prepare the project for a commit.
+```
+
+### AWS
+
+```text
 Analyze my AWS environment.
 
 Investigate the deployment failure.
 
+Check the configured AWS environment.
+
 Prepare this application for AWS deployment.
+
+Analyze the infrastructure configuration.
 ```
 
-The agent determines the required sequence of actions based on the task, available tools and connected model.
+The exact operations performed depend on the available tools, model capabilities, credentials and permissions.
 
 ---
 
-# 🏭 Future Direction: Sovereign / On-Prem AI
+# 🔄 Agent Execution Flow
 
-The architecture of `depression.ai` is also being adapted toward **self-hosted AI workbenches** for organizations that cannot send confidential information to public AI services.
-
-Potential deployment environment:
+A typical task follows a workflow similar to:
 
 ```text
-                    ON-PREMISE NETWORK
+                    USER REQUEST
+                         │
+                         ▼
+                 ┌──────────────┐
+                 │ Context Load │
+                 └──────┬───────┘
+                        ↓
+                 ┌──────────────┐
+                 │ Plan Agent   │
+                 └──────┬───────┘
+                        ↓
+                 ┌──────────────┐
+                 │ Task Planning│
+                 └──────┬───────┘
+                        ↓
+                 ┌──────────────┐
+                 │ Build Agent  │
+                 └──────┬───────┘
+                        ↓
+                 ┌──────────────┐
+                 │ Tool Calling │
+                 └──────┬───────┘
+                        ↓
+                 ┌──────────────┐
+                 │ Verification │
+                 └──────┬───────┘
+                        ↓
+                       RESULT
+```
+
+---
+
+# 🧱 Why the Framework Is Different
+
+`depression.ai` is designed as a **general-purpose agentic execution framework** rather than a single-purpose coding assistant.
+
+The same runtime can combine:
+
+```text
+LLM
+ │
+ ├── Development
+ ├── Filesystem
+ ├── Terminal
+ ├── Git
+ ├── System Operations
+ ├── Browser Automation
+ ├── MCP
+ └── AWS
+```
+
+This allows one agentic workspace to move from:
+
+```text
+Idea
+ ↓
+Analysis
+ ↓
+Development
+ ↓
+Testing
+ ↓
+System Handling
+ ↓
+Cloud Operations
+ ↓
+Deployment
+```
+
+---
+
+# 🔒 Current Privacy Boundary
+
+The current architecture is designed so that the **agent framework, tool execution and project interaction run on the user's system**.
+
+The LLM can currently be supplied through an API endpoint.
+
+Conceptually:
+
+```text
+USER SYSTEM
+────────────────────────────
+depression.ai
+Agent Runtime
+Tools
+Files
+Terminal
+Git
+AWS
+Sessions
+Permissions
+────────────────────────────
+             │
+             ▼
+       LLM API Endpoint
+```
+
+The next architecture change is to allow the LLM itself to run locally:
+
+```text
+USER / ORGANIZATION
+────────────────────────────
+depression.ai
+Agent Runtime
+Tools
+Files
+Terminal
+Git
+AWS
+Sessions
+Permissions
+────────────────────────────
+             │
+             ▼
+       LOCAL LLM SERVER
+             │
+             ▼
+          GPU
+```
+
+This is the direction toward self-hosted and air-gapped deployments.
+
+---
+
+# 🏭 Air-Gapped Deployment Direction
+
+For highly controlled environments, the target deployment can operate entirely inside an organization's network.
+
+```text
+                 AIR-GAPPED / INTERNAL NETWORK
+
 ┌──────────────────────────────────────────────────────┐
 │                                                      │
-│   User Workstation                                  │
-│          │                                           │
-│          ▼                                           │
-│   ┌──────────────┐                                  │
-│   │ depression.ai│                                  │
-│   └──────┬───────┘                                  │
-│          │                                           │
-│          ▼                                           │
-│   ┌──────────────┐                                  │
-│   │ Local Model  │◄──── GPU Server                  │
-│   │   Runtime    │                                  │
-│   └──────────────┘                                  │
-│          │                                           │
-│          ▼                                           │
-│   Internal Files / Tools / Infrastructure            │
+│                    USER WORKSTATION                  │
+│                           │                          │
+│                           ▼                          │
+│                  ┌────────────────┐                  │
+│                  │ depression.ai  │                  │
+│                  │   TUI / Agent  │                  │
+│                  └───────┬────────┘                  │
+│                          │                           │
+│                          ▼                           │
+│                  ┌────────────────┐                  │
+│                  │ Local LLM API  │                  │
+│                  └───────┬────────┘                  │
+│                          │                           │
+│                          ▼                           │
+│                  ┌────────────────┐                  │
+│                  │   GPU Server   │                  │
+│                  └───────┬────────┘                  │
+│                          │                           │
+│                          ▼                           │
+│       Internal Documents / Code / Tools / Systems   │
 │                                                      │
 └──────────────────────────────────────────────────────┘
 ```
 
-The objective is to allow organizations to run agentic workflows using **their own infrastructure and locally hosted open-weight models**, subject to the capabilities and security controls of the deployment environment.
+The objective is to enable agentic AI workflows without requiring confidential organizational data to be processed by a public AI service.
 
 ---
 
@@ -653,6 +1259,8 @@ src/
 ├── tui/
 └── utils/
 ```
+
+The framework is organized around the agent runtime, LLM integration, context handling, tools, permissions, sessions, plugins, MCP and TUI.
 
 ---
 
@@ -690,6 +1298,42 @@ mypy src/
 
 ---
 
+# 📌 Project Status
+
+`depression.ai` is an actively developed agentic AI framework by **Team Depression**.
+
+The existing framework provides the foundation for:
+
+```text
+✓ Terminal-native agent
+✓ Plan + Build architecture
+✓ Tool execution
+✓ Filesystem operations
+✓ Terminal operations
+✓ Git workflows
+✓ MCP support
+✓ Permission controls
+✓ Persistent sessions
+✓ Snapshot / undo workflows
+✓ TUI
+✓ Runtime LLM configuration
+✓ AWS-oriented workflows
+```
+
+The development direction includes:
+
+```text
+→ Stronger local LLM support
+→ GPU-based inference
+→ Self-hosted deployment
+→ Multiple local model support
+→ Task-based model selection
+→ Air-gapped AI workflows
+→ Enterprise / industrial AI workbench
+```
+
+---
+
 # 📞 Team Depression — Contact Information
 
 ## R Naveen Patil
@@ -697,6 +1341,7 @@ mypy src/
 **Lead Developer**
 
 * Email: `rnaveenpatil@gmail.com`
+* Phone: `7483894502`
 * LinkedIn: https://www.linkedin.com/in/r-naveen-patil-a45403292/
 * GitHub: https://github.com/rnaveenpatil
 * Portfolio: https://rnaveenpatil-resume.netlify.app
@@ -729,6 +1374,13 @@ mypy src/
 
 ---
 
+# 🔗 Repository
+
+**GitHub:**
+https://github.com/rnaveenpatil/depression.ai
+
+---
+
 <div align="center">
 
 ### `TEAM DEPRESSION`
@@ -737,18 +1389,12 @@ mypy src/
 
 ### `You A-Z. AI depression.ai`
 
-</div>
-
----
-
-## License
-
-This project is released under the **ISC License**.
-
----
-
-<div align="center">
-
 **depression.ai — Developed by Team Depression**
 
 </div>
+
+---
+
+# 📜 License
+
+This project is released under the **MOODLAKATTE INSTITUTE**.
