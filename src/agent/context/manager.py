@@ -11,7 +11,7 @@ from typing import Any, Dict, List, Optional
 from agent.utils.logging import get_logger
 from agent.context.project import ProjectContext
 from agent.context.files import FileContext
-from agent.context.compaction import Compactor
+from agent.context.compaction import Compactor, _estimate_message_tokens
 
 logger = get_logger(__name__)
 
@@ -57,8 +57,8 @@ class ContextManager:
         - messages[] is the canonical conversation log.
         - tool_outputs is a small ring buffer of recent tool results used
           for prompt hints. Tool results are ALSO recorded as `tool`
-          messages in messages[]; the two stores are intentionally distinct
-          and total_tokens() counts only messages[] to avoid double-counting.
+          messages in messages[]; total_tokens() counts only messages[]
+          to avoid double-counting.
     """
 
     def __init__(
@@ -83,7 +83,7 @@ class ContextManager:
         self.include_tool_outputs = self.config.get("include_tool_outputs", True)
         self.enable_summarization = self.config.get("enable_summarization", True)
 
-        # Token counter (best effort; falls back to len//4)
+        # Token counter (best effort; falls back to len//4).
         token_counter = None
         try:
             from agent.llm.rate_limiter import TokenCounter
@@ -147,10 +147,18 @@ class ContextManager:
                     if self.llm and hasattr(self.llm, "get_current_model")
                     else "default"
                 )
-                return self._token_counter.count_tokens(text, model or "default")
+                return int(self._token_counter.count_tokens(text, model or "default"))
             except Exception:
                 pass
         return max(1, len(text) // 4)
+
+    def _estimate_message_tokens_full(self, m: ContextMessage) -> int:
+        """
+        Estimated cost of a single message, counting content AND
+        tool_calls metadata. Delegates to the shared helper in
+        compaction.py so the two modules agree.
+        """
+        return _estimate_message_tokens(m)
 
     def total_tokens(self) -> int:
         """
@@ -158,18 +166,24 @@ class ContextManager:
         messages inside messages[], so counting the buffer would double
         the total and cause premature compaction.
         """
-        return sum(m.tokens for m in self.messages)
+        return sum(
+            m.tokens or self._estimate_message_tokens_full(m)
+            for m in self.messages
+        )
 
     def usage_pct(self) -> float:
         if self.max_tokens <= 0:
             return 0.0
-        return min(1.0, self.total_tokens() / self.max_tokens)
+        return min(1.0, float(self.total_tokens()) / float(self.max_tokens))
 
     # ------------------------------------------------------------------
     # MESSAGE WRITES
     # ------------------------------------------------------------------
 
     async def _add_message(self, msg: ContextMessage) -> ContextMessage:
+        # Backfill an accurate token count if the caller didn't provide one.
+        if not msg.tokens:
+            msg.tokens = self._estimate_message_tokens_full(msg)
         async with self._lock:
             self.messages.append(msg)
             self._trim_messages()
@@ -197,10 +211,6 @@ class ContextManager:
         content: str,
         context: Optional[Dict[str, Any]] = None,
     ) -> ContextMessage:
-        # Agent owns the user-turn write. This guard only protects against
-        # a duplicate write from the same code path (last message equals
-        # the incoming content). It is intentionally NOT a general dedupe:
-        # a user asking the same thing twice in a row must not be dropped.
         if (
             self.messages
             and self.messages[-1].role == "user"
@@ -265,8 +275,6 @@ class ContextManager:
             pinned + kept, key=lambda m: m.timestamp
         )
 
-        # Drop orphan tool messages (a `tool` with no preceding assistant
-        # tool_call, or an assistant tool_call with missing results).
         try:
             from agent.context.runtime import normalize_messages
             normalize_messages(self)
@@ -298,7 +306,9 @@ class ContextManager:
         except Exception:
             return str(result)
 
-    def get_recent_tool_outputs(self, n: Optional[int] = None):
+    def get_recent_tool_outputs(
+        self, n: Optional[int] = None
+    ) -> List[Dict[str, Any]]:
         recent = list(self.tool_outputs)[-(n or self.recent_tool_outputs):]
         return [
             {
@@ -361,7 +371,6 @@ class ContextManager:
                 ):
                     parent = unpinned[i - 1]
                     ids = self._tool_call_ids(parent)
-                    # Collect the assistant + all matching tool results.
                     group: List[ContextMessage] = [parent]
                     j = i
                     while (
@@ -373,8 +382,6 @@ class ContextManager:
                         j += 1
                     if len(selected) + len(group) <= self.recent_messages:
                         selected[0:0] = group
-                    # Advance past the whole group. -1 moves to the
-                    # assistant we just consumed.
                     i -= len(group)
                     continue
             selected.insert(0, m)
@@ -429,7 +436,6 @@ class ContextManager:
         """
         Seed messages[] from a Session's history. Called on resume so the
         model's context matches what the transcript shows the user.
-        Returns the number of messages imported.
         """
         if session is None:
             return 0
@@ -441,7 +447,6 @@ class ContextManager:
         if not entries:
             return 0
 
-        # Keep the last N entries to respect the context window.
         entries = entries[-max(self.recent_messages * 2, 40):]
 
         async with self._lock:
@@ -451,7 +456,6 @@ class ContextManager:
                 content = getattr(e, "content", "") or ""
                 metadata: Dict[str, Any] = {}
 
-                # Rehydrate tool-call metadata for assistant tool turns.
                 if role == "assistant":
                     tcalls = getattr(e, "metadata", {}) or {}
                     if "tool_calls" in tcalls:
@@ -460,19 +464,19 @@ class ContextManager:
                     metadata["tool_call_id"] = getattr(e, "tool_call_id", None)
                     metadata["name"] = getattr(e, "tool_name", None)
 
-                self.messages.append(
-                    ContextMessage(
-                        role=role,
-                        content=content,
-                        tokens=getattr(e, "tokens", 0)
-                        or self._estimate_tokens(content),
-                        timestamp=getattr(e, "timestamp", time.time()),
-                        metadata=metadata,
-                        pinned=bool(getattr(e, "pinned", False)),
-                    )
+                msg = ContextMessage(
+                    role=role,
+                    content=content,
+                    tokens=getattr(e, "tokens", 0)
+                    or self._estimate_tokens(content),
+                    timestamp=getattr(e, "timestamp", time.time()),
+                    metadata=metadata,
+                    pinned=bool(getattr(e, "pinned", False)),
                 )
+                if not msg.tokens:
+                    msg.tokens = self._estimate_message_tokens_full(msg)
+                self.messages.append(msg)
 
-            # Drop orphans so the first request is well-formed.
             try:
                 from agent.context.runtime import normalize_messages
                 normalize_messages(self)

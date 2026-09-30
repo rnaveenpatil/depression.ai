@@ -39,6 +39,42 @@ Omit:
 Output only the summary, no preamble."""
 
 
+def _estimate_message_tokens(message: Any) -> int:
+    """
+    Estimated cost of a single message, counting content AND any
+    tool_calls metadata. Shared by manager.py and Compactor so the two
+    modules agree on what a message costs.
+    """
+    cached = getattr(message, "tokens", 0)
+    if cached:
+        return int(cached)
+
+    total = _estimate_str_tokens(getattr(message, "content", "") or "")
+
+    tool_calls = getattr(message, "tool_calls", None)
+    if tool_calls:
+        try:
+            total += _estimate_str_tokens(json.dumps(tool_calls, default=str))
+        except (TypeError, ValueError):
+            total += len(str(tool_calls)) // 4
+
+    tool_call_id = getattr(message, "tool_call_id", None)
+    if tool_call_id:
+        total += _estimate_str_tokens(str(tool_call_id))
+
+    name = getattr(message, "name", None)
+    if name:
+        total += _estimate_str_tokens(str(name))
+
+    return total
+
+
+def _estimate_str_tokens(text: str) -> int:
+    if not text:
+        return 0
+    return max(1, len(text) // 4)
+
+
 class Compactor:
     """Context compaction engine."""
 
@@ -229,9 +265,7 @@ class Compactor:
 
         added: List[Any] = []
         for m in reversed(candidates):
-            t = getattr(m, "tokens", 0) or self._estimate_str_tokens(
-                getattr(m, "content", "")
-            )
+            t = getattr(m, "tokens", 0) or _estimate_message_tokens(m)
             if t <= budget:
                 added.append(m)
                 budget -= t
@@ -283,11 +317,9 @@ class Compactor:
         for m in messages:
             t = getattr(m, "tokens", 0)
             if not t:
-                t = self._estimate_str_tokens(getattr(m, "content", ""))
+                t = _estimate_message_tokens(m)
             total += t
         return total
 
     def _estimate_str_tokens(self, text: str) -> int:
-        if not text:
-            return 0
-        return max(1, len(text) // 4)
+        return _estimate_str_tokens(text)

@@ -1,8 +1,9 @@
-"""Runtime helpers for OpenCode-style message integrity.
+"""Runtime helpers for message integrity.
 
 The ContextManager is the only persistent conversation store. This module
-adapts its ContextMessage records to provider Message objects and guarantees
-that assistant tool calls and their tool results are kept as atomic groups.
+adapts its ContextMessage records to provider Message objects and
+guarantees that assistant tool calls and their tool results stay as
+atomic groups through trimming, compaction, and provider serialization.
 """
 from __future__ import annotations
 
@@ -12,46 +13,60 @@ from typing import Any, List
 from agent.llm.provider import Message
 
 
-def _tool_calls(message: Any) -> list[dict]:
+def _tool_calls(message: Any) -> List[dict]:
     calls = (getattr(message, "metadata", {}) or {}).get("tool_calls") or []
     return list(calls)
 
 
+def _result_ids_for(messages: List[Any]) -> set:
+    out: set = set()
+    for m in messages:
+        if getattr(m, "role", "") != "tool":
+            continue
+        tid = str((getattr(m, "metadata", {}) or {}).get("tool_call_id") or "")
+        if tid:
+            out.add(tid)
+    return out
+
+
 def normalize_messages(context_manager: Any) -> None:
-    """Remove orphan tool messages/calls after trimming or compaction."""
+    """
+    Repair the message list after trimming or compaction.
+
+    Policy:
+      - An assistant message with tool_calls is kept REGARDLESS of whether
+        every tool result is present. Losing the assistant turn is worse
+        than losing a tool result — the model would forget it ever tried.
+      - A tool result whose tool_call_id has no matching assistant call is
+        dropped (providers reject orphan tool messages).
+      - A tool result whose tool_call_id belongs to an assistant call that
+        IS present is kept.
+    """
     messages = list(getattr(context_manager, "messages", []) or [])
     if not messages:
         return
 
-    valid: list[Any] = []
-    i = 0
-    while i < len(messages):
-        msg = messages[i]
-        role = getattr(msg, "role", "")
-        if role == "assistant" and _tool_calls(msg):
-            calls = _tool_calls(msg)
-            ids = {str(c.get("id")) for c in calls if c.get("id")}
-            results: list[Any] = []
-            j = i + 1
-            while j < len(messages) and getattr(messages[j], "role", "") == "tool":
-                tid = str((getattr(messages[j], "metadata", {}) or {}).get("tool_call_id") or "")
-                if tid:
-                    results.append(messages[j])
-                j += 1
-            result_ids = {
-                str((getattr(r, "metadata", {}) or {}).get("tool_call_id"))
-                for r in results
-            }
-            if ids and ids.issubset(result_ids):
-                valid.append(msg)
-                valid.extend(results)
-            i = j
-            continue
+    # First pass: collect the set of tool_call ids that any assistant message
+    # in this list references.
+    referenced_ids: set = set()
+    for m in messages:
+        if getattr(m, "role", "") == "assistant":
+            for c in _tool_calls(m):
+                cid = c.get("id")
+                if cid:
+                    referenced_ids.add(str(cid))
+
+    valid: List[Any] = []
+    for m in messages:
+        role = getattr(m, "role", "")
         if role == "tool":
-            i += 1
+            tid = str((getattr(m, "metadata", {}) or {}).get("tool_call_id") or "")
+            if tid and tid in referenced_ids:
+                valid.append(m)
+            # else: orphan tool result — drop it
             continue
-        valid.append(msg)
-        i += 1
+        # assistant (with or without tool_calls), user, system — keep
+        valid.append(m)
 
     context_manager.messages = valid
 
@@ -71,7 +86,13 @@ def _to_provider_message(cm: Any) -> Message:
 
 
 def get_model_messages(context_manager: Any, limit: int = 40) -> List[Message]:
-    """Build provider messages without splitting a tool-call group."""
+    """
+    Build provider messages without splitting a tool-call group.
+
+    An "atomic group" is an assistant message carrying tool_calls plus all
+    of its adjacent tool result messages. Groups are always kept whole or
+    dropped whole.
+    """
     normalize_messages(context_manager)
     messages = list(getattr(context_manager, "messages", []) or [])
 
@@ -106,7 +127,9 @@ def get_model_messages(context_manager: Any, limit: int = 40) -> List[Message]:
     return [_to_provider_message(m) for m in system + selected]
 
 
-async def add_tool_call(context_manager: Any, content: str | None, tool_calls: list[Any]) -> None:
+async def add_tool_call(
+    context_manager: Any, content: str | None, tool_calls: List[Any]
+) -> None:
     payload = []
     for call in tool_calls:
         payload.append({
