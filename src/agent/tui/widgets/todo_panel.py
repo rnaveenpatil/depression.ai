@@ -13,11 +13,21 @@ Header shows `X/Y done`. Polls the shared TodoTool store every 0.5s.
 The colour of the DONE glyph is bright green (not dim) so it stands out
 against pending items. The task title for done items is dimmed so the
 list reads as "these are behind us".
+
+NOTE
+----
+The session is resolved *lazily on every refresh* rather than being
+captured at construction time. `DepressionApp.compose()` builds this
+panel before `on_mount` runs, and at that point `coordinator.build_agent`
+/ `plan_agent` may not yet have a `.session` attached. Caching the
+session up-front produced a `_session_key` that never matched the one
+used by `TodoTool` / the plan-update handler, so the panel read from an
+empty bucket and rendered nothing.
 """
 
 from __future__ import annotations
 
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from textual.app import ComposeResult
 from textual.containers import Vertical
@@ -44,6 +54,12 @@ _GLYPH = {
 }
 
 
+def _esc(text: Any) -> str:
+    if text is None:
+        return ""
+    return str(text).replace("[", r"\[")
+
+
 class TodoPanel(Vertical):
     DEFAULT_CSS = f"""
     TodoPanel {{
@@ -57,12 +73,15 @@ class TodoPanel(Vertical):
     }}
     """
 
-    def __init__(self, session: Any = None, **kwargs: Any):
+    def __init__(self, app_ref: Any = None, session: Any = None, **kwargs: Any):
         super().__init__(**kwargs)
+        # Prefer the app reference so we can re-resolve the live session
+        # on each tick. `session` is kept as a fallback for standalone use.
+        self._app = app_ref
         self._session = session
         self._store: Dict[str, Any] = {}
-        self._header: Static | None = None
-        self._body: Static | None = None
+        self._header: Optional[Static] = None
+        self._body: Optional[Static] = None
         self._last_render = ""
 
     def compose(self) -> ComposeResult:
@@ -74,48 +93,105 @@ class TodoPanel(Vertical):
         yield self._body
 
     def on_mount(self) -> None:
-        self._resolve_store()
+        self._refresh()
         self.set_interval(0.5, self._refresh)
 
-    def _resolve_store(self) -> None:
-        try:
-            from agent.tools.todo import TodoTool
-            sid = TodoTool._session_key(self._session)
-            self._store = TodoTool._strong_keys.get(sid, {})
-        except Exception:
-            self._store = {}
+    # ------------------------------------------------------------------
+    # Session / store resolution
+    # ------------------------------------------------------------------
+
+    def _current_session(self) -> Any:
+        """Ask the app for the live session each time; fall back to the
+        snapshot captured at construction."""
+        if self._app is not None:
+            try:
+                live = self._app._session()  # type: ignore[attr-defined]
+                if live is not None:
+                    return live
+            except Exception:
+                pass
+        return self._session
+
+    def _resolve_store(self) -> Dict[str, Any]:
+        from agent.tools.todo import TodoTool
+
+        session = self._current_session()
+        sid = TodoTool._session_key(session)
+        store = TodoTool._strong_keys.get(sid)
+
+        # If the exact session-key lookup misses, fall back to the most
+        # recently used bucket. This handles the case where the panel is
+        # polling before the agent has attached its session, and prevents
+        # the "silent empty" mode.
+        if not store:
+            try:
+                candidates = [
+                    v for v in TodoTool._strong_keys.values() if v
+                ]
+                if len(candidates) == 1:
+                    store = candidates[0]
+            except Exception:
+                store = None
+
+        self._store = store or {}
+        return self._store
+
+    # ------------------------------------------------------------------
+    # Render
+    # ------------------------------------------------------------------
 
     def _refresh(self) -> None:
         if self._body is None:
             return
-        self._resolve_store()
-
-        items: List[Any] = sorted(
-            self._store.values(),
-            key=lambda i: (i.status != "in_progress", i.priority, i.created_at),
-        )
+        try:
+            self._resolve_store()
+            items: List[Any] = sorted(
+                self._store.values(),
+                key=lambda i: (
+                    getattr(i, "status", "pending") != "in_progress",
+                    getattr(i, "priority", 3),
+                    getattr(i, "created_at", 0),
+                ),
+            )
+        except Exception as exc:
+            # Surface the failure instead of dying silently inside the
+            # interval callback.
+            self._paint(f"[{ERROR}]todo error: {_esc(exc)}[/]")
+            return
 
         if not items:
-            markup = f"[{DIM}]no tasks yet[/]"
-        else:
-            done = sum(1 for i in items if i.status in ("done", "completed"))
-            total = len(items)
-            lines = [f"[{MUTED}]{done}/{total} done[/]", ""]
-            for it in items:
-                glyph, color = _GLYPH.get(it.status, ("○", MUTED))
-                title = str(it.title).replace("[", r"\[")
-                if len(title) > 32:
-                    title = title[:29] + "…"
-                if it.status in ("done", "completed"):
-                    lines.append(
-                        f"[{color}]{glyph}[/] [{DIM}][strike]{title}[/strike][/]"
-                    )
-                elif it.status == "in_progress":
-                    lines.append(f"[{color}]{glyph}[/] [{GREEN_GLOW}]{title}[/]")
-                else:
-                    lines.append(f"[{color}]{glyph}[/] [{TEXT}]{title}[/]")
-            markup = "\n".join(lines)
+            self._paint(f"[{DIM}]no tasks yet[/]")
+            return
 
-        if markup != self._last_render:
-            self._last_render = markup
+        done = sum(
+            1 for i in items
+            if getattr(i, "status", "") in ("done", "completed")
+        )
+        total = len(items)
+        lines = [f"[{MUTED}]{done}/{total} done[/]", ""]
+        for it in items:
+            status = getattr(it, "status", "pending")
+            glyph, color = _GLYPH.get(status, ("○", MUTED))
+            title = _esc(getattr(it, "title", "") or "")
+            if len(title) > 32:
+                title = title[:29] + "…"
+            if status in ("done", "completed"):
+                lines.append(
+                    f"[{color}]{glyph}[/] [{DIM}][strike]{title}[/strike][/]"
+                )
+            elif status == "in_progress":
+                lines.append(f"[{color}]{glyph}[/] [{GREEN_GLOW}]{title}[/]")
+            else:
+                lines.append(f"[{color}]{glyph}[/] [{TEXT}]{title}[/]")
+
+        self._paint("\n".join(lines))
+
+    def _paint(self, markup: str) -> None:
+        # NOTE: must not be named `_render` — Textual's Widget._render()
+        # is an internal hook called with no arguments and returning a
+        # Visual, so shadowing it crashes every repaint of this panel.
+        if markup == self._last_render:
+            return
+        self._last_render = markup
+        if self._body is not None:
             self._body.update(markup)

@@ -77,6 +77,11 @@ IGNORED_DIRS = {
 class ProjectContext:
     """
     Detects and summarizes the project structure.
+
+    Scanning is bounded by:
+      - max_depth    (default 5)
+      - max_files    (default 5000)
+      - max_seconds  (default 3.0)   ← new: wall-clock cap on the walk
     """
 
     def __init__(self, workspace: Any):
@@ -84,7 +89,12 @@ class ProjectContext:
         self.root: Optional[Path] = self._resolve_root()
         self._cache: Optional[Dict[str, Any]] = None
         self._cache_time: float = 0.0
-        self._cache_ttl: float = 60.0  # seconds
+        self._cache_ttl: float = 60.0
+
+        # Scan bounds.
+        self._max_depth: int = 5
+        self._max_files: int = 5000
+        self._max_seconds: float = 3.0
 
     def _resolve_root(self) -> Optional[Path]:
         try:
@@ -99,12 +109,10 @@ class ProjectContext:
     # ------------------------------------------------------------------
 
     async def refresh(self) -> Dict[str, Any]:
-        """Force a re-scan"""
         self._cache = None
         return await self.get_summary(force=True)
 
     async def get_summary(self, force: bool = False) -> Dict[str, Any]:
-        """Return a cached summary of the project"""
         now = time.time()
         if not force and self._cache and (now - self._cache_time) < self._cache_ttl:
             return self._cache
@@ -122,27 +130,37 @@ class ProjectContext:
         if not self.root or not self.root.exists():
             return {"root": None, "error": "project root not found"}
 
+        deadline = time.monotonic() + self._max_seconds
+        truncated_scan = False
+
         lang_counts: Dict[str, int] = {}
         file_count = 0
         total_size = 0
         top_level_entries: List[str] = []
 
         try:
-            top_level_entries = sorted([
-                e.name for e in self.root.iterdir()
-                if not e.name.startswith(".")
-            ])[:30]
+            top_level_entries = sorted(
+                e.name for e in self.root.iterdir() if not e.name.startswith(".")
+            )[:30]
         except Exception:
             top_level_entries = []
 
-        # Walk the tree (bounded)
         for dirpath, dirnames, filenames in os.walk(self.root):
-            # Prune ignored directories in-place
-            dirnames[:] = [d for d in dirnames if d not in IGNORED_DIRS and not d.startswith(".")]
+            # Stop early if we've spent too long.
+            if time.monotonic() >= deadline:
+                truncated_scan = True
+                break
 
-            # Depth limit: stop at 5 levels deep
-            rel = Path(dirpath).relative_to(self.root)
-            if len(rel.parts) > 5:
+            dirnames[:] = [
+                d for d in dirnames
+                if d not in IGNORED_DIRS and not d.startswith(".")
+            ]
+
+            try:
+                rel = Path(dirpath).relative_to(self.root)
+            except Exception:
+                rel = Path(".")
+            if len(rel.parts) > self._max_depth:
                 dirnames[:] = []
                 continue
 
@@ -152,16 +170,18 @@ class ProjectContext:
                 lang = LANG_EXT.get(ext)
                 if lang:
                     lang_counts[lang] = lang_counts.get(lang, 0) + 1
-
                 try:
                     total_size += (Path(dirpath) / fn).stat().st_size
                 except Exception:
                     pass
 
-            if file_count > 5000:  # safety cap
+                if file_count > self._max_files:
+                    truncated_scan = True
+                    break
+
+            if file_count > self._max_files:
                 break
 
-        # Detect project types via marker files
         detected_types: List[str] = []
         for lang, markers in PROJECT_MARKERS.items():
             for marker in markers:
@@ -177,7 +197,6 @@ class ProjectContext:
         if lang_counts:
             primary_lang = max(lang_counts.items(), key=lambda x: x[1])[0]
 
-        # Metadata extraction
         metadata = self._extract_metadata(detected_types)
 
         return {
@@ -185,23 +204,22 @@ class ProjectContext:
             "name": self.root.name,
             "detected_types": detected_types,
             "primary_language": primary_lang,
-            "language_counts": dict(sorted(
-                lang_counts.items(), key=lambda x: -x[1]
-            )[:10]),
+            "language_counts": dict(
+                sorted(lang_counts.items(), key=lambda x: -x[1])[:10]
+            ),
             "file_count": file_count,
             "total_size_bytes": total_size,
             "top_level_entries": top_level_entries,
             "metadata": metadata,
             "scanned_at": time.time(),
+            "truncated_scan": truncated_scan,
         }
 
     def _extract_metadata(self, detected_types: List[str]) -> Dict[str, Any]:
-        """Extract dependency / script info from common project files"""
         meta: Dict[str, Any] = {}
         if not self.root:
             return meta
 
-        # Python
         pyproject = self.root / "pyproject.toml"
         if pyproject.exists():
             try:
@@ -218,7 +236,6 @@ class ProjectContext:
             except Exception:
                 pass
 
-        # Node
         pkg = self.root / "package.json"
         if pkg.exists():
             try:
@@ -234,7 +251,6 @@ class ProjectContext:
             except Exception:
                 pass
 
-        # Rust
         cargo = self.root / "Cargo.toml"
         if cargo.exists():
             try:
@@ -250,7 +266,6 @@ class ProjectContext:
             except Exception:
                 pass
 
-        # Go
         gomod = self.root / "go.mod"
         if gomod.exists():
             try:
@@ -267,7 +282,6 @@ class ProjectContext:
     # ------------------------------------------------------------------
 
     async def as_prompt(self, max_chars: int = 1500) -> str:
-        """Return a compact, LLM-friendly summary string"""
         summary = await self.get_summary()
         parts = []
 

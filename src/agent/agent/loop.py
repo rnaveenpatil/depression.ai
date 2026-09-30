@@ -53,6 +53,7 @@ class LoopContext:
     tokens_used: int = 0
     input_tokens: int = 0
     output_tokens: int = 0
+    llm_calls: int = 0
     cost: float = 0.0
     errors: List[str] = field(default_factory=list)
     metadata: Dict[str, Any] = field(default_factory=dict)
@@ -76,6 +77,7 @@ class LoopContext:
             "tokens_used": self.tokens_used,
             "input_tokens": self.input_tokens,
             "output_tokens": self.output_tokens,
+            "llm_calls": self.llm_calls,
             "cost": self.cost,
             "errors": len(self.errors),
             "duration": time.time() - self.start_time,
@@ -127,8 +129,7 @@ class AgentLoop:
         self._project_ctx_ts = 0.0
         self._system_prompt_cache: Optional[str] = None
 
-        # Checklist tracking.
-        self._checklist_rendered = False           # inline block printed once
+        self._checklist_rendered = False
         self._last_checklist_signature: Optional[tuple] = None
 
     @property
@@ -200,6 +201,7 @@ class AgentLoop:
 
     async def _classify_intent(self, query: str) -> str:
         try:
+            self.context.llm_calls += 1
             response = await self.llm.complete(
                 messages=[
                     Message(
@@ -422,6 +424,7 @@ class AgentLoop:
         while local_turns < max_local_turns:
             local_turns += 1
             try:
+                self.context.llm_calls += 1
                 response = await self.llm.complete_with_tools(
                     messages=messages,
                     tools=self._get_available_tools(),
@@ -510,6 +513,7 @@ class AgentLoop:
         qa: str,
     ) -> Dict[str, Any]:
         try:
+            self.context.llm_calls += 1
             response = await self.llm.complete(
                 messages=[
                     Message(
@@ -567,6 +571,7 @@ class AgentLoop:
         body = "\n".join(bullets) if bullets else "(no tasks executed)"
 
         try:
+            self.context.llm_calls += 1
             response = await self.llm.complete(
                 messages=[
                     Message(role="system", content=system_prompt),
@@ -659,11 +664,11 @@ class AgentLoop:
 
             "## Planning — VERY IMPORTANT\n"
             "For any request that needs 2 or more steps, your FIRST response "
-
             "MUST start with a checklist so the user knows what you are about "
-            "and tell the user whats problem you identifed in evry step and what action you re taking next"
-            "to do. This is not optional. Use this exact format — a markdown "
-            "checkbox list, one line per step, nothing else on those lines:\n\n"
+            "to do. For each step, identify the problem you found and the "
+            "action you are taking next. This is not optional. Use this exact "
+            "format — a markdown checkbox list, one line per step, nothing "
+            "else on those lines:\n\n"
             "    - [ ] first step\n"
             "    - [ ] second step\n"
             "    - [ ] third step\n\n"
@@ -931,6 +936,7 @@ class AgentLoop:
                 )
             )
 
+        self.context.llm_calls += 1
         response = await self.llm.complete_with_tools(
             messages=messages,
             tools=self._get_available_tools(),
@@ -949,6 +955,7 @@ class AgentLoop:
                     content="Please provide your answer now, or call a tool if you still need information.",
                 )
             ]
+            self.context.llm_calls += 1
             response = await self.llm.complete_with_tools(
                 messages=retry_messages,
                 tools=self._get_available_tools(),
@@ -960,10 +967,6 @@ class AgentLoop:
 
         self._record_usage(getattr(response, "usage", None))
 
-        # Parse a checklist from the model's text. Emit:
-        #   - render=True the FIRST time we see a valid checklist (inline block)
-        #   - render=False on any later emission with a different signature
-        #     (sidebar updates in place, no duplicate inline block)
         if content and not calls:
             try:
                 from agent.tui.plan_parser import parse_plan_from_text
@@ -1013,7 +1016,14 @@ class AgentLoop:
     def _record_usage(self, usage: Any) -> None:
         u = usage or {}
         if not isinstance(u, dict):
-            u = getattr(u, "__dict__", {}) or {}
+            # Try dataclass / namedtuple style first, then attributes.
+            u = getattr(u, "__dict__", None) or {}
+            if not u:
+                u = {
+                    "prompt_tokens": int(getattr(usage, "prompt_tokens", 0) or 0),
+                    "completion_tokens": int(getattr(usage, "completion_tokens", 0) or 0),
+                    "total_tokens": int(getattr(usage, "total_tokens", 0) or 0),
+                }
         prompt = int(u.get("prompt_tokens", 0) or 0)
         completion = int(u.get("completion_tokens", 0) or 0)
         total = int(u.get("total_tokens", 0) or 0) or (prompt + completion)
@@ -1119,8 +1129,8 @@ class AgentLoop:
 
         if isinstance(out, str) and out.strip():
             return out.strip()
-        if isinstance(out, (dict, list)):
-            return json.dumps(out, ensure_ascii=False, default=str)
+        # Do not return raw JSON as if it were the model's answer. Fall
+        # through to a real final-response turn instead.
         return None
 
     # ------------------------------------------------------------------
@@ -1318,6 +1328,7 @@ class AgentLoop:
         )
 
         try:
+            self.context.llm_calls += 1
             response = await self.llm.complete(
                 messages=messages,
                 temperature=0.3,
@@ -1348,6 +1359,7 @@ class AgentLoop:
                 "iterations": self.context.iteration,
                 "tool_calls": len(self.completed_tool_calls),
                 "tokens": self.context.tokens_used,
+                "llm_calls": self.context.llm_calls,
                 "errors": len(self.context.errors),
                 "intent": self.context.intent,
             }
@@ -1393,6 +1405,7 @@ class AgentLoop:
             "errors": len(self.context.errors),
             "duration": time.time() - self.context.start_time,
             "intent": self.context.intent,
+            "llm_calls": self.context.llm_calls,
         }
 
     def add_event_handler(self, event: str, handler: Callable) -> None:

@@ -2,8 +2,10 @@
 from __future__ import annotations
 
 import asyncio
+import os as _os
 import re
 import threading
+import time
 from typing import Any, Optional
 
 import httpx
@@ -40,6 +42,9 @@ MODE_ORDER = ["build", "plan"]
 
 DEFAULT_TURN_TIMEOUT = 900.0
 
+# Panel identifiers used by the sidebar and the slash commands.
+_PANEL_NAMES = ("llm", "aws", "context", "todo", "llmcost", "help")
+
 
 def _esc(text: Any) -> str:
     """Escape a value for safe embedding inside a Textual markup string."""
@@ -48,12 +53,31 @@ def _esc(text: Any) -> str:
     return str(text).replace("[", r"\[")
 
 
-def _fmt(n: int) -> str:
+def _fmt(n: Any) -> str:
     """Format an integer with thousands separators."""
     try:
         return f"{int(n):,}"
     except Exception:
         return "0"
+
+
+def _fmt_cost(v: Any) -> str:
+    try:
+        return f"${float(v):.4f}"
+    except Exception:
+        return "$0.0000"
+
+
+def _shorten_path(path: str, max_len: int = 32) -> str:
+    """Middle-ellipsis a long path so the tail stays readable."""
+    if not path:
+        return "—"
+    if len(path) <= max_len:
+        return path
+    # Keep the leading ~ or / and the last two segments.
+    head_len = max(4, max_len - 24)
+    tail_len = max_len - head_len - 1
+    return f"{path[:head_len]}…{path[-tail_len:]}"
 
 
 # ======================================================================
@@ -165,6 +189,233 @@ class ContextPanel(Vertical):
 
 
 # ======================================================================
+# LLM COST PANEL
+# ======================================================================
+
+class LLMCostPanel(Vertical):
+    """
+    Live view of tokens, API calls, and cost for the current query and
+    for the whole session.
+
+    Data sources:
+      - Session counters come from `coordinator.get_status()` (accumulated
+        on `AgentContext` by `Agent._run_query_pipeline`).
+      - Per-query counters come from the active `AgentLoop.context` (reset
+        at the top of every `run()`).
+    """
+
+    DEFAULT_CSS = f"""
+    LLMCostPanel {{
+        width: 100%; height: auto;
+        padding: 0 1;
+        background: {BG};
+    }}
+    LLMCostPanel .label  {{ color: {MUTED}; height: 1; }}
+    LLMCostPanel .value  {{ color: {TEXT}; height: 1; }}
+    LLMCostPanel .head   {{ color: {GREEN}; text-style: bold; height: 1; margin: 1 0 0 0; }}
+    LLMCostPanel .accent {{ color: {GREEN_GLOW}; height: 1; }}
+    LLMCostPanel .dim    {{ color: {DIM}; height: 1; }}
+    """
+
+    def __init__(self, app_ref: "DepressionApp", **kwargs: Any):
+        super().__init__(**kwargs)
+        self._app = app_ref
+        # Cached per-query values so the tick can update duration without
+        # re-reading the whole loop each frame.
+        self._query_start_ts: float = 0.0
+        self._query_active: bool = False
+
+    def compose(self) -> ComposeResult:
+        yield Static(f"[bold {GREEN}]▌ LLM COST[/]", markup=True)
+
+        # ---- environment ----
+        yield Static("dir", classes="label")
+        yield Static("", id="cost-dir", classes="value")
+        yield Static("data", classes="label")
+        yield Static("", id="cost-data", classes="value")
+
+        # ---- model / session ----
+        yield Static("model", classes="label")
+        yield Static("", id="cost-model", classes="value")
+        yield Static("provider", classes="label")
+        yield Static("", id="cost-provider", classes="value")
+        yield Static("session", classes="label")
+        yield Static("", id="cost-session", classes="value")
+
+        # ---- current query ----
+        yield Static("── this query ──", classes="head")
+        yield Static("", id="cost-q-in",    classes="value")
+        yield Static("", id="cost-q-out",   classes="value")
+        yield Static("", id="cost-q-total", classes="accent")
+        yield Static("", id="cost-q-calls", classes="value")
+        yield Static("", id="cost-q-tools", classes="value")
+        yield Static("", id="cost-q-dur",   classes="value")
+
+        # ---- session totals ----
+        yield Static("── session ──", classes="head")
+        yield Static("", id="cost-s-in",    classes="value")
+        yield Static("", id="cost-s-out",   classes="value")
+        yield Static("", id="cost-s-total", classes="accent")
+        yield Static("", id="cost-s-calls", classes="value")
+        yield Static("", id="cost-s-tools", classes="value")
+        yield Static("", id="cost-s-turns", classes="value")
+        yield Static("", id="cost-s-cost",  classes="value")
+
+    def on_mount(self) -> None:
+        self.refresh_values()
+        # Duration ticks once a second while a query is in flight.
+        self.set_interval(1.0, self._tick_duration)
+
+    # ------------------------------------------------------------------
+
+    def _coordinator_status(self) -> dict:
+        try:
+            if self._app.coordinator is not None:
+                return self._app.coordinator.get_status() or {}
+        except Exception:
+            pass
+        return {}
+
+    def _loop_context(self) -> Any:
+        try:
+            if self._app.coordinator is not None:
+                agent = self._app.coordinator.get_current_agent()
+                return getattr(agent, "loop", None) and agent.loop.context
+        except Exception:
+            pass
+        return None
+
+    def _tick_duration(self) -> None:
+        if not self._query_active:
+            return
+        try:
+            self.query_one("#cost-q-dur", Static).update(
+                f"[{MUTED}]duration[/]  [{TEXT}]"
+                f"{time.time() - self._query_start_ts:.1f}s[/]"
+            )
+        except Exception:
+            pass
+
+    def mark_query_start(self) -> None:
+        self._query_start_ts = time.time()
+        self._query_active = True
+
+    def mark_query_end(self) -> None:
+        self._query_active = False
+
+    # ------------------------------------------------------------------
+
+    def refresh_values(self) -> None:
+        status = self._coordinator_status()
+
+        # ---- environment ----
+        project_dir = str(status.get("project_dir") or "")
+        data_dir = str(status.get("data_dir") or "")
+        try:
+            self.query_one("#cost-dir", Static).update(
+                f"[{TEXT}]{_esc(_shorten_path(project_dir))}[/]"
+            )
+            self.query_one("#cost-data", Static).update(
+                f"[{TEXT}]{_esc(_shorten_path(data_dir))}[/]"
+            )
+        except Exception:
+            pass
+
+        # ---- model / session ----
+        model = status.get("model") or "—"
+        provider = status.get("provider") or "—"
+        session_id = status.get("session_id") or "—"
+        if len(str(model)) > 30:
+            model = str(model)[:29] + "…"
+        if len(str(session_id)) > 16:
+            session_id = str(session_id)[:16]
+        try:
+            self.query_one("#cost-model", Static).update(
+                f"[{TEXT}]{_esc(model)}[/]"
+            )
+            self.query_one("#cost-provider", Static).update(
+                f"[{TEXT}]{_esc(provider)}[/]"
+            )
+            self.query_one("#cost-session", Static).update(
+                f"[{TEXT}]{_esc(session_id)}[/]"
+            )
+        except Exception:
+            pass
+
+        # ---- current query ----
+        ctx = self._loop_context()
+        if ctx is not None:
+            qi = int(getattr(ctx, "input_tokens", 0) or 0)
+            qo = int(getattr(ctx, "output_tokens", 0) or 0)
+            qt = int(getattr(ctx, "tokens_used", 0) or 0) or (qi + qo)
+            qc = int(getattr(ctx, "llm_calls", 0) or 0)
+            qtools = len(getattr(ctx, "actions_taken", []) or [])
+            qdur = time.time() - float(getattr(ctx, "start_time", time.time()))
+        else:
+            qi = qo = qt = qc = qtools = 0
+            qdur = 0.0
+
+        try:
+            self.query_one("#cost-q-in", Static).update(
+                f"[{MUTED}]in[/]      [{TEXT}]{_fmt(qi)}[/]"
+            )
+            self.query_one("#cost-q-out", Static).update(
+                f"[{MUTED}]out[/]     [{TEXT}]{_fmt(qo)}[/]"
+            )
+            self.query_one("#cost-q-total", Static).update(
+                f"[{MUTED}]total[/]   [{GREEN}]{_fmt(qt)}[/]"
+            )
+            self.query_one("#cost-q-calls", Static).update(
+                f"[{MUTED}]api calls[/]  [{AMBER}]{_fmt(qc)}[/]"
+            )
+            self.query_one("#cost-q-tools", Static).update(
+                f"[{MUTED}]tool calls[/] [{TEXT}]{_fmt(qtools)}[/]"
+            )
+            self.query_one("#cost-q-dur", Static).update(
+                f"[{MUTED}]duration[/]  [{TEXT}]{qdur:.1f}s[/]"
+            )
+        except Exception:
+            pass
+
+        # ---- session totals ----
+        si = int(status.get("input_tokens", 0) or 0)
+        so = int(status.get("output_tokens", 0) or 0)
+        st = int(status.get("tokens_used", 0) or 0) or (si + so)
+        sc = int(status.get("llm_calls", 0) or 0)
+        stools = int(status.get("tools_used", {}) and sum(status.get("tools_used", {}).values()) or 0)
+        # tools_used is a dict of {tool: count}; sum gives total tool calls.
+        if stools == 0:
+            stools = int(status.get("metrics", {}).get("total_tool_calls", 0) or 0)
+        sturns = int(status.get("turn_count", 0) or 0)
+        scost = status.get("cost", 0.0) or 0.0
+
+        try:
+            self.query_one("#cost-s-in", Static).update(
+                f"[{MUTED}]in[/]      [{TEXT}]{_fmt(si)}[/]"
+            )
+            self.query_one("#cost-s-out", Static).update(
+                f"[{MUTED}]out[/]     [{TEXT}]{_fmt(so)}[/]"
+            )
+            self.query_one("#cost-s-total", Static).update(
+                f"[{MUTED}]total[/]   [{GREEN}]{_fmt(st)}[/]"
+            )
+            self.query_one("#cost-s-calls", Static).update(
+                f"[{MUTED}]api calls[/]  [{AMBER}]{_fmt(sc)}[/]"
+            )
+            self.query_one("#cost-s-tools", Static).update(
+                f"[{MUTED}]tool calls[/] [{TEXT}]{_fmt(stools)}[/]"
+            )
+            self.query_one("#cost-s-turns", Static).update(
+                f"[{MUTED}]turns[/]     [{TEXT}]{_fmt(sturns)}[/]"
+            )
+            self.query_one("#cost-s-cost", Static).update(
+                f"[{MUTED}]cost[/]      [{GREEN_GLOW}]{_fmt_cost(scost)}[/]"
+            )
+        except Exception:
+            pass
+
+
+# ======================================================================
 # HELP PANEL
 # ======================================================================
 
@@ -188,6 +439,7 @@ class HelpPanel(Vertical):
         yield Static("/aws       open AWS panel", classes="help-row")
         yield Static("/context   open context panel", classes="help-row")
         yield Static("/todo      open todo panel", classes="help-row")
+        yield Static("/llmcost   open token + api cost panel", classes="help-row")
         yield Static("/plan      switch mode → plan", classes="help-row")
         yield Static("/build     switch mode → build", classes="help-row")
         yield Static("/clear     clear transcript", classes="help-row")
@@ -425,7 +677,6 @@ class DepressionApp(App):
         self._is_shutting_down = False
         self._has_messages = False
 
-        import os as _os
         try:
             self.turn_timeout = float(
                 _os.environ.get("TUI_TURN_TIMEOUT", DEFAULT_TURN_TIMEOUT)
@@ -454,7 +705,11 @@ class DepressionApp(App):
                     ("llm", LLMPanel(self, id="panel-llm")),
                     ("aws", AWSPanel(self, id="panel-aws")),
                     ("context", ContextPanel(self, id="panel-context")),
-                    ("todo", TodoPanel(session=self._session(), id="panel-todo")),
+                    # Pass the app, not a session snapshot — TodoPanel
+                    # re-resolves the live session on every poll so its
+                    # session-key matches the one the tool writes under.
+                    ("todo", TodoPanel(app_ref=self, id="panel-todo")),
+                    ("llmcost", LLMCostPanel(self, id="panel-llmcost")),
                     ("help", HelpPanel(id="panel-help")),
                 ],
                 id="sidebar",
@@ -509,6 +764,7 @@ class DepressionApp(App):
         self.query_one("#prompt", Input).focus()
         self._refresh_aws_status()
         self._refresh_token_bar()
+        self._refresh_llmcost_panel()
 
     def _wire_events(self) -> None:
         if self._event_handlers_registered:
@@ -556,6 +812,7 @@ class DepressionApp(App):
         self.call_after_refresh(lambda: transcript.scroll_end(animate=False))
 
         self._sync_tokens_from_loop()
+        self._refresh_llmcost_panel()
 
         if tool in ("aws",) or tool.startswith("mcp__aws__"):
             try:
@@ -569,11 +826,6 @@ class DepressionApp(App):
             pass
 
     async def _on_plan_updated(self, event: AgentEvent) -> None:
-        """
-        The model wrote a checklist in its response. Mirror it into the
-        shared TodoTool store so the sidebar updates live, and — only the
-        first time — render an inline 'plan' block in the transcript.
-        """
         if self._is_shutting_down:
             return
         data = event.payload or {}
@@ -602,6 +854,13 @@ class DepressionApp(App):
                     status=status,
                     priority=prio_map.get(str(e.get("priority") or "medium"), 3),
                 )
+
+            # Nudge the panel so it re-reads the freshly written store
+            # now instead of waiting for its next 0.5s tick.
+            try:
+                self.query_one("#panel-todo", TodoPanel)._refresh()
+            except Exception:
+                pass
         except Exception:
             pass
 
@@ -612,7 +871,6 @@ class DepressionApp(App):
         self._write(self._render_plan_block(entries), "agent")
 
     def _render_plan_block(self, entries: list) -> str:
-        """Format the checklist as a single markup block, colour-coded."""
         glyph_map = {
             "pending":     ("○", MUTED),
             "in_progress": ("▶", AMBER),
@@ -682,6 +940,12 @@ class DepressionApp(App):
     def _refresh_token_bar(self) -> None:
         try:
             self.query_one("#token-bar", Static).update(self._token_bar())
+        except Exception:
+            pass
+
+    def _refresh_llmcost_panel(self) -> None:
+        try:
+            self.query_one("#panel-llmcost", LLMCostPanel).refresh_values()
         except Exception:
             pass
 
@@ -796,7 +1060,7 @@ class DepressionApp(App):
 
     def _set_active_panel(self, which: str) -> None:
         self._active_panel = which
-        for name in ("llm", "aws", "context", "todo", "help"):
+        for name in _PANEL_NAMES:
             try:
                 self.query_one(f"#panel-{name}").display = (name == which)
             except Exception:
@@ -812,6 +1076,13 @@ class DepressionApp(App):
             self._refresh_context_panel()
         if which == "aws":
             self._refresh_aws_status()
+        if which == "llmcost":
+            self._refresh_llmcost_panel()
+        if which == "todo":
+            try:
+                self.query_one("#panel-todo", TodoPanel)._refresh()
+            except Exception:
+                pass
 
     def _show_panel(self, which: str) -> None:
         self._set_active_panel(which)
@@ -924,6 +1195,12 @@ class DepressionApp(App):
         self.live_total_tokens = 0
         self._refresh_token_bar()
 
+        # Mark the query start on the cost panel so duration ticks.
+        try:
+            self.query_one("#panel-llmcost", LLMCostPanel).mark_query_start()
+        except Exception:
+            pass
+
         self._agent_worker = self._run_agent(text)
 
     def _slash(self, text: str) -> None:
@@ -947,6 +1224,8 @@ class DepressionApp(App):
             self._show_panel("context")
         elif command == "/todo":
             self._show_panel("todo")
+        elif command == "/llmcost":
+            self._show_panel("llmcost")
         elif command == "/help":
             self._show_panel("help")
         elif command == "/clear":
@@ -1062,6 +1341,11 @@ class DepressionApp(App):
             self._refresh_mode_chip()
             self._refocus_prompt()
             self._refresh_token_bar()
+            try:
+                self.query_one("#panel-llmcost", LLMCostPanel).mark_query_end()
+                self._refresh_llmcost_panel()
+            except Exception:
+                pass
             self._schedule_drain()
 
     def _schedule_drain(self) -> None:
@@ -1121,6 +1405,7 @@ class DepressionApp(App):
             status.update(f"connected · {_esc(model)}")
             self._refresh_mode_chip()
             self._refresh_context_panel()
+            self._refresh_llmcost_panel()
             self._system(f"LLM connected: {_esc(base_url)} · {_esc(model)}")
         except Exception as exc:
             status.update(f"error: {_esc(exc)}")
@@ -1238,6 +1523,10 @@ class DepressionApp(App):
         self.busy = False
         self._set_busy_visual(False)
         self._refresh_mode_chip()
+        try:
+            self.query_one("#panel-llmcost", LLMCostPanel).mark_query_end()
+        except Exception:
+            pass
 
     def action_cancel(self) -> None:
         if isinstance(self.screen, PermissionModal):

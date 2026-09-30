@@ -54,6 +54,9 @@ class AgentContext:
     conversation_id: str = ""
     turn_count: int = 0
     tokens_used: int = 0
+    input_tokens: int = 0
+    output_tokens: int = 0
+    llm_calls: int = 0
     cost: float = 0.0
     tool_calls: int = 0
     tasks_completed: int = 0
@@ -115,6 +118,7 @@ class Agent:
             "total_tokens": 0,
             "avg_response_time": 0.0,
             "total_tool_calls": 0,
+            "total_llm_calls": 0,
             "success_rate": 1.0,
         }
 
@@ -132,16 +136,12 @@ class Agent:
 
             self.llm = get_llm_registry()
 
-            # If the user has saved a runtime connection, it was already
-            # installed by the TUI bootstrap; nothing to do here.
-            # Otherwise the registry stays empty until /connect is used.
             if not self.llm.has_model():
                 logger.warning(
                     "No model connected. The agent will run without a model "
                     "until the user pastes one via the TUI /connect panel."
                 )
 
-            # Tools
             from agent.tools.registry import ToolRegistry
             from agent.tools import (
                 TerminalTool, FileSystemTool, SearchTool, GitTool,
@@ -207,7 +207,6 @@ class Agent:
                         handler=lambda name=fn["name"], **kw: self.mcp_client.call_tool(name, kw),
                     )
 
-            # Planner
             from agent.agent.planner import Planner
             self.planner = Planner(
                 llm=self.llm,
@@ -216,7 +215,6 @@ class Agent:
                 fallback_chain=getattr(self, "_fallback_chain", None),
             )
 
-            # Loop
             from agent.agent.loop import AgentLoop
             self.loop = AgentLoop(
                 agent=self,
@@ -226,24 +224,20 @@ class Agent:
                 config=self.config.get("loop", {}) or {},
             )
 
-            # Subagents
             from agent.agent.subagent import SubAgentManager
             self.subagent_manager = SubAgentManager(
                 agent=self, config=self.config.get("subagent", {}) or {},
             )
             await self.subagent_manager.initialize()
 
-            # Plugins
             from agent.plugins.loader import get_plugin_loader
             self.plugin_loader = get_plugin_loader(
                 agent=self, config=self.config.get("plugins", {}) or {},
             )
             await self.plugin_loader.initialize()
 
-            # Restore state
             await self._load_state()
 
-            # Wire permission prompt into input handler ONLY if no callback set
             if (
                 self.permission_manager
                 and getattr(self.permission_manager, "confirm_callback", None) is None
@@ -316,7 +310,9 @@ class Agent:
                 if self.context_manager:
                     live_context = await self.context_manager.get_context()
 
-                self._resolve_temperature(query)
+                # Record the current turn's LLM call counter so we can
+                # attribute the delta to this query.
+                llm_calls_before = self.context.llm_calls
 
                 result = await self.loop.run(
                     query=query,
@@ -336,9 +332,22 @@ class Agent:
 
                 elapsed = time.time() - start
                 ctx_summary = result.get("context", {}) or {}
-                tokens = ctx_summary.get("tokens_used", 0)
+
+                # Accumulate token counts.
+                tokens = ctx_summary.get("tokens_used", 0) or 0
+                input_tokens = ctx_summary.get("input_tokens", 0) or 0
+                output_tokens = ctx_summary.get("output_tokens", 0) or 0
+                llm_calls = ctx_summary.get("llm_calls", 0) or 0
+                cost = ctx_summary.get("cost", 0.0) or 0.0
+
                 self.context.tokens_used += tokens
+                self.context.input_tokens += input_tokens
+                self.context.output_tokens += output_tokens
+                self.context.llm_calls += llm_calls
+                self.context.cost += cost
                 self.metrics["total_tokens"] += tokens
+                self.metrics["total_llm_calls"] += llm_calls
+
                 self.context.tool_calls += result.get("tool_calls", 0)
                 self.metrics["total_tool_calls"] += result.get("tool_calls", 0)
 
@@ -615,16 +624,36 @@ class Agent:
         if self.llm:
             current_model = self.llm.get_current_model()
             current_provider = self.llm.get_current_provider()
+
+        # Project directory and data directory for the TUI display.
+        project_dir = ""
+        data_dir = ""
+        try:
+            if self.workspace is not None:
+                project_dir = str(getattr(self.workspace, "project_dir", ""))
+        except Exception:
+            project_dir = ""
+        try:
+            from agent.utils.platform import get_data_dir
+            data_dir = str(get_data_dir("agent"))
+        except Exception:
+            data_dir = ""
+
         return {
             "status": self.status.value,
             "session_id": self.session.id if self.session else "",
             "turn_count": self.context.turn_count,
             "tasks_completed": self.context.tasks_completed,
             "tokens_used": self.context.tokens_used,
+            "input_tokens": self.context.input_tokens,
+            "output_tokens": self.context.output_tokens,
+            "llm_calls": self.context.llm_calls,
             "cost": self.context.cost,
             "uptime": time.time() - self.context.start_time,
             "model": current_model,
             "provider": current_provider,
+            "project_dir": project_dir,
+            "data_dir": data_dir,
             "metrics": dict(self.metrics),
             "tools_used": dict(self.context.tools_used),
             "tool_count": len(self.tool_registry.list_tools()) if self.tool_registry else 0,
