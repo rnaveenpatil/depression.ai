@@ -4,12 +4,12 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "depression.ai"
-version = "1.0.0"
+version = "1.0.1"
 description = "AI agent for everything — development, deployment, and analysis"
 readme = "README.md"
-license = "ISC"
+license = "MIT kundapura"
 authors = [{name = "rnaveenpatil", email = "rnaveenpatil@example.com"}]
-keywords = ["ai", "cli", "agent", "tui", "textual", "llm"]
+keywords = ["ai", "cli", "agent", "tui", "textual", "aws"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
