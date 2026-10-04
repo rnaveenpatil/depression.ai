@@ -1072,7 +1072,7 @@ class DepressionApp(App):
             return
 
         self._show_transcript()
-        self._write(self._render_plan_block(entries), "agent")
+        self._write(self._render_plan_block(entries), "agent", markup=True)
 
     def _render_plan_block(self, entries: list) -> str:
         glyph_map = {
@@ -1320,7 +1320,20 @@ class DepressionApp(App):
         clean = self._CTRL_RE.sub("", str(text))
         return clean.replace("[", r"\[")
 
-    def _write(self, text: str, cls: str = "agent") -> None:
+    def _strip_ctrl(self, text: str) -> str:
+        """Drop control characters but leave markup brackets intact."""
+        return self._CTRL_RE.sub("", str(text))
+
+    def _write(self, text: str, cls: str = "agent", markup: bool = False) -> None:
+        """Mount a line into the transcript.
+
+        By default ``text`` is treated as raw output: control characters are
+        stripped and ``[`` is escaped so tool/LLM output such as ``[INFO]``
+        or JSON ``[0]`` renders literally. Pass ``markup=True`` when the
+        caller has already built a Textual markup string (escaping its own
+        dynamic parts) -- brackets are then preserved so the styles show
+        instead of the raw tags leaking into the transcript.
+        """
         if self._is_shutting_down:
             return
         self._show_transcript()
@@ -1328,8 +1341,9 @@ class DepressionApp(App):
             transcript = self.query_one("#transcript", VerticalScroll)
         except Exception:
             return
+        safe = self._strip_ctrl(text) if markup else self._sanitize(text)
         try:
-            transcript.mount(Static(self._sanitize(text), classes=cls, markup=True))
+            transcript.mount(Static(safe, classes=cls, markup=True))
         except Exception:
             transcript.mount(Static(str(text), classes=cls, markup=False))
         self.call_after_refresh(
@@ -1369,7 +1383,7 @@ class DepressionApp(App):
         )
 
     def _agent_head(self) -> None:
-        self._write(f"[bold {GREEN}]◆ depression.ai[/]", "agent-head")
+        self._write(f"[bold {GREEN}]◆ depression.ai[/]", "agent-head", markup=True)
 
     def _refocus_prompt(self) -> None:
         try:
@@ -1398,7 +1412,7 @@ class DepressionApp(App):
             self._refresh_mode_chip()
             preview = text if len(text) <= 60 else text[:60] + "…"
             self._queued(
-                f"queued ({len(self._prompt_queue)} ahead): {_esc(preview)}"
+                f"queued ({len(self._prompt_queue)} ahead): {preview}"
             )
             return
 
@@ -1535,7 +1549,7 @@ class DepressionApp(App):
                 self._refresh_context_panel()
                 self._refresh_mode_chip()
             else:
-                self._error(_esc(str(result.get("error", "agent request failed"))))
+                self._error(str(result.get("error", "agent request failed")))
         except asyncio.TimeoutError:
             mins = self.turn_timeout / 60.0
             self._error(
@@ -1545,7 +1559,7 @@ class DepressionApp(App):
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            self._error(f"agent error: {_esc(exc)}")
+            self._error(f"agent error: {exc}")
         finally:
             self.busy = False
             self._set_busy_visual(False)
@@ -1617,7 +1631,7 @@ class DepressionApp(App):
             self._refresh_mode_chip()
             self._refresh_context_panel()
             self._refresh_llmcost_panel()
-            self._system(f"LLM connected: {_esc(base_url)} · {_esc(model)}")
+            self._system(f"LLM connected: {base_url} · {model}")
         except Exception as exc:
             status.update(f"error: {_esc(exc)}")
 
@@ -1648,7 +1662,7 @@ class DepressionApp(App):
                 status.update(
                     f"discovered {len(ids)} model(s); selected {_esc(ids[0])}"
                 )
-                self._system("models: " + _esc(", ".join(ids[:12])))
+                self._system("models: " + ", ".join(ids[:12]))
             else:
                 status.update("/models returned no model IDs")
         except Exception as exc:

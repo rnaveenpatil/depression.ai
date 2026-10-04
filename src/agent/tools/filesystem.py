@@ -372,7 +372,7 @@ class FileSystemTool(BaseTool):
         data = content.encode("utf-8")
 
         def _do_write() -> None:
-            with open(target, mode, "wb") as f:
+            with open(target, f"{mode}b") as f:
                 f.write(data)
 
         try:

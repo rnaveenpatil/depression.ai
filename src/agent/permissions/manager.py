@@ -138,19 +138,25 @@ def _looks_destructive(tool: str, action: str, params: Dict[str, Any]) -> Tuple[
                 if pat.search(val):
                     return True, f"{key} matches destructive pattern '{pat.pattern}'"
 
-    # Git action strings like "reset_hard", "clean -f", "branch -D"
-    git_action = params.get("action")
-    if isinstance(git_action, str):
-        ga = git_action.lower()
+    # Git action strings like "reset_hard", "clean -f", "branch -D".
+    # Consult the explicit ``action`` argument as well as ``params``: callers
+    # pass the inferred action positionally, and for tools whose action is
+    # inferred from the tool name it is absent from ``params`` entirely.
+    # Reading only ``params`` would let a destructive action run unprompted.
+    for cand in (action, params.get("action")):
+        if not isinstance(cand, str):
+            continue
+        ga = cand.lower()
         if ga in ("delete", "remove", "reset", "clean", "drop", "prune",
                   "delete_branch", "deletebranch", "branch_delete",
                   "reset_hard", "reset-hard", "clean_force", "clean-force"):
             return True, f"git action '{ga}' is destructive"
 
-    # Filesystem action strings
-    fs_action = params.get("action")
-    if isinstance(fs_action, str):
-        fa = fs_action.lower()
+    # Filesystem action strings (same reasoning as above).
+    for cand in (action, params.get("action")):
+        if not isinstance(cand, str):
+            continue
+        fa = cand.lower()
         if fa in ("delete", "remove", "rm", "unlink", "rmdir", "purge", "wipe"):
             return True, f"filesystem action '{fa}' is destructive"
 
@@ -601,7 +607,20 @@ class PermissionManager:
         }
 
     def _infer_action(self, tool: str, params: Dict[str, Any]) -> str:
-        """Best-effort action inference."""
+        """Best-effort action inference.
+
+        Unified tools (`filesystem`, `git`, ...) dispatch on an explicit
+        ``action`` param rather than encoding it in the tool name, so that
+        param is the strongest signal and must win over name matching.
+        Otherwise `filesystem.delete` would be inferred as a generic
+        "execute", which both mislabels the prompt and makes the session
+        cache key collide across different operations on the same path.
+        """
+        for key in ("action", "operation", "op"):
+            explicit = params.get(key)
+            if isinstance(explicit, str) and explicit.strip():
+                return explicit.strip().lower()
+
         t = tool.lower()
         if "read" in t or t in ("filesystem_read",):
             return "read"

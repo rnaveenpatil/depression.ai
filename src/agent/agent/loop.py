@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import inspect
 import json
 import time
 from collections import deque
@@ -161,6 +162,143 @@ class AgentLoop:
     def model_context(self):
         return self.agent.context_manager
 
+    # ------------------------------------------------------------------
+    # REGISTRY CAPABILITY PROBES
+    # ------------------------------------------------------------------
+    # The loop is constructed with a *duck-typed* registry: the real
+    # ToolRegistry, a slimmed-down registry used by sub-agents, or a stub
+    # in tests. Never assume ``is_read_only`` / ``mutation_epoch`` exist --
+    # reaching for them unconditionally is what turned a missing attribute
+    # into a spurious "tool call failed" for every tool invocation.
+
+    def _is_read_only(self, name: str) -> bool:
+        """Return True only if the registry positively says the tool is read-only.
+
+        A missing registry or a registry without ``is_read_only`` yields
+        ``False`` (treat as mutating), which is the safe default: mutating
+        tools are never cached and always invalidate the cache.
+        """
+        registry = self.tool_registry
+        probe = getattr(registry, "is_read_only", None)
+        if not callable(probe):
+            return False
+        try:
+            return bool(probe(name))
+        except Exception:
+            logger.debug("is_read_only(%s) probe failed", name, exc_info=True)
+            return False
+
+    def _registry_epoch(self) -> int:
+        """Return the registry mutation epoch, or 0 when unavailable."""
+        epoch = getattr(self.tool_registry, "mutation_epoch", 0)
+        try:
+            return int(epoch)
+        except (TypeError, ValueError):
+            return 0
+
+    def _registry_list_tools(self) -> List[str]:
+        """Return registered tool names, or ``[]`` when unavailable.
+
+        Accepts a real registry (``list_tools()``), a test stub that only
+        exposes a ``tools`` mapping, or ``None``.
+        """
+        probe = getattr(self.tool_registry, "list_tools", None)
+        if callable(probe):
+            try:
+                return list(probe())
+            except Exception:
+                logger.debug("list_tools probe failed", exc_info=True)
+        tools = getattr(self.tool_registry, "tools", None)
+        if isinstance(tools, dict):
+            return list(tools)
+        return []
+
+    def _registry_has_tool(self, name: str) -> bool:
+        """Best-effort ``has_tool`` that never raises."""
+        probe = getattr(self.tool_registry, "has_tool", None)
+        if callable(probe):
+            try:
+                return bool(probe(name))
+            except Exception:
+                logger.debug("has_tool(%s) probe failed", name, exc_info=True)
+        return name in self._registry_list_tools()
+
+    def _registry_describe_for_prompt(self, tools: Any) -> str:
+        """Render the tool list for the system prompt.
+
+        Falls back to a minimal Markdown list built from the schemas when
+        the registry does not implement ``describe_for_prompt``.
+        """
+        probe = getattr(self.tool_registry, "describe_for_prompt", None)
+        if callable(probe):
+            try:
+                return str(probe(tools))
+            except Exception:
+                logger.debug("describe_for_prompt probe failed", exc_info=True)
+        lines: List[str] = []
+        for item in tools or []:
+            if not isinstance(item, dict):
+                continue
+            fn = item.get("function") if isinstance(item.get("function"), dict) else item
+            name = fn.get("name") or ""
+            desc = fn.get("description") or ""
+            if name:
+                lines.append(f"- {name}: {desc}".rstrip(": ").strip())
+        return "\n".join(lines) if lines else "(no tools available)"
+
+    def _registry_get_schemas(self) -> List[Dict[str, Any]]:
+        """Return tool schemas, narrowed by intent when supported."""
+        for attr, with_intent in (("select_for_task", True), ("get_schemas", False)):
+            probe = getattr(self.tool_registry, attr, None)
+            if not callable(probe):
+                continue
+            try:
+                raw = probe(self.context.intent) if with_intent else probe()
+                return list(raw)
+            except Exception:
+                logger.debug("%s probe failed", attr, exc_info=True)
+        return []
+
+    async def _registry_execute(self, name: str, args: Dict[str, Any]) -> Any:
+        """Execute a tool through whichever registry API is available.
+
+        Prefers ``execute_safe`` (permission-checked, exception-shielded),
+        falls back to ``execute``, then to the agent's own
+        ``execute_tool`` (the path taken when the loop is handed a registry
+        stub), and only then degrades to a structured failure rather than
+        raising ``AttributeError`` when no executor exists at all.
+        """
+        probe = getattr(self.tool_registry, "execute_safe", None)
+        if not callable(probe):
+            probe = getattr(self.tool_registry, "execute", None)
+
+        target = probe
+        if not callable(target):
+            # A stub or slimmed-down registry has no execute API, but the
+            # agent itself can still run tools -- use it instead of failing
+            # every call with a bogus "no registry" error.
+            target = getattr(self.agent, "execute_tool", None)
+            if not callable(target):
+                return {
+                    "success": False,
+                    "tool": name,
+                    "error": "no tool registry configured for this loop",
+                    "recoverable": True,
+                }
+        try:
+            result = target(name, args)
+            if inspect.isawaitable(result):
+                result = await result
+            return result
+        except Exception as exc:
+            logger.error("Tool %s failed: %s", name, exc, exc_info=True)
+            return {
+                "success": False,
+                "tool": name,
+                "error": str(exc),
+                "recoverable": True,
+            }
+
     # ==================================================================
     # PUBLIC ENTRY
     # ==================================================================
@@ -177,7 +315,7 @@ class AgentLoop:
         self.pending_tool_calls = []
         self.completed_tool_calls = []
         self.tool_result_cache.clear()
-        self._cache_epoch = self.tool_registry.mutation_epoch
+        self._cache_epoch = self._registry_epoch()
         self.should_stop = False
         self.is_paused = False
         self._project_ctx = None
@@ -735,7 +873,7 @@ class AgentLoop:
 
     async def _system_prompt_fingerprint(self) -> tuple:
         try:
-            tools = tuple(sorted(self.tool_registry.list_tools()))
+            tools = tuple(sorted(self._registry_list_tools()))
         except Exception:
             tools = ()
         try:
@@ -991,7 +1129,7 @@ Never claim success without evidence.
             + env_block
             + aws_block
             + "\n\n## Available Tools\n"
-            + self.tool_registry.describe_for_prompt(self._get_available_tools())
+            + self._registry_describe_for_prompt(self._get_available_tools())
             + "\n\n## Project\n"
             + json.dumps(project, indent=2, default=str)
             + "\n\n## Permissions\n"
@@ -1027,7 +1165,7 @@ Never claim success without evidence.
                 try:
                     for t in mcp_client.list_tools():
                         name = t.get("function", {}).get("name", "")
-                        if name.startswith("mcp__aws__") and self.tool_registry.has_tool(name):
+                        if name.startswith("mcp__aws__") and self._registry_has_tool(name):
                             mcp_aws_tools.append(name)
                 except Exception:
                     mcp_aws_tools = []
@@ -1212,7 +1350,7 @@ Never claim success without evidence.
         return {
             "max_tasks": 20,
             "timeout": self.default_timeout,
-            "available_tools": self.tool_registry.list_tools(),
+            "available_tools": self._registry_list_tools(),
             "intent": intent,
         }
 
@@ -1419,10 +1557,8 @@ Never claim success without evidence.
     # ==================================================================
 
     def _get_available_tools(self) -> List[Dict[str, Any]]:
-        try:
-            return self.tool_registry.select_for_task(self.context.intent)
-        except Exception:
-            return self.tool_registry.get_schemas()
+        """Tools the model may call: registry schemas, narrowed by intent."""
+        return self._registry_get_schemas()
 
     async def _get_state_context(self) -> Dict[str, Any]:
         return {
@@ -1469,8 +1605,6 @@ Never claim success without evidence.
         tool_name = getattr(calls[0], "name", "")
         if tool_name in ("question",):
             return None
-        if not self.tool_registry.is_read_only(tool_name):
-            return None
 
         outcome = results[0].get("result") or {}
         if not isinstance(outcome, dict) or not outcome.get("success", False):
@@ -1489,7 +1623,12 @@ Never claim success without evidence.
             else:
                 out = f"Result written to {outcome['path']}"
 
-        if isinstance(out, str) and len(out.strip()) >= 40:
+        # Any non-empty readable output proves the call succeeded; the
+        # fast path returns it directly instead of spending a second LLM
+        # turn re-summarising what the tool already reported. (An earlier
+        # 40-char floor suppressed the fast path for short but perfectly
+        # valid outputs such as "ok".)
+        if isinstance(out, str) and out.strip():
             return out.strip()
         return None
 
@@ -1530,7 +1669,7 @@ Never claim success without evidence.
             try:
                 key = f"{name}:{json.dumps(args, sort_keys=True, default=str)}"
                 cache_entry = None
-                if self.enable_caching and self.tool_registry.is_read_only(name):
+                if self.enable_caching and self._is_read_only(name):
                     cache_entry = self.tool_result_cache.get(key)
 
                 if (
@@ -1557,7 +1696,7 @@ Never claim success without evidence.
                     continue
 
                 start = time.time()
-                result = await self.tool_registry.execute_safe(name, args)
+                result = await self._registry_execute(name, args)
                 elapsed = time.time() - start
 
                 if not isinstance(result, dict):
@@ -1578,7 +1717,7 @@ Never claim success without evidence.
                 if (
                     self.enable_caching
                     and result.get("success", False)
-                    and self.tool_registry.is_read_only(name)
+                    and self._is_read_only(name)
                 ):
                     self.tool_result_cache[key] = {
                         "result": result, "timestamp": time.time(),
@@ -1642,7 +1781,7 @@ Never claim success without evidence.
 
     def _maybe_invalidate_cache(self) -> None:
         """Drop the cache if any mutating tool has run since we last checked."""
-        current = self.tool_registry.mutation_epoch
+        current = self._registry_epoch()
         if current != self._cache_epoch:
             if self.tool_result_cache:
                 logger.debug(
@@ -1825,7 +1964,7 @@ Never claim success without evidence.
         self.pending_tool_calls = []
         self.completed_tool_calls = []
         self.tool_result_cache.clear()
-        self._cache_epoch = self.tool_registry.mutation_epoch
+        self._cache_epoch = self._registry_epoch()
         self.should_stop = False
         self.is_paused = False
         self.state = LoopState.IDLE
