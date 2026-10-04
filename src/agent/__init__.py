@@ -36,4 +36,6 @@ __all__ = [
     "get_llm_registry",
 ]
 
-__version__ = "1.0.0"
+from agent._version import __version__, get_version
+
+__all__ += ["__version__", "get_version"]

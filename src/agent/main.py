@@ -41,6 +41,7 @@ if str(_REPO_ROOT / "src") not in sys.path:
 # IMPORTS
 # ----------------------------------------------------------------------
 from agent.utils.logging import setup_logging, get_logger
+from agent._version import get_version
 from agent.utils.errors import (
     AgentError, ConfigError, format_error, handle_exception,
 )
@@ -69,7 +70,7 @@ from agent.agent.dual_agent import create_dual_agent_system, AgentCoordinator
 logger = get_logger(__name__)
 
 APP_NAME = "depression"
-APP_VERSION = "1.0.0"
+APP_VERSION = get_version()
 
 
 # ======================================================================

@@ -7,6 +7,9 @@ Preference order:
 
 The LLM gets a single tool name to remember; the fallback logic lives
 here so the model never has to guess.
+
+Credential source: EnvManager.get_aws_env(). This is the one canonical
+place all AWS consumers (CLI, boto3, MCP) must read from.
 """
 
 from __future__ import annotations
@@ -20,6 +23,7 @@ from typing import Any, Dict, List, Optional
 
 from agent.tools.registry import BaseTool
 from agent.utils.logging import get_logger
+from agent.utils.env_manager import EnvManager
 
 logger = get_logger(__name__)
 
@@ -97,7 +101,6 @@ class AWSHelperTool(BaseTool):
     # ------------------------------------------------------------------
 
     async def _identity(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        """sts get-caller-identity via MCP first, bash fallback."""
         mcp_attempt = await self._try_mcp(
             tool_name="mcp__aws__call_aws",
             arguments={
@@ -125,7 +128,6 @@ class AWSHelperTool(BaseTool):
     async def _call(self, params: Dict[str, Any]) -> Dict[str, Any]:
         prefer = params.get("prefer", "auto")
 
-        # Explicit MCP tool call
         if params.get("mcp_tool"):
             return await self._try_mcp(
                 tool_name=str(params["mcp_tool"]),
@@ -133,11 +135,9 @@ class AWSHelperTool(BaseTool):
                 prefer=prefer,
             )
 
-        # Standard service+operation call
         service = params.get("service")
         operation = params.get("operation")
         if service and operation:
-            # Preferred path: MCP's generic call_aws tool
             mcp_attempt = await self._try_mcp(
                 tool_name="mcp__aws__call_aws",
                 arguments={
@@ -180,7 +180,6 @@ class AWSHelperTool(BaseTool):
                 "error": "MCP client not available",
             }
 
-        # Check the tool exists
         try:
             available = {t["function"]["name"] for t in client.list_tools()}
         except Exception as exc:
@@ -221,10 +220,25 @@ class AWSHelperTool(BaseTool):
     # CLI fallback
     # ------------------------------------------------------------------
 
+    def _build_aws_subprocess_env(self, profile: Optional[str] = None) -> Dict[str, str]:
+        """
+        Build the env the AWS CLI subprocess should see.
+
+        = os.environ (updated live by EnvManager)
+        + canonical AWS vars from EnvManager.get_aws_env()   <- always overrides
+        + optional AWS_PROFILE
+        """
+        env = os.environ.copy()
+        env.update(EnvManager.get().get_aws_env())
+        if profile:
+            env["AWS_PROFILE"] = profile
+        return env
+
     async def _run_cli(
         self,
         args: List[str],
         prefer: str = "auto",
+        profile: Optional[str] = None,
     ) -> Dict[str, Any]:
         if prefer == "mcp":
             return {
@@ -242,9 +256,22 @@ class AWSHelperTool(BaseTool):
             }
 
         cmd = ["aws", *args]
-        env = os.environ.copy()  # AWS CLI reads from env chain
+        env = self._build_aws_subprocess_env(profile=profile)
+
+        # Fail fast with a clear message if no creds at all
+        if not env.get("AWS_ACCESS_KEY_ID") and not env.get("AWS_PROFILE"):
+            return {
+                "success": False,
+                "_source": "cli",
+                "error": (
+                    "No AWS credentials available. Add them in the AWS panel "
+                    "or set AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY."
+                ),
+                "command": " ".join(cmd),
+            }
 
         t0 = time.time()
+        proc = None
         try:
             proc = await asyncio.create_subprocess_exec(
                 *cmd,
@@ -257,11 +284,12 @@ class AWSHelperTool(BaseTool):
                 proc.communicate(), timeout=self.timeout
             )
         except asyncio.TimeoutError:
-            try:
-                proc.kill()
-                await asyncio.wait_for(proc.wait(), timeout=2)
-            except Exception:
-                pass
+            if proc is not None:
+                try:
+                    proc.kill()
+                    await asyncio.wait_for(proc.wait(), timeout=2)
+                except Exception:
+                    pass
             return {
                 "success": False,
                 "_source": "cli",
@@ -282,7 +310,6 @@ class AWSHelperTool(BaseTool):
             "duration": time.time() - t0,
         }
 
-        # Try to surface JSON as structured output when possible
         if out.strip().startswith(("{", "[")):
             try:
                 result["json"] = json.loads(out)

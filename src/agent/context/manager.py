@@ -54,11 +54,10 @@ class ContextManager:
     Single source of truth for messages, tool results and context state.
 
     Ownership:
-        - messages[] is the canonical conversation log.
+        - messages[] is the ONLY conversation log fed to the model.
         - tool_outputs is a small ring buffer of recent tool results used
-          for prompt hints. Tool results are ALSO recorded as `tool`
-          messages in messages[]; total_tokens() counts only messages[]
-          to avoid double-counting.
+          for prompt hints. It never feeds the provider request directly;
+          each tool result is ALSO present as a `tool` message.
     """
 
     def __init__(
@@ -83,7 +82,6 @@ class ContextManager:
         self.include_tool_outputs = self.config.get("include_tool_outputs", True)
         self.enable_summarization = self.config.get("enable_summarization", True)
 
-        # Token counter (best effort; falls back to len//4).
         token_counter = None
         try:
             from agent.llm.rate_limiter import TokenCounter
@@ -153,35 +151,66 @@ class ContextManager:
         return max(1, len(text) // 4)
 
     def _estimate_message_tokens_full(self, m: ContextMessage) -> int:
-        """
-        Estimated cost of a single message, counting content AND
-        tool_calls metadata. Delegates to the shared helper in
-        compaction.py so the two modules agree.
-        """
         return _estimate_message_tokens(m)
 
     def total_tokens(self) -> int:
-        """
-        Sum message tokens only. Tool outputs are duplicated as tool
-        messages inside messages[], so counting the buffer would double
-        the total and cause premature compaction.
-        """
+        """Cost of the message log only (tool_outputs is not double-counted)."""
         return sum(
             m.tokens or self._estimate_message_tokens_full(m)
             for m in self.messages
         )
 
-    def usage_pct(self) -> float:
+    def extra_request_tokens(
+        self,
+        system_prompt: Optional[str] = None,
+        tool_schemas: Optional[List[Dict[str, Any]]] = None,
+        state_block: Optional[str] = None,
+    ) -> int:
+        """
+        Cost of everything sent alongside messages[] on every request:
+        system prompt + tool schemas JSON + runtime state block.
+        Callers MUST include this when computing the real budget.
+        """
+        total = 0
+        if system_prompt:
+            total += self._estimate_tokens(system_prompt)
+        if tool_schemas:
+            try:
+                total += self._estimate_tokens(
+                    json.dumps(tool_schemas, default=str)
+                )
+            except Exception:
+                total += 512  # conservative
+        if state_block:
+            total += self._estimate_tokens(state_block)
+        return total
+
+    def real_request_tokens(
+        self,
+        system_prompt: Optional[str] = None,
+        tool_schemas: Optional[List[Dict[str, Any]]] = None,
+        state_block: Optional[str] = None,
+    ) -> int:
+        return self.total_tokens() + self.extra_request_tokens(
+            system_prompt, tool_schemas, state_block
+        )
+
+    def usage_pct(
+        self,
+        system_prompt: Optional[str] = None,
+        tool_schemas: Optional[List[Dict[str, Any]]] = None,
+        state_block: Optional[str] = None,
+    ) -> float:
         if self.max_tokens <= 0:
             return 0.0
-        return min(1.0, float(self.total_tokens()) / float(self.max_tokens))
+        used = self.real_request_tokens(system_prompt, tool_schemas, state_block)
+        return min(1.0, float(used) / float(self.max_tokens))
 
     # ------------------------------------------------------------------
     # MESSAGE WRITES
     # ------------------------------------------------------------------
 
     async def _add_message(self, msg: ContextMessage) -> ContextMessage:
-        # Backfill an accurate token count if the caller didn't provide one.
         if not msg.tokens:
             msg.tokens = self._estimate_message_tokens_full(msg)
         async with self._lock:
@@ -254,9 +283,9 @@ class ContextManager:
 
     def _trim_messages(self) -> None:
         """
-        Cap the message list. Preserves pinned/system + the newest
-        non-pinned messages. After trimming, normalize_messages() drops
-        any orphan tool messages left behind.
+        Cap the message list. Preserves pinned/system + newest non-pinned
+        messages, then REPAIRS the list atomically so no invalid sequence
+        survives.
         """
         if len(self.messages) <= self.max_messages:
             return
@@ -270,16 +299,15 @@ class ContextManager:
 
         keep = max(0, self.max_messages - len(pinned))
         kept = unpinned[-keep:] if keep else []
-
-        self.messages = sorted(
-            pinned + kept, key=lambda m: m.timestamp
-        )
+        self.messages = sorted(pinned + kept, key=lambda m: m.timestamp)
 
         try:
-            from agent.context.runtime import normalize_messages
-            normalize_messages(self)
+            from agent.context.runtime import repair_context
+            repairs = repair_context(self, fill_missing=True)
+            if repairs:
+                logger.debug("trim repair: %d fix(es)", repairs)
         except Exception as e:
-            logger.debug("normalize_messages after trim failed: %s", e)
+            logger.debug("repair_context after trim failed: %s", e)
 
     async def add_tool_output(
         self,
@@ -294,7 +322,8 @@ class ContextManager:
             params=params,
             result=result,
             tokens=self._estimate_tokens(rendered),
-            success=bool(result.get("success", True)) if isinstance(result, dict) else True,
+            success=bool(result.get("success", True))
+            if isinstance(result, dict) else True,
             tool_call_id=tool_call_id,
         )
         self.tool_outputs.append(out)
@@ -339,13 +368,8 @@ class ContextManager:
     # ------------------------------------------------------------------
 
     def _effective_messages(self) -> List[ContextMessage]:
-        """
-        Return pinned + a windowed tail of non-pinned messages, keeping
-        assistant tool_call groups intact. Group reconstruction walks
-        backward from the tail and consumes whole groups in one step.
-        """
-        from agent.context.runtime import normalize_messages
-        normalize_messages(self)
+        from agent.context.runtime import repair_context
+        repair_context(self, fill_missing=True)
 
         msgs = list(self.messages)
         if len(msgs) <= self.recent_messages:
@@ -433,10 +457,6 @@ class ContextManager:
     # ------------------------------------------------------------------
 
     async def load_from_session(self, session: Any) -> int:
-        """
-        Seed messages[] from a Session's history. Called on resume so the
-        model's context matches what the transcript shows the user.
-        """
         if session is None:
             return 0
         history = getattr(session, "history", None)
@@ -478,32 +498,42 @@ class ContextManager:
                 self.messages.append(msg)
 
             try:
-                from agent.context.runtime import normalize_messages
-                normalize_messages(self)
+                from agent.context.runtime import repair_context
+                repair_context(self, fill_missing=True)
             except Exception:
                 pass
 
-        logger.info(
-            "Seeded context from session: %d message(s)", len(self.messages)
-        )
+        logger.info("Seeded context from session: %d message(s)", len(self.messages))
         return len(self.messages)
 
     # ------------------------------------------------------------------
     # COMPACTION
     # ------------------------------------------------------------------
 
-    async def needs_compaction(self) -> bool:
-        return self.usage_pct() >= self.compaction_threshold
+    async def needs_compaction(
+        self,
+        system_prompt: Optional[str] = None,
+        tool_schemas: Optional[List[Dict[str, Any]]] = None,
+        state_block: Optional[str] = None,
+    ) -> bool:
+        return self.usage_pct(system_prompt, tool_schemas, state_block) >= self.compaction_threshold
 
-    async def compact(self, aggressive: bool = False) -> Dict[str, Any]:
-        from agent.context.runtime import normalize_messages
+    async def compact(
+        self,
+        aggressive: bool = False,
+        system_prompt: Optional[str] = None,
+        tool_schemas: Optional[List[Dict[str, Any]]] = None,
+        state_block: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        from agent.context.runtime import repair_context
 
         async with self._lock:
-            normalize_messages(self)
+            repair_context(self, fill_missing=True)
             before = self.total_tokens()
             if not before:
                 return {"compacted": False, "reason": "empty context"}
 
+            extra = self.extra_request_tokens(system_prompt, tool_schemas, state_block)
             target = int(
                 self.max_tokens * (0.35 if aggressive else self.compaction_target)
             )
@@ -512,12 +542,13 @@ class ContextManager:
                 tool_outputs=list(self.tool_outputs),
                 target_tokens=target,
                 current_tokens=before,
+                extra_tokens=extra,
             )
             if not result.get("compacted"):
                 return result
 
             self.messages = result["messages"]
-            normalize_messages(self)
+            repair_context(self, fill_missing=True)
 
             while len(self.tool_outputs) > max(1, self.recent_tool_outputs):
                 self.tool_outputs.popleft()
@@ -533,8 +564,19 @@ class ContextManager:
                 "summaries_created": result.get("summaries_created", 0),
             }
 
-    async def compact_if_needed(self) -> Optional[Dict[str, Any]]:
-        return await self.compact() if await self.needs_compaction() else None
+    async def compact_if_needed(
+        self,
+        system_prompt: Optional[str] = None,
+        tool_schemas: Optional[List[Dict[str, Any]]] = None,
+        state_block: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        if await self.needs_compaction(system_prompt, tool_schemas, state_block):
+            return await self.compact(
+                system_prompt=system_prompt,
+                tool_schemas=tool_schemas,
+                state_block=state_block,
+            )
+        return None
 
     # ------------------------------------------------------------------
     # CLEAR / STATS / SERIALIZATION
@@ -544,8 +586,7 @@ class ContextManager:
         async with self._lock:
             self.messages = (
                 [m for m in self.messages if m.role == "system"]
-                if keep_system
-                else []
+                if keep_system else []
             )
             self.tool_outputs.clear()
             await self.file_context.clear()

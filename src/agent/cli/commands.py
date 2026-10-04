@@ -683,7 +683,7 @@ class CommandProcessor:
             self.ui.print_info(f"\n⏱️  Uptime: {hours}h {minutes}m {seconds}s")
 
     async def cmd_version(self, args: List[str]) -> None:
-        self.ui.print_info("CLI Agent v1.0.0")
+        self.ui.print_info("CLI Agent v1.0.1")
         self.ui.print_info(f"Python: {sys.version.split()[0]}")
 
     # ==================================================================

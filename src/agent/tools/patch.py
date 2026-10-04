@@ -1,10 +1,8 @@
 """
-Patch Tool - Apply unified diffs and structured find-replace patches to files.
+Patch Tool - Apply unified diffs and structured find-replace patches.
 
-Supports:
-    - Unified diff format (--- / +++ / @@ ... @@)
-    - Structured find-replace patches
-    - Dry-run (preview) mode
+Captures the pre-image and post-image (capped at 50 KB per side) so the
+TUI can render an inline diff alongside the result.
 """
 
 from __future__ import annotations
@@ -20,6 +18,9 @@ from agent.utils.logging import get_logger
 logger = get_logger(__name__)
 
 
+DIFF_SIZE_CAP = 50 * 1024
+
+
 class PatchTool(BaseTool):
     name = "patch"
     description = "Apply a unified diff or a structured find-replace patch."
@@ -29,9 +30,8 @@ class PatchTool(BaseTool):
             "action": {
                 "type": "string",
                 "enum": ["apply", "preview"],
-                "description": "apply writes changes; preview shows the diff only",
             },
-            "diff": {"type": "string", "description": "Unified diff text"},
+            "diff": {"type": "string"},
             "patches": {
                 "type": "array",
                 "items": {
@@ -43,6 +43,11 @@ class PatchTool(BaseTool):
                     },
                     "required": ["path", "old", "new"],
                 },
+            },
+            "include_diff": {
+                "type": "boolean",
+                "default": True,
+                "description": "Capture before/after content (capped at 50 KB per side).",
             },
         },
         "required": ["action"],
@@ -63,11 +68,16 @@ class PatchTool(BaseTool):
             return {"success": False, "error": f"Unknown action: {action}"}
 
         dry_run = action == "preview"
+        include_diff = bool(params.get("include_diff", True))
 
         if params.get("patches"):
-            results = await self._apply_structured(params["patches"], dry_run=dry_run)
+            results = await self._apply_structured(
+                params["patches"], dry_run=dry_run, include_diff=include_diff
+            )
         elif params.get("diff"):
-            results = await self._apply_unified(params["diff"], dry_run=dry_run)
+            results = await self._apply_unified(
+                params["diff"], dry_run=dry_run, include_diff=include_diff
+            )
         else:
             return {"success": False, "error": "Provide either 'patches' or 'diff'"}
 
@@ -77,7 +87,10 @@ class PatchTool(BaseTool):
     # ------------------------------------------------------------------
 
     async def _apply_structured(
-        self, patches: List[Dict[str, Any]], dry_run: bool
+        self,
+        patches: List[Dict[str, Any]],
+        dry_run: bool,
+        include_diff: bool = True,
     ) -> List[Dict[str, Any]]:
         results: List[Dict[str, Any]] = []
         for p in patches:
@@ -104,14 +117,19 @@ class PatchTool(BaseTool):
                 updated = text.replace(old, new, 1)
                 if not dry_run:
                     target.write_text(updated, encoding="utf-8")
-                results.append(
-                    {
-                        "success": True,
-                        "path": str(target),
-                        "bytes_before": len(text),
-                        "bytes_after": len(updated),
-                    }
-                )
+                entry: Dict[str, Any] = {
+                    "success": True,
+                    "path": str(target),
+                    "bytes_before": len(text),
+                    "bytes_after": len(updated),
+                }
+                if include_diff:
+                    if len(text) <= DIFF_SIZE_CAP and len(updated) <= DIFF_SIZE_CAP:
+                        entry["before"] = text
+                        entry["after"] = updated
+                    else:
+                        entry["diff_omitted"] = True
+                results.append(entry)
             except Exception as e:
                 results.append(
                     {"success": False, "path": str(path), "error": str(e)}
@@ -119,7 +137,10 @@ class PatchTool(BaseTool):
         return results
 
     async def _apply_unified(
-        self, diff_text: str, dry_run: bool
+        self,
+        diff_text: str,
+        dry_run: bool,
+        include_diff: bool = True,
     ) -> List[Dict[str, Any]]:
         files = self._parse_unified_diff(diff_text)
         results: List[Dict[str, Any]] = []
@@ -158,13 +179,18 @@ class PatchTool(BaseTool):
                 updated = "".join(lines)
                 if not dry_run:
                     target.write_text(updated, encoding="utf-8")
-                results.append(
-                    {
-                        "success": True,
-                        "path": str(target),
-                        "hunks_applied": len(file_hunks["hunks"]),
-                    }
-                )
+                entry: Dict[str, Any] = {
+                    "success": True,
+                    "path": str(target),
+                    "hunks_applied": len(file_hunks["hunks"]),
+                }
+                if include_diff:
+                    if len(text) <= DIFF_SIZE_CAP and len(updated) <= DIFF_SIZE_CAP:
+                        entry["before"] = text
+                        entry["after"] = updated
+                    else:
+                        entry["diff_omitted"] = True
+                results.append(entry)
             except Exception as e:
                 results.append(
                     {"success": False, "path": str(path), "error": str(e)}
@@ -181,10 +207,8 @@ class PatchTool(BaseTool):
                 continue
             if line.startswith("+++ "):
                 raw_path = line[4:].strip()
-                # Strip trailing tab + timestamp if present.
                 if "\t" in raw_path:
                     raw_path = raw_path.split("\t", 1)[0]
-                # Strip leading a/ or b/ prefix used by git.
                 if raw_path.startswith(("a/", "b/")):
                     raw_path = raw_path[2:]
                 current = {"path": raw_path, "hunks": []}
@@ -209,7 +233,7 @@ class PatchTool(BaseTool):
                 continue
             if current_hunk is None:
                 continue
-            if line.startswith("\\"):  # \ No newline at end of file
+            if line.startswith("\\"):
                 continue
             if line.startswith(" "):
                 current_hunk["old_lines"].append(line[1:])

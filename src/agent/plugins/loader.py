@@ -47,6 +47,7 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Set, Tuple
 
 from agent.utils.logging import get_logger
+from agent._version import get_version
 from agent.utils.errors import PluginError
 from agent.plugins.registry import (
     PluginRegistry,
@@ -64,7 +65,7 @@ logger = get_logger(__name__)
 # CONSTANTS
 # ======================================================================
 
-AGENT_VERSION = "1.0.0"
+AGENT_VERSION = get_version()
 
 DEFAULT_PLUGIN_DIRS = [
     Path.cwd() / ".agent" / "plugins",

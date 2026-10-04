@@ -24,6 +24,7 @@ import time
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from agent.utils.logging import get_logger
+from agent._version import get_version
 
 logger = get_logger(__name__)
 
@@ -279,7 +280,8 @@ class UI:
     # HEADER / BANNER
     # ------------------------------------------------------------------
 
-    def print_banner(self, title="CLI AGENT", subtitle="", version="v1.0.0") -> None:
+    def print_banner(self, title="CLI AGENT", subtitle="", version=None) -> None:
+        version = version if version is not None else f"v{get_version()}"
         self._w()
         logo = [
             "  ██████╗██╗     ██╗     █████╗  ██████╗ ███████╗███╗   ██╗████████╗",
@@ -574,7 +576,8 @@ class UI:
     # SPECIAL
     # ------------------------------------------------------------------
 
-    def print_welcome(self, version="v1.0.0", model="—") -> None:
+    def print_welcome(self, version=None, model="—") -> None:
+        version = version if version is not None else f"v{get_version()}"
         self._w()
         self.print_box(
             content=f"Welcome to CLI Agent {version}\nModel: {model}\nType /help for commands, or just type a query.",

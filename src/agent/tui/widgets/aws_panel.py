@@ -11,6 +11,10 @@ Animations:
 Status:
     - MCP status line reflects whether the AWS MCP server is connected
     - Falls back to the AWS CLI banner when MCP is unavailable
+
+Live updates:
+    - Subscribes to EnvManager so external changes refresh the panel
+    - On save, fires `on_aws_changed` so the running agent can reload
 """
 
 from __future__ import annotations
@@ -20,6 +24,8 @@ from typing import Any, Optional
 from textual.app import ComposeResult
 from textual.containers import Horizontal, Vertical
 from textual.widgets import Button, Input, Select, Static
+
+from agent.utils.env_manager import EnvManager
 
 
 GREEN = "#00ff66"
@@ -142,6 +148,9 @@ class AWSPanel(Vertical):
         self._region_static: Optional[Static] = None
         self._mcp_status: Optional[Static] = None
 
+        # Subscribe to EnvManager so external changes refresh this panel.
+        self._env_cb = self._on_env_changed
+
     def compose(self) -> ComposeResult:
         self._title = Static("", markup=True)
         yield self._title
@@ -180,10 +189,60 @@ class AWSPanel(Vertical):
         yield self._mcp_status
 
     def on_mount(self) -> None:
+        # Pull the freshest creds from EnvManager (may differ from app.aws).
+        self._sync_from_env()
+        try:
+            EnvManager.get().subscribe(self._env_cb)
+        except Exception:
+            pass
+
         self._render_title()
         self._render_strength()
         self.refresh_mcp_status()
         self.set_interval(0.12, self._tick)
+
+    def on_unmount(self) -> None:
+        try:
+            EnvManager.get().unsubscribe(self._env_cb)
+        except Exception:
+            pass
+
+    # ------------------------------------------------------------------
+    # env_manager sync
+    # ------------------------------------------------------------------
+
+    def _sync_from_env(self) -> None:
+        """Copy EnvManager's view of AWS creds into the app state."""
+        try:
+            creds = EnvManager.get().get_aws_credentials()
+        except Exception:
+            return
+        if not isinstance(getattr(self._app, "aws", None), dict):
+            return
+        if creds.get("access_key"):
+            self._app.aws["access_key"] = creds["access_key"]
+        if creds.get("secret_key"):
+            self._app.aws["secret_key"] = creds["secret_key"]
+        if creds.get("region"):
+            self._app.aws["region"] = creds["region"]
+
+    def _on_env_changed(self, snapshot: dict) -> None:
+        """EnvManager notified us that creds changed (e.g. another panel)."""
+        try:
+            if not isinstance(getattr(self._app, "aws", None), dict):
+                return
+            if snapshot.get("access_key"):
+                self._app.aws["access_key"] = snapshot["access_key"]
+            if snapshot.get("secret_key"):
+                self._app.aws["secret_key"] = snapshot["secret_key"]
+            if snapshot.get("region"):
+                self._app.aws["region"] = snapshot["region"]
+        except Exception:
+            return
+        try:
+            self.refresh_values()
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------
     # animations
@@ -331,10 +390,8 @@ class AWSPanel(Vertical):
     # ------------------------------------------------------------------
 
     def refresh_mcp_status(self) -> None:
-        """Reflect whether the AWS MCP server is available."""
         if self._mcp_status is None:
             return
-
         line = self._compute_mcp_status()
         self._mcp_status.update(line)
 
@@ -431,3 +488,63 @@ class AWSPanel(Vertical):
         self._render_title()
         self._render_strength()
         self.refresh_mcp_status()
+
+    # ------------------------------------------------------------------
+    # SAVE — the actual fix for bug 1 and 7
+    # ------------------------------------------------------------------
+
+    def save_credentials(self) -> dict:
+        """
+        Read inputs, persist via EnvManager (which updates os.environ and
+        notifies subscribers), then trigger agent reload.
+
+        Returns {"ok": bool, "error": Optional[str]}.
+        """
+        try:
+            access_key = self.query_one("#aws-key", Input).value.strip()
+        except Exception:
+            access_key = ""
+        try:
+            secret_input = self.query_one("#aws-secret", Input)
+            secret_key = secret_input.value.strip()
+            # If the field still shows the placeholder, keep the existing key.
+            if secret_key == "••••••••":
+                secret_key = self._app.aws.get("secret_key") or ""
+        except Exception:
+            secret_key = ""
+
+        region = self._current_region()
+
+        if not access_key or not secret_key:
+            return {"ok": False, "error": "Access key and secret are required."}
+
+        try:
+            EnvManager.get().save_aws_credentials(
+                access_key=access_key,
+                secret_key=secret_key,
+                region=region,
+            )
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
+        # Update local app state
+        if isinstance(getattr(self._app, "aws", None), dict):
+            self._app.aws["access_key"] = access_key
+            self._app.aws["secret_key"] = secret_key
+            self._app.aws["region"] = region
+
+        # Fire a hook so the coordinator can reload the running agent.
+        try:
+            hook = getattr(self._app, "on_aws_changed", None)
+            if callable(hook):
+                hook()
+        except Exception:
+            pass
+
+        # Refresh visuals
+        self.refresh_values()
+        self.refresh_mcp_status()
+        self.start_scan(passes=2)
+        self.start_radar(duration_ticks=30)
+        self.start_trace(ok=True)
+        return {"ok": True, "error": None}
