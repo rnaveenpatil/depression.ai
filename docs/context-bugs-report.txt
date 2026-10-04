@@ -1,0 +1,305 @@
+CONTEXT / PROMPT-LEAK BUG REPORT
+================================
+Repo:   /home/patil/depression.ai
+Scope:  src/agent/context/*, src/agent/agent/dual_agent.py, src/agent/agent/loop.py
+Date:   2026-10-04
+Status: all 5 bugs reproduced against the current working tree (no files modified)
+
+Reported symptom
+----------------
+"The LLM answers the previous answers inside the present prompt" — the model
+replies to / repeats earlier content instead of the current user query.
+
+Verified reproductions
+----------------------
+1. Bug 1  : two auto-mode queries -> query #2's request contains query #1's
+            planner/executor scaffolding as real user+assistant turns.
+2. Bug 2  : newest assistant+tool group larger than the limit -> provider
+            receives 0 messages (the user question never reaches the model).
+3. Bug 3  : 8 system messages + 4 Q/A turns, max_messages=12 -> only 2 of the
+            4 real Q/A turns survive trimming.
+4. Bug 4  : 3 compactions -> 3 stacked "[CONTEXT SUMMARY]" system messages,
+            none of them ever removed.
+5. Bug 5  : one pinned compaction summary present -> the real system prompt is
+            never added, so the loop runs with no instructions at all.
+
+Severity ordering: Bug 1 (cause of the reported symptom), Bug 2 (silent data
+loss), Bug 5 (agent loses its instructions), Bug 3 + Bug 4 (unbounded growth).
+
+================================================================================
+BUG 1 — Plan and Build agents share ONE conversation log (root cause)
+================================================================================
+Files   : src/agent/agent/dual_agent.py:1114  (PlanAgent)
+          src/agent/agent/dual_agent.py:1128  (BuildAgent)
+          src/agent/agent/dual_agent.py:925-931 (handle_query dispatch)
+          src/agent/agent/dual_agent.py:1006    (plan prompt)
+          src/agent/agent/dual_agent.py:1029    (build prompt)
+          src/agent/agent/dual_agent.py:983     ("Previous plan execution results")
+          src/agent/agent/dual_agent.py:511,534 (BaseAgent._run_query_pipeline
+                                                 records user + assistant turns)
+
+create_dual_agent_system() hands the SAME context_manager object to both
+agents:
+
+    plan_agent  = PlanAgent(...,  context_manager=context_manager, ...)
+    build_agent = BuildAgent(..., context_manager=context_manager, ...)
+
+Effect: every coordinator prompt becomes a permanent conversation turn.
+
+  * _process_auto() asks the plan agent to plan (line 1006), then the build
+    agent to execute (line 1029). BaseAgent._run_query_pipeline stores both the
+    synthetic prompt as a `user` message and the model's reply as an `assistant`
+    message (lines 511 and 534).
+  * With max_iterations=3 a single user query therefore injects up to 6
+    scaffolding turns.
+  * Nothing in the transcript marks those turns as orchestration rather than
+    user speech, so the next request ends with the previous plan and the
+    previous answer sitting directly in front of the new question.
+
+Reproduction (real ContextManager + real AgentCoordinator, stubbed loop):
+
+    [user     ] Create a detailed execution plan for: what is 2+2? ...
+    [assistant] PLAN-answer
+    [user     ] Execute this plan step by step: ...
+    [assistant] BUILD-answer
+    [user     ] Create a detailed execution plan for: now list the files ...  <-- real query
+    [assistant] PLAN-answer
+    [user     ] Execute this plan step by step: ...
+    [assistant] BUILD-answer
+
+The model is being told, by its own history, to keep planning and executing.
+That is exactly "answering the previous answers in the present prompt".
+
+Notes
+  * The TUI defaults to mode "build" (src/agent/tui/app.py:745), so the
+    pollution is worst in plan mode, auto mode and execute_plan()
+    (dual_agent.py:927-944, :1080-1090).
+  * The genuine user question is never recorded as a clean user turn in these
+    modes — it only exists embedded inside a planner instruction.
+
+Suggested fix
+  * Give plan_agent and build_agent separate ContextManagers (shared session
+    for persistence, separate message logs), or
+  * pass record_user=False for orchestration calls (BaseAgent already supports
+    it: dual_agent.py:499) and record only the coordinator's final user-visible
+    answer, or
+  * tag orchestration messages (metadata={"orchestration": True}) and keep them
+    out of the model-facing window in ContextManager._effective_messages().
+
+================================================================================
+BUG 2 — get_model_messages() can return ZERO messages (user query dropped)
+================================================================================
+File    : src/agent/context/runtime.py:311-334  (get_model_messages)
+          back-compat branch taken when `limit < 500`
+          (loop.py:126 -> max_history_length defaults to 40)
+
+Code (runtime.py:328-334):
+
+    if limit < 500:
+        selected: List[Any] = []
+        for g in reversed(groups):
+            if len(selected) + len(g) > max(1, limit):
+                break                      # <-- fires on the FIRST group
+            selected[0:0] = g
+        return [_to_provider_message(m) for m in system + selected]
+
+`groups` comes from group_messages(): one group = assistant(tool_calls) plus
+all of its tool results. If the newest group alone exceeds the limit, `break`
+happens before anything is selected and the provider receives only the system
+messages — the user's question is silently never sent.
+
+Reproduction: 1 user message + an assistant turn declaring 45 tool calls +
+45 tool results (a 46-message newest group), get_model_messages(cm, 40):
+
+    limit=40, newest group has 46 messages -> provider receives 0 messages;
+    contains the user question: False
+
+Impact: the model answers from the system prompt alone, which reads as
+"it ignored my prompt and answered something old".
+
+Suggested fix
+  * Always keep the newest group: `if used + cost > budget and selected: break`
+    is fine for the token branch, but the count branch needs
+    `if selected: break else: selected[0:0] = g` (truncate the group instead of
+    dropping the turn), or raise the default max_history_length.
+
+================================================================================
+BUG 3 — Trimming protects every system message and deletes real conversation
+================================================================================
+File    : src/agent/context/manager.py:284-310  (_trim_messages)
+          manager.py:370-414                    (_effective_messages, same rule)
+
+Code (manager.py:293-302):
+
+    pinned, unpinned = [], []
+    for m in self.messages:
+        if m.pinned or m.role == "system":
+            pinned.append(m)          # <-- EVERY system message is unkillable
+        else:
+            unpinned.append(m)
+
+    keep = max(0, self.max_messages - len(pinned))
+    kept = unpinned[-keep:] if keep else []
+    self.messages = sorted(pinned + kept, key=lambda m: m.timestamp)
+
+Sources of unkillable system messages:
+  * src/agent/agent/loop.py:1276 — `add_system_message("Execution plan
+    guidance:\n" + json.dumps(self.current_plan.to_dict(), indent=2))`, added
+    once per planned query. Planning is ON by default (loop.py:127
+    `enable_planning = config.get("enable_planning", True)`), so this happens
+    for every non-"question" intent.
+  * src/agent/agent/loop.py:1852 — failure guidance after a failed tool batch.
+  * src/agent/context/compaction.py:286-295 — compaction summaries
+    (pinned=True, role="system"), see Bug 4.
+
+Consequence: `len(pinned)` grows monotonically while the conversation does
+not. Once pinned >= max_messages, `keep` becomes 0 and `kept` is empty — the
+entire conversation is discarded and only stale plan JSON / old summaries are
+sent to the model. Even below that threshold the live window shrinks every
+turn.
+
+Reproduction (max_messages=12, 8 plan-guidance system messages, 4 Q/A turns):
+
+    kept: 12 | system: 8 | user: 2 | assistant: 2
+    >>> real conversation turns surviving: 4 of 8
+
+Note: with the shipped default max_messages=200 (manager.py:76) this needs
+roughly 60+ planned queries to bite, which matches "it worked earlier in the
+session, now it answers old stuff".
+
+Suggested fix
+  * Keep only *pinned* messages unconditionally; treat role=="system" as
+    protected only while it is newer than the retained window (or bound them:
+    keep the newest K system messages, drop the rest).
+  * Don't persist per-query plan JSON as a message at all — put it in the
+    transient state block that loop.py:1416 already appends per request
+    ("Execution state: " + state_block).
+
+================================================================================
+BUG 4 — Compaction summaries accumulate forever
+================================================================================
+File    : src/agent/context/compaction.py:245-320  (_summarize_old_messages)
+
+Code (compaction.py:280-320):
+
+    summary_content = f"[CONTEXT SUMMARY — earlier turns]\n{summary_text}"
+    summary_msg = ContextMessage(role="system", content=summary_content,
+                                 pinned=True, metadata={"compacted": True, ...})
+    ...
+    for g in pinned_groups:      # <-- includes every PREVIOUS summary
+        combined.extend(g)
+    combined.append(summary_msg)  # <-- and adds another one
+
+Previous summaries are `role="system", pinned=True`, so they land in
+pinned_groups, are carried forward verbatim, and are additionally immune to
+_trim_messages (Bug 3) and to the windowing in _effective_messages(). Every
+compaction therefore adds one more permanent narrative of "earlier turns".
+
+Reproduction (3 compaction cycles):
+
+    after compaction 1: messages=9  | summaries kept=1 | system=1
+    after compaction 2: messages=12 | summaries kept=2 | system=2
+    after compaction 3: messages=14 | summaries kept=3 | system=3
+
+Monotonic growth: the prompt keeps stale narrative that no longer matches the
+retained window, which is precisely the "the model keeps answering the old
+conversation" experience once compaction starts firing.
+
+Note: old_flat excludes pinned messages (compaction.py:268), so summary N+1
+describes only the turns after summary N — the contents are not duplicated,
+but they are unbounded in number and never reconciled.
+
+Suggested fix
+  * Replace the previous summary instead of appending: drop summaries whose
+    metadata has {"compacted": True} before appending the new one, or
+  * mark summaries as replaceable (e.g. pinned=False + a dedicated
+    `is_summary` flag honoured by _trim_messages/_effective_messages), or
+  * cap them: keep the newest summary, drop older ones.
+
+================================================================================
+BUG 5 — Loop can run with NO system prompt
+================================================================================
+File    : src/agent/agent/loop.py:1493-1505  (_ensure_system_prompt)
+Trigger : any pinned system message that isn't "Execution state:" — i.e. a
+          compaction summary (Bug 4) or a pinned plan-guidance message.
+
+Code (loop.py:1493-1505):
+
+    messages = getattr(self.model_context, "messages", None) or []
+    has_pinned = any(
+        getattr(m, "role", None) == "system"
+        and getattr(m, "pinned", True)
+        and not str(getattr(m, "content", "")).startswith("Execution state:")
+        for m in messages
+    )
+    if not has_pinned:
+        await self.model_context.add_system_message(
+            await self._get_system_prompt(), pinned=True
+        )
+
+The check identifies the system prompt by "is a pinned system message that
+isn't the state block" instead of by identity, so a pinned compaction summary
+satisfies it. The real prompt (tools, permissions, persona, rules) is then
+never added — and because `_think` (loop.py:1400) only inserts the system
+prompt when `messages` has none at all (loop.py:1906 also checks), the request
+proceeds with no instructions.
+
+Reproduction (context pre-seeded with one pinned "[CONTEXT SUMMARY]" message):
+
+    system messages: 1
+    real system prompt present?: False
+    -> has_pinned matched the COMPACTION SUMMARY, so the agent runs with no instructions
+
+Also note `getattr(m, "pinned", True)` defaults to True for any object without
+the attribute, which widens the false positive further.
+
+Impact: an agent with no system prompt has no tool contract and no rules; it
+continues whatever thread the surviving history suggests — the reported symptom
+in its worst form.
+
+Suggested fix
+  * Track the prompt by identity, e.g. keep a `system_prompt_hash` /
+    `metadata={"system_prompt": True}` marker on the message the loop writes and
+    test for that marker; exclude messages with metadata {"compacted": True} or
+    a `role == "system"` + content starting with "[CONTEXT SUMMARY".
+  * Use `getattr(m, "pinned", False)` rather than True.
+
+================================================================================
+MINOR FINDINGS (not the main symptom)
+================================================================================
+M1  src/agent/context/runtime.py:322-323 and :350
+    Every system message is hoisted to the front of the request in its original
+    order, regardless of when it was written. Old plan guidance and old
+    summaries therefore always precede the live window, so the model reads
+    them as current framing rather than history.
+
+M2  src/agent/context/manager.py:238-265
+    add_user_message / add_assistant_message de-duplicate only against the
+    IMMEDIATELY previous message. The final answer is currently added twice —
+    src/agent/agent/loop.py:1940 (_generate_final_response) and
+    src/agent/agent/dual_agent.py:534 (_run_query_pipeline) — and is saved from
+    duplication only by that adjacency check. Any interleaved message (failure
+    guidance, a tool result, an event) turns it into a real duplicate answer in
+    the transcript.
+
+M3  src/agent/agent/loop.py:1909-1919
+    _generate_final_response appends a synthetic `user` message ("Provide the
+    final response to the user. …") to the request but never persists it, while
+    the answer it produces IS persisted (loop.py:1940). The stored transcript
+    therefore contains assistant turns with no matching user turn.
+
+M4  src/agent/agent/dual_agent.py:1005-1011
+    _process_auto temporarily flips `plan_loop.enable_planning = False` and
+    restores it in a `finally`; the plan prompt it builds still asks for JSON
+    plan output, so in auto mode the plan agent's reply is pure JSON that is
+    then stored in the shared history as an assistant answer (feeds Bug 1).
+
+REPRODUCTION COMMANDS
+---------------------
+Bug 1: PYTHONPATH=src python3 /tmp/opencode/repro_ctx.py
+       (real ContextManager + AgentCoordinator, stubbed AgentLoop; prints the
+        exact message list handed to the provider)
+Bugs 2-5: small scripts driving ContextManager / AgentLoop directly; the exact
+       outputs are quoted in each section above.
+
+Files touched by this report: none (investigation only).
