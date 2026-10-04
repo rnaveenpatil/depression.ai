@@ -4,11 +4,11 @@ Compaction - Shrinks the context when it grows too large.
 Strategy (multi-stage):
   1. Drop redundant tool outputs (keep the most recent N).
   2. Summarize older VALID message groups into a single summary message.
-  3. If still over budget, hard-truncate the oldest non-pinned groups.
+  3. If still over budget, hard-truncate the oldest non-protected groups.
 
 Whole groups only. Never splits an assistant / tool_call / tool_result
-group. Groups that fail validation are collapsed to a single system marker
-so they cannot corrupt the request.
+group. [Bug 4] Previous summaries are dropped before the new one is
+added, so at most one summary ever survives a compaction cycle.
 """
 
 from __future__ import annotations
@@ -20,8 +20,6 @@ from typing import Any, Dict, List, Optional, Tuple
 from agent.utils.logging import get_logger
 from agent.llm.provider import Message
 
-# Shared grouping / validation lives in runtime.py so runtime and
-# compaction can never disagree about what a "valid group" is.
 from agent.context.runtime import group_messages, validate_group
 
 logger = get_logger(__name__)
@@ -50,15 +48,6 @@ def _tool_calls_of(message: Any) -> List[dict]:
 
 
 def _estimate_message_tokens(message: Any) -> int:
-    """
-    Estimate a message's cost.
-
-    Rules:
-      - If `tokens` is present and covers tool_calls, use it.
-      - Content is prose-ish: ~len/4.
-      - Tool_calls JSON is dense: ~len/3.
-      - Never return less than 1.
-    """
     cached = int(getattr(message, "tokens", 0) or 0)
     calls = _tool_calls_of(message)
     calls_tokens = 0
@@ -71,7 +60,6 @@ def _estimate_message_tokens(message: Any) -> int:
             calls_tokens = max(1, len(calls_json) // 3)
 
     if cached:
-        # Trust the cached count only if it's at least the tool_calls cost.
         if calls_tokens and cached < calls_tokens:
             return cached + calls_tokens
         return cached
@@ -88,23 +76,46 @@ def _estimate_group_tokens(group: List[Any]) -> int:
     return sum(_estimate_message_tokens(m) for m in group)
 
 
-def _is_pinned_or_system(message: Any) -> bool:
-    return bool(getattr(message, "pinned", False)) or getattr(message, "role", "") == "system"
+def _is_protected(message: Any) -> bool:
+    """[Bug 3] Protected == explicitly pinned. Nothing else."""
+    return bool(getattr(message, "pinned", False))
+
+
+def _is_summary(message: Any) -> bool:
+    return bool((getattr(message, "metadata", {}) or {}).get("compacted"))
+
+
+def _drop_old_summaries(groups: List[List[Any]]) -> List[List[Any]]:
+    """
+    [Bug 4] Keep at most the newest compaction summary across the groups.
+    Older summaries describe turns that are no longer in the window and
+    must not accumulate.
+    """
+    flat: List[Any] = [m for g in groups for m in g]
+    summaries = [m for m in flat if _is_summary(m)]
+    if len(summaries) <= 1:
+        return groups
+
+    newest = max(summaries, key=lambda m: getattr(m, "timestamp", 0))
+
+    out: List[List[Any]] = []
+    for g in groups:
+        kept = [
+            m for m in g
+            if (not _is_summary(m)) or m is newest
+        ]
+        if kept:
+            out.append(kept)
+    return out
 
 
 def _sanitize_groups(groups: List[List[Any]]) -> List[List[Any]]:
-    """
-    Replace any group that fails validation with a single, valid marker
-    message so the conversation sequence can never be broken.
-    """
     out: List[List[Any]] = []
     for g in groups:
         if validate_group(g):
             out.append(g)
             continue
 
-        # Try to repair: keep the first message only if it's not an
-        # assistant with tool_calls.
         first = g[0] if g else None
         role = getattr(first, "role", "") if first is not None else ""
         content = getattr(first, "content", "") if first is not None else ""
@@ -122,7 +133,6 @@ def _sanitize_groups(groups: List[List[Any]]) -> List[List[Any]]:
         )
 
         if role == "assistant" and calls and ContextMessage is not None:
-            # Drop tool_calls, keep any prose content if present.
             try:
                 m = ContextMessage(
                     role="assistant",
@@ -149,7 +159,6 @@ def _sanitize_groups(groups: List[List[Any]]) -> List[List[Any]]:
             except Exception:
                 pass
 
-        # Absolute fallback
         class _Marker:
             __slots__ = ("role", "content", "tokens", "pinned", "metadata", "timestamp")
             def __init__(self) -> None:
@@ -168,8 +177,6 @@ def _sanitize_groups(groups: List[List[Any]]) -> List[List[Any]]:
 # ----------------------------------------------------------------------
 
 class Compactor:
-    """Context compaction engine."""
-
     def __init__(self, llm: Any = None, config: Optional[Dict[str, Any]] = None):
         cfg = config or {}
         self.llm = llm
@@ -184,8 +191,6 @@ class Compactor:
             self.target_ratio, self.enable_summarization,
         )
 
-    # ------------------------------------------------------------------
-
     async def compact(
         self,
         messages: List[Any],
@@ -194,11 +199,6 @@ class Compactor:
         current_tokens: int,
         extra_tokens: int = 0,
     ) -> Dict[str, Any]:
-        """
-        extra_tokens = cost of everything the caller will also send:
-        system prompt + tool schemas + runtime state block. Subtracted
-        from the target so compaction frees enough room for those too.
-        """
         if not messages:
             return {"compacted": False, "reason": "no messages"}
 
@@ -208,9 +208,8 @@ class Compactor:
         if len(tool_outputs) > self.max_tool_outputs_keep:
             stages.append("tool_output_trim")
 
-        # Sanitize before doing anything else so broken sequences can't
-        # survive compaction.
         raw_groups = group_messages(working)
+        raw_groups = _drop_old_summaries(raw_groups)
         sanitized_groups = _sanitize_groups(raw_groups)
         working = [m for g in sanitized_groups for m in g]
 
@@ -241,8 +240,6 @@ class Compactor:
             "stages_applied": stages,
         }
 
-    # ------------------------------------------------------------------
-
     async def _summarize_old_messages(
         self,
         messages: List[Any],
@@ -250,11 +247,11 @@ class Compactor:
     ) -> Tuple[List[Any], bool]:
         groups = group_messages(messages)
 
-        pinned_groups: List[List[Any]] = []
+        protected_groups: List[List[Any]] = []
         unpinned_groups: List[List[Any]] = []
         for g in groups:
-            if all(_is_pinned_or_system(m) for m in g):
-                pinned_groups.append(g)
+            if all(_is_protected(m) for m in g):
+                protected_groups.append(g)
             else:
                 unpinned_groups.append(g)
 
@@ -294,7 +291,6 @@ class Compactor:
                 logger.warning(
                     "ContextMessage construction failed (%s); using fallback", e
                 )
-                ContextMessage = None  # type: ignore
                 summary_msg = None  # type: ignore
         else:
             summary_msg = None  # type: ignore
@@ -314,9 +310,13 @@ class Compactor:
                     self.timestamp = time.time()
             summary_msg = _SummaryMessage()
 
+        # [Bug 4] Do NOT carry previous summaries forward.
         combined: List[Any] = []
-        for g in pinned_groups:
-            combined.extend(g)
+        for g in protected_groups:
+            # Skip stale summaries even among pinned groups.
+            kept = [m for m in g if not _is_summary(m)]
+            if kept:
+                combined.extend(kept)
         combined.append(summary_msg)
         for g in recent_groups:
             combined.extend(g)
@@ -338,7 +338,6 @@ class Compactor:
             )
             text = getattr(result, "content", None) or str(result)
             text = text.strip()
-            # Cap the fallback-safe summary too.
             if len(text) > self.max_summary_tokens * 4:
                 text = text[: self.max_summary_tokens * 4] + "…"
             return text or self._heuristic_summary(transcript)
@@ -346,16 +345,15 @@ class Compactor:
             logger.warning("LLM summarization failed: %s", e)
             return self._heuristic_summary(transcript)
 
-    # ------------------------------------------------------------------
-
     def _hard_truncate(self, messages: List[Any], target_tokens: int) -> List[Any]:
         groups = group_messages(messages)
+        groups = _drop_old_summaries(groups)
 
-        pinned_groups: List[List[Any]] = []
+        protected_groups: List[List[Any]] = []
         unpinned_groups: List[List[Any]] = []
         for g in groups:
-            if all(_is_pinned_or_system(m) for m in g):
-                pinned_groups.append(g)
+            if all(_is_protected(m) for m in g):
+                protected_groups.append(g)
             else:
                 unpinned_groups.append(g)
 
@@ -365,7 +363,7 @@ class Compactor:
             unpinned_groups[:-must_keep_count] if must_keep_count else list(unpinned_groups)
         )
 
-        base: List[Any] = [m for g in pinned_groups for m in g] + [
+        base: List[Any] = [m for g in protected_groups for m in g] + [
             m for g in must_keep_groups for m in g
         ]
         budget = target_tokens - self._estimate_tokens(base)
@@ -381,12 +379,10 @@ class Compactor:
 
         added_groups.reverse()
         return (
-            [m for g in pinned_groups for m in g]
+            [m for g in protected_groups for m in g]
             + [m for g in added_groups for m in g]
             + [m for g in must_keep_groups for m in g]
         )
-
-    # ------------------------------------------------------------------
 
     def _heuristic_summary(self, transcript: str) -> str:
         lines = transcript.splitlines()
@@ -403,13 +399,10 @@ class Compactor:
             for l in assistant_previews:
                 parts.append(f"  - {l[10:].strip()}")
         text = "\n".join(parts)
-        # Cap to the summary budget.
         cap = self.max_summary_tokens * 4
         if len(text) > cap:
             text = text[:cap] + "…"
         return text
-
-    # ------------------------------------------------------------------
 
     def _render_transcript(self, messages: List[Any]) -> str:
         parts = []

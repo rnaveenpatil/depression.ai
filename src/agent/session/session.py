@@ -11,6 +11,11 @@ Note on state duplication:
     seeds from this transcript exactly once per session load via
     ContextManager.load_from_session(). After that, only ContextManager
     writes to the model's view.
+
+Long-term memory:
+    Compaction summaries are stored separately, one JSONL per session,
+    via `agent.context.summary_store.SummaryStore`. On session delete or
+    reset, they are cleared alongside the transcript.
 """
 
 from __future__ import annotations
@@ -27,6 +32,7 @@ from agent.utils.logging import get_logger
 from agent.utils.errors import SessionError
 from agent.session.history import SessionHistory, HistoryEntry
 from agent.session.state import SessionState, SessionStatus
+from agent.context.summary_store import SummaryStore
 
 logger = get_logger(__name__)
 
@@ -202,8 +208,10 @@ class SessionManager:
 
     Storage layout:
         ~/.agent/sessions/
-            index.json             — fast listing
-            <session_id>.json      — full session
+            index.json              — fast listing
+            <session_id>.json       — full session transcript
+        ~/.agent/summaries/
+            <session_id>.jsonl      — compaction summaries (long-term)
     """
 
     def __init__(
@@ -230,6 +238,11 @@ class SessionManager:
         )
         self.default_name: str = cfg.get("default_name", "session")
         self.resume_last: bool = cfg.get("resume_last", False)
+
+        # Summary store for long-term memory.
+        self.summary_store = SummaryStore(
+            root=cfg.get("summary_dir") or None
+        )
 
         self._current: Optional[Session] = None
         self._last_save: float = 0.0
@@ -405,6 +418,12 @@ class SessionManager:
         except Exception as e:
             logger.warning("Failed to delete session file: %s", e)
 
+        # [long-term memory] Clear the summaries for this session too.
+        try:
+            self.summary_store.clear(session_id)
+        except Exception as e:
+            logger.debug("Failed to clear summaries for %s: %s", session_id, e)
+
         async with self._lock:
             self._index.pop(session_id, None)
             if self._current and self._current.id == session_id:
@@ -439,6 +458,11 @@ class SessionManager:
                 p = self._path_for(sid)
                 if p.exists():
                     p.unlink()
+            except Exception:
+                pass
+            # Also clean up its summaries.
+            try:
+                self.summary_store.clear(sid)
             except Exception:
                 pass
             self._index.pop(sid, None)
@@ -492,7 +516,13 @@ class SessionManager:
     async def reset_current(self) -> bool:
         if not self._current:
             return False
+        sid = self._current.id
         self._current.reset()
+        # [long-term memory] Reset also drops the summaries for this session.
+        try:
+            self.summary_store.clear(sid)
+        except Exception as exc:
+            logger.debug("Failed to clear summaries on reset: %s", exc)
         await self.save_current_session()
         return True
 
@@ -518,19 +548,69 @@ class SessionManager:
         self, session_id: Optional[str] = None
     ) -> Dict[str, Any]:
         session = self._current
+        target_id = session_id
         if session_id:
             session = await self.load_session(session_id)
         if not session:
             raise SessionError("No session to export")
-        return session.to_dict()
+
+        data = session.to_dict()
+        # Attach the summaries too so an export is self-contained.
+        try:
+            data["summaries"] = self.summary_store.load(
+                target_id or session.id
+            )
+        except Exception:
+            data["summaries"] = []
+        return data
 
     async def import_session(self, data: Dict[str, Any]) -> Session:
         session = Session.from_dict(data)
         async with self._lock:
             self._current = session
         await self.save_session(session)
+        # Restore any summaries that came with the import.
+        summaries = data.get("summaries") or []
+        if isinstance(summaries, list):
+            for row in summaries:
+                try:
+                    body = str(row.get("summary") or "")
+                    if not body:
+                        continue
+                    self.summary_store.append(
+                        session.id,
+                        body,
+                        turns_summarized=int(row.get("turns", 0) or 0),
+                        tokens_before=int(row.get("tokens_before", 0) or 0),
+                        tokens_after=int(row.get("tokens_after", 0) or 0),
+                        metadata=row.get("metadata") or {},
+                    )
+                except Exception:
+                    continue
         logger.info("Imported session: %s", session.id)
         return session
+
+    # ------------------------------------------------------------------
+    # SUMMARY ACCESS
+    # ------------------------------------------------------------------
+
+    def get_summaries(self, session_id: Optional[str] = None) -> List[Dict[str, Any]]:
+        sid = session_id or (self._current.id if self._current else None)
+        if not sid:
+            return []
+        try:
+            return self.summary_store.load(sid)
+        except Exception:
+            return []
+
+    def latest_summary(self, session_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
+        sid = session_id or (self._current.id if self._current else None)
+        if not sid:
+            return None
+        try:
+            return self.summary_store.latest(sid)
+        except Exception:
+            return None
 
     # ------------------------------------------------------------------
     # SUMMARY FOR PROMPT

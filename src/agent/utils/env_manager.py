@@ -112,8 +112,21 @@ def load_env_file(env_path: Optional[Path] = None) -> Dict[str, str]:
     return result
 
 
-def write_env_file(env_vars: Dict[str, str], env_path: Optional[Path] = None) -> None:
-    """Write environment variables to a .env file."""
+def write_env_file(
+    env_vars: Dict[str, str],
+    env_path: Optional[Path] = None,
+    strict: bool = False,
+) -> None:
+    """Write environment variables to a .env file.
+
+    Args:
+        env_vars: keys to merge over whatever is already on disk.
+        env_path: target file, defaults to ``find_env_file()``.
+        strict: when True, filesystem failures raise ``OSError`` instead of
+            being swallowed. Credential writes pass ``strict=True`` so the
+            UI can report a failed save rather than reporting success while
+            the old value silently remains on disk.
+    """
     path = env_path or find_env_file()
 
     existing = load_env_file(path)
@@ -129,9 +142,14 @@ def write_env_file(env_vars: Dict[str, str], env_path: Optional[Path] = None) ->
         try:
             path.chmod(0o600)
         except OSError:
-            pass
+            if strict:
+                raise
+    except OSError:
+        if strict:
+            raise
     except Exception:
-        pass
+        if strict:
+            raise
 
 
 # ======================================================================
@@ -293,7 +311,8 @@ class EnvManager:
         _set(AWS_ENVS["region"], region)
         _set(AWS_ENVS["session_token"], session_token)
 
-        write_env_file(env_vars, aws_env_path)
+        # strict=True: a failed write must not be reported as a saved secret.
+        write_env_file(env_vars, aws_env_path, strict=True)
 
         # --- live process update (the actual bug #1 fix) ---
         def _mirror(key: str, value: Optional[str]) -> None:

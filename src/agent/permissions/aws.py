@@ -2,8 +2,9 @@
 AWS Policy - Safety gate for AWS operations.
 
 Handles both:
-    - Direct AWS tool calls (aws_*, s3_*, ec2_*, iam_*)
-    - `aws` CLI commands executed via the terminal tool
+    - Direct AWS tool calls (aws_*, s3_*, ec2_*, iam_*, mcp__aws__*)
+    - The unified `aws` tool (params: {service, operation, args})
+    - Raw `aws` CLI commands run via the terminal/bash tool
 
 Risk classification:
     SAFE      → describe-*, list-*, get-*  (read-only)
@@ -65,22 +66,18 @@ class AWSPolicy(Policy):
 
         self._critical_res = [re.compile(p) for p in CRITICAL_AWS_PATTERNS]
 
-    # ------------------------------------------------------------------
-
     async def evaluate(
         self, request: PermissionRequest
     ) -> Optional[PermissionVerdict]:
         if not self.enabled:
             return None
 
-        # Identify AWS operation
         op = self._extract_aws_op(request)
         if not op:
             return None
 
         service, action, args = op
 
-        # Denied services
         if service in self.denied_services:
             return PermissionVerdict.deny(
                 f"AWS service '{service}' is blocked",
@@ -88,7 +85,6 @@ class AWSPolicy(Policy):
                 policy=self.name,
             )
 
-        # Profile check
         profile = self._extract_flag(args, "--profile")
         if profile and self.allowed_profiles and profile not in self.allowed_profiles:
             return PermissionVerdict.deny(
@@ -97,7 +93,6 @@ class AWSPolicy(Policy):
                 policy=self.name,
             )
 
-        # Region check
         region = self._extract_flag(args, "--region")
         if region and self.allowed_regions and region not in self.allowed_regions:
             return PermissionVerdict.deny(
@@ -106,7 +101,6 @@ class AWSPolicy(Policy):
                 policy=self.name,
             )
 
-        # Critical patterns
         cmd_str = " ".join(args)
         for r in self._critical_res:
             if r.search(cmd_str):
@@ -116,7 +110,6 @@ class AWSPolicy(Policy):
                     policy=self.name,
                 )
 
-        # Classify by action prefix
         if action.startswith(SAFE_AWS_PREFIXES):
             return PermissionVerdict.allow(
                 f"read-only AWS: {service} {action}",
@@ -146,7 +139,6 @@ class AWSPolicy(Policy):
             )
 
         if action.startswith(HIGH_AWS_PREFIXES):
-            # Wildcards make it CRITICAL
             if self._has_wildcard(cmd_str):
                 return PermissionVerdict.ask(
                     f"AWS destructive with wildcard: {service} {action}",
@@ -165,7 +157,6 @@ class AWSPolicy(Policy):
                 policy=self.name,
             )
 
-        # Unknown AWS action → medium
         return PermissionVerdict.ask(
             f"AWS: {service} {action}",
             risk=RiskLevel.MEDIUM,
@@ -180,26 +171,50 @@ class AWSPolicy(Policy):
         self, request: PermissionRequest
     ) -> Optional[tuple]:
         """Return (service, action, args) or None."""
-        tool = request.tool.lower()
+        tool = (request.tool or "").lower()
+        params = request.params or {}
 
-        # Case 1: Direct MCP / native AWS tools: aws_s3_list_buckets, s3_list_objects
-        if tool.startswith("aws_") or tool.startswith("mcp__aws__"):
-            cleaned = tool.replace("mcp__aws__", "").replace("aws_", "")
+        # Case 1: unified `aws` tool. Params carry service + operation.
+        if tool == "aws":
+            service = str(params.get("service") or "").strip().lower()
+            operation = str(params.get("operation") or "").strip().lower()
+            extra = list(params.get("args") or [])
+            if service and operation:
+                return service, operation, extra
+            # Identity action
+            if str(params.get("action") or "").lower() == "identity":
+                return "sts", "get-caller-identity", []
+            return None
+
+        # Case 2: MCP AWS tool with explicit operation string.
+        if tool.startswith("mcp__aws__"):
+            operation = str(
+                params.get("operation") or params.get("command") or ""
+            ).strip()
+            if operation:
+                parts = operation.split(None, 1)
+                if len(parts) == 2:
+                    return parts[0].lower(), parts[1].lower(), []
+            cleaned = tool.replace("mcp__aws__", "")
+            parts = cleaned.split("_", 1)
+            if len(parts) == 2:
+                return parts[0].lower(), parts[1].replace("_", "-").lower(), []
+            return cleaned.lower(), "unknown", []
+
+        # Case 3: direct tool names.
+        if tool.startswith("aws_") or tool.startswith("s3_") or tool.startswith("ec2_") or tool.startswith("iam_"):
+            cleaned = tool.replace("aws_", "")
             parts = cleaned.split("_", 1)
             if len(parts) == 2:
                 service, action = parts
-                action = action.replace("_", "-")
-                return service, action, []
-            return cleaned, "unknown", []
+                return service.lower(), action.replace("_", "-").lower(), []
+            return cleaned.lower(), "unknown", []
 
-        if tool.startswith("s3_") or tool.startswith("ec2_") or tool.startswith("iam_"):
-            service, action = tool.split("_", 1)
-            return service, action.replace("_", "-"), []
-
-        # Case 2: aws CLI through terminal tool
+        # Case 4: aws CLI via terminal/bash.
         command = (
-            request.params.get("command")
-            or request.params.get("cmd")
+            params.get("command")
+            or params.get("cmd")
+            or params.get("shell")
             or ""
         )
         if not command:
@@ -210,7 +225,6 @@ class AWSPolicy(Policy):
         except ValueError:
             return None
 
-        # Find "aws" in the token list
         for i, p in enumerate(parts):
             if p == "aws":
                 rest = parts[i + 1:]
@@ -221,13 +235,12 @@ class AWSPolicy(Policy):
         if not rest:
             return None
 
-        # Skip global flags like --profile, --region, --output
         service = None
         idx = 0
         while idx < len(rest):
             tok = rest[idx]
             if tok.startswith("--"):
-                idx += 2  # skip flag + value
+                idx += 2
                 continue
             service = tok
             idx += 1
@@ -237,7 +250,7 @@ class AWSPolicy(Policy):
             return None
 
         action = rest[idx] if idx < len(rest) else "unknown"
-        return service, action, rest[idx + 1:]
+        return service.lower(), action.lower(), rest[idx + 1:]
 
     def _extract_flag(self, args: List[str], flag: str) -> Optional[str]:
         for i, a in enumerate(args):
