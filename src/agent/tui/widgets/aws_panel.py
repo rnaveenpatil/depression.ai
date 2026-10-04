@@ -8,13 +8,15 @@ Animations:
     - breathing status dot when credentials are present
     - endpoint trace line on verify
 
-Status:
-    - MCP status line reflects whether the AWS MCP server is connected
-    - Falls back to the AWS CLI banner when MCP is unavailable
-
-Live updates:
-    - Subscribes to EnvManager so external changes refresh the panel
-    - On save, fires `on_aws_changed` so the running agent can reload
+Storage:
+    * Credentials are written via EnvManager to the GLOBAL env file
+      (~/.agent/env, 0600). That's the same file provider API keys and
+      user identity live in.
+    * EnvManager then updates os.environ and notifies subscribers, so the
+      MCP client, aws_helper, and terminal subprocesses see the change
+      without a restart.
+    * After saving, the panel fires `app.on_aws_changed()` if the app
+      exposes it, so the running agent reloads MCP with the new creds.
 """
 
 from __future__ import annotations
@@ -40,9 +42,11 @@ BORDER = "#0a3d20"
 PANEL = "#031008"
 BG = "#000000"
 
+DEFAULT_REGION = "us-east-1"
+
 AWS_REGIONS = [
-    "ap-south-1", "ap-south-2",
     "us-east-1", "us-east-2", "us-west-1", "us-west-2",
+    "ap-south-1", "ap-south-2",
     "eu-west-1", "eu-west-2", "eu-west-3", "eu-central-1", "eu-central-2",
     "eu-north-1", "eu-south-1", "eu-south-2",
     "ap-southeast-1", "ap-southeast-2", "ap-southeast-3", "ap-southeast-4",
@@ -59,6 +63,12 @@ _SCAN_WIDTH = 34
 _STRENGTH_CHARS = "▰"
 
 
+def _esc(text: Any) -> str:
+    if text is None:
+        return ""
+    return str(text).replace("[", r"\[")
+
+
 class AWSPanel(Vertical):
     DEFAULT_CSS = f"""
     AWSPanel {{
@@ -67,14 +77,7 @@ class AWSPanel(Vertical):
         padding: 0 1;
         background: {BG};
     }}
-    AWSPanel .title-row {{
-        height: 1;
-        width: 100%;
-    }}
-    AWSPanel .label {{
-        color: {MUTED};
-        margin-top: 1;
-    }}
+    AWSPanel .label {{ color: {MUTED}; margin-top: 1; }}
     AWSPanel Input {{
         background: {PANEL};
         border: round {BORDER};
@@ -105,14 +108,8 @@ class AWSPanel(Vertical):
         color: {GREEN_GLOW};
         border: round {GREEN_GLOW};
     }}
-    AWSPanel .strength {{
-        height: 1;
-        width: 100%;
-    }}
-    AWSPanel .trace {{
-        height: 1;
-        width: 100%;
-    }}
+    AWSPanel .strength {{ height: 1; width: 100%; }}
+    AWSPanel .trace {{ height: 1; width: 100%; }}
     AWSPanel .status {{
         height: auto;
         width: 100%;
@@ -148,7 +145,6 @@ class AWSPanel(Vertical):
         self._region_static: Optional[Static] = None
         self._mcp_status: Optional[Static] = None
 
-        # Subscribe to EnvManager so external changes refresh this panel.
         self._env_cb = self._on_env_changed
 
     def compose(self) -> ComposeResult:
@@ -172,7 +168,7 @@ class AWSPanel(Vertical):
         yield self._region_static
         yield Select(
             [(r, r) for r in AWS_REGIONS],
-            value=self._app.aws.get("region") or "ap-south-1",
+            value=self._app.aws.get("region") or DEFAULT_REGION,
             id="aws-region",
             allow_blank=False,
         )
@@ -189,7 +185,6 @@ class AWSPanel(Vertical):
         yield self._mcp_status
 
     def on_mount(self) -> None:
-        # Pull the freshest creds from EnvManager (may differ from app.aws).
         self._sync_from_env()
         try:
             EnvManager.get().subscribe(self._env_cb)
@@ -212,7 +207,6 @@ class AWSPanel(Vertical):
     # ------------------------------------------------------------------
 
     def _sync_from_env(self) -> None:
-        """Copy EnvManager's view of AWS creds into the app state."""
         try:
             creds = EnvManager.get().get_aws_credentials()
         except Exception:
@@ -227,7 +221,6 @@ class AWSPanel(Vertical):
             self._app.aws["region"] = creds["region"]
 
     def _on_env_changed(self, snapshot: dict) -> None:
-        """EnvManager notified us that creds changed (e.g. another panel)."""
         try:
             if not isinstance(getattr(self._app, "aws", None), dict):
                 return
@@ -381,9 +374,9 @@ class AWSPanel(Vertical):
     def _current_region(self) -> str:
         try:
             val = self.query_one("#aws-region", Select).value
-            return str(val) if val else "ap-south-1"
+            return str(val) if val else DEFAULT_REGION
         except Exception:
-            return "ap-south-1"
+            return DEFAULT_REGION
 
     # ------------------------------------------------------------------
     # MCP status
@@ -392,8 +385,7 @@ class AWSPanel(Vertical):
     def refresh_mcp_status(self) -> None:
         if self._mcp_status is None:
             return
-        line = self._compute_mcp_status()
-        self._mcp_status.update(line)
+        self._mcp_status.update(self._compute_mcp_status())
 
     def _compute_mcp_status(self) -> str:
         mcp_tools = 0
@@ -414,7 +406,7 @@ class AWSPanel(Vertical):
                     tools = client.list_tools() if hasattr(client, "list_tools") else []
                     mcp_tools = sum(
                         1 for t in tools
-                        if t["function"]["name"].startswith("mcp__aws__")
+                        if t.get("function", {}).get("name", "").startswith("mcp__aws__")
                     )
                     if mcp_tools:
                         break
@@ -443,7 +435,7 @@ class AWSPanel(Vertical):
         )
 
     # ------------------------------------------------------------------
-    # public API used by the app
+    # public API
     # ------------------------------------------------------------------
 
     def start_scan(self, passes: int = 2) -> None:
@@ -480,7 +472,7 @@ class AWSPanel(Vertical):
             secret_input.value = (
                 "••••••••" if self._app.aws.get("secret_key") else ""
             )
-            region = self._app.aws.get("region") or "ap-south-1"
+            region = self._app.aws.get("region") or DEFAULT_REGION
             if region in AWS_REGIONS:
                 self.query_one("#aws-region", Select).value = region
         except Exception:
@@ -490,26 +482,29 @@ class AWSPanel(Vertical):
         self.refresh_mcp_status()
 
     # ------------------------------------------------------------------
-    # SAVE — the actual fix for bug 1 and 7
+    # SAVE
     # ------------------------------------------------------------------
 
     def save_credentials(self) -> dict:
         """
-        Read inputs, persist via EnvManager (which updates os.environ and
-        notifies subscribers), then trigger agent reload.
-
-        Returns {"ok": bool, "error": Optional[str]}.
+        Persist via EnvManager (updates os.environ + notifies subscribers),
+        then trigger the agent reload hook.
         """
         try:
             access_key = self.query_one("#aws-key", Input).value.strip()
         except Exception:
             access_key = ""
+
         try:
             secret_input = self.query_one("#aws-secret", Input)
             secret_key = secret_input.value.strip()
-            # If the field still shows the placeholder, keep the existing key.
+            # Placeholder means "keep existing".
             if secret_key == "••••••••":
-                secret_key = self._app.aws.get("secret_key") or ""
+                secret_key = (
+                    self._app.aws.get("secret_key")
+                    or EnvManager.get().get_aws_credentials().get("secret_key")
+                    or ""
+                )
         except Exception:
             secret_key = ""
 
@@ -527,13 +522,12 @@ class AWSPanel(Vertical):
         except Exception as e:
             return {"ok": False, "error": str(e)}
 
-        # Update local app state
         if isinstance(getattr(self._app, "aws", None), dict):
             self._app.aws["access_key"] = access_key
             self._app.aws["secret_key"] = secret_key
             self._app.aws["region"] = region
 
-        # Fire a hook so the coordinator can reload the running agent.
+        # Fire reload hook (best effort).
         try:
             hook = getattr(self._app, "on_aws_changed", None)
             if callable(hook):
@@ -541,7 +535,7 @@ class AWSPanel(Vertical):
         except Exception:
             pass
 
-        # Refresh visuals
+        # Refresh visuals.
         self.refresh_values()
         self.refresh_mcp_status()
         self.start_scan(passes=2)

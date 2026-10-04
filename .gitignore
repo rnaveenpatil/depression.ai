@@ -1,6 +1,31 @@
+# Credentials and secrets — never commit these
 .env
 .env.*
 !.env.example
+# AWS: the CLI's own credential store (~/.agent/env for real users) plus any
+# repo-local copy of it or the shared credentials file.
+.agent/env
+.agent/credentials
+.aws/
+aws-credentials
+*.credentials
+# Firebase / Google OAuth
+firebase.json
+client_secrets.json
+*service_account*.json
+service-account*.json
+# Keys and certificates
+*.pem
+*.key
+*.p12
+*.pfx
+*.jks
+*.keystore
+*_rsa
+*_rsa.pub
+# Agent runtime config: holds llm.api_keys (provider secrets)
+.agent/config.json
+
 __pycache__/
 *.py[cod]
 .pytest_cache/

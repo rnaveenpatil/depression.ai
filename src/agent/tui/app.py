@@ -4,7 +4,6 @@ from __future__ import annotations
 import asyncio
 import os as _os
 import re
-import threading
 import time
 from typing import Any, Optional
 
@@ -20,7 +19,11 @@ from textual.widgets import Button, Footer, Input, Select, Static
 from agent.agent.dual_agent import AgentCoordinator
 from agent.llm.provider import get_llm_registry
 from agent.llm.runtime import configure_runtime_provider, load_runtime_config
-from agent.utils.env_manager import get_aws_credentials, set_aws_credentials
+from agent.utils.env_manager import (
+    EnvManager,
+    get_aws_credentials,
+    set_aws_credentials,
+)
 
 from agent.tui.events import AgentEvent, EventBridge
 from agent.tui.theme import (
@@ -41,20 +44,18 @@ MODE_ICONS = {"plan": "◇", "build": "◆"}
 MODE_ORDER = ["build", "plan"]
 
 DEFAULT_TURN_TIMEOUT = 900.0
+DEFAULT_AWS_REGION = "us-east-1"
 
-# Panel identifiers used by the sidebar and the slash commands.
 _PANEL_NAMES = ("llm", "aws", "context", "todo", "llmcost", "help")
 
 
 def _esc(text: Any) -> str:
-    """Escape a value for safe embedding inside a Textual markup string."""
     if text is None:
         return ""
     return str(text).replace("[", r"\[")
 
 
 def _fmt(n: Any) -> str:
-    """Format an integer with thousands separators."""
     try:
         return f"{int(n):,}"
     except Exception:
@@ -69,12 +70,10 @@ def _fmt_cost(v: Any) -> str:
 
 
 def _shorten_path(path: str, max_len: int = 32) -> str:
-    """Middle-ellipsis a long path so the tail stays readable."""
     if not path:
         return "—"
     if len(path) <= max_len:
         return path
-    # Keep the leading ~ or / and the last two segments.
     head_len = max(4, max_len - 24)
     tail_len = max_len - head_len - 1
     return f"{path[:head_len]}…{path[-tail_len:]}"
@@ -194,14 +193,16 @@ class ContextPanel(Vertical):
 
 class LLMCostPanel(Vertical):
     """
-    Live view of tokens, API calls, and cost for the current query and
-    for the whole session.
+    Live view of tokens, API calls, and cost.
 
-    Data sources:
-      - Session counters come from `coordinator.get_status()` (accumulated
-        on `AgentContext` by `Agent._run_query_pipeline`).
-      - Per-query counters come from the active `AgentLoop.context` (reset
-        at the top of every `run()`).
+    Data sources (in priority order):
+      1. The active AgentLoop's LoopContext — per-query counters and the
+         live "duration" tick.
+      2. The coordinator's status dict — session totals (via
+         AgentCoordinator.get_status()).
+      3. The app's own reactives — last-resort fallback.
+
+    Polls once a second so duration updates while a query is running.
     """
 
     DEFAULT_CSS = f"""
@@ -220,21 +221,17 @@ class LLMCostPanel(Vertical):
     def __init__(self, app_ref: "DepressionApp", **kwargs: Any):
         super().__init__(**kwargs)
         self._app = app_ref
-        # Cached per-query values so the tick can update duration without
-        # re-reading the whole loop each frame.
         self._query_start_ts: float = 0.0
         self._query_active: bool = False
 
     def compose(self) -> ComposeResult:
         yield Static(f"[bold {GREEN}]▌ LLM COST[/]", markup=True)
 
-        # ---- environment ----
         yield Static("dir", classes="label")
         yield Static("", id="cost-dir", classes="value")
         yield Static("data", classes="label")
         yield Static("", id="cost-data", classes="value")
 
-        # ---- model / session ----
         yield Static("model", classes="label")
         yield Static("", id="cost-model", classes="value")
         yield Static("provider", classes="label")
@@ -242,7 +239,6 @@ class LLMCostPanel(Vertical):
         yield Static("session", classes="label")
         yield Static("", id="cost-session", classes="value")
 
-        # ---- current query ----
         yield Static("── this query ──", classes="head")
         yield Static("", id="cost-q-in",    classes="value")
         yield Static("", id="cost-q-out",   classes="value")
@@ -251,7 +247,6 @@ class LLMCostPanel(Vertical):
         yield Static("", id="cost-q-tools", classes="value")
         yield Static("", id="cost-q-dur",   classes="value")
 
-        # ---- session totals ----
         yield Static("── session ──", classes="head")
         yield Static("", id="cost-s-in",    classes="value")
         yield Static("", id="cost-s-out",   classes="value")
@@ -263,154 +258,253 @@ class LLMCostPanel(Vertical):
 
     def on_mount(self) -> None:
         self.refresh_values()
-        # Duration ticks once a second while a query is in flight.
-        self.set_interval(1.0, self._tick_duration)
+        # Poll once a second; the render is cheap and idempotent.
+        self.set_interval(1.0, self.refresh_values)
 
+    # ------------------------------------------------------------------
+    # Data acquisition
     # ------------------------------------------------------------------
 
     def _coordinator_status(self) -> dict:
         try:
-            if self._app.coordinator is not None:
-                return self._app.coordinator.get_status() or {}
+            coord = getattr(self._app, "coordinator", None)
+            if coord is None:
+                return {}
+            fn = getattr(coord, "get_status", None)
+            if callable(fn):
+                st = fn() or {}
+                if isinstance(st, dict):
+                    return st
         except Exception:
             pass
         return {}
 
     def _loop_context(self) -> Any:
-        try:
-            if self._app.coordinator is not None:
-                agent = self._app.coordinator.get_current_agent()
-                return getattr(agent, "loop", None) and agent.loop.context
-        except Exception:
-            pass
-        return None
+        """Return the active loop's LoopContext if reachable, else None."""
+        coord = getattr(self._app, "coordinator", None)
+        if coord is None:
+            return None
 
-    def _tick_duration(self) -> None:
-        if not self._query_active:
-            return
+        agent = None
         try:
-            self.query_one("#cost-q-dur", Static).update(
-                f"[{MUTED}]duration[/]  [{TEXT}]"
-                f"{time.time() - self._query_start_ts:.1f}s[/]"
-            )
+            fn = getattr(coord, "get_current_agent", None)
+            if callable(fn):
+                agent = fn()
         except Exception:
-            pass
+            agent = None
+
+        if agent is None:
+            for attr in ("build_agent", "plan_agent"):
+                candidate = getattr(coord, attr, None)
+                if candidate is not None:
+                    agent = candidate
+                    break
+
+        if agent is None:
+            return None
+
+        loop = getattr(agent, "loop", None)
+        if loop is None:
+            return None
+        return getattr(loop, "context", None)
+
+    @staticmethod
+    def _num(obj: Any, *names: str) -> int:
+        """First present numeric attribute from `names`, else 0."""
+        if obj is None:
+            return 0
+        for n in names:
+            v = obj.get(n) if isinstance(obj, dict) else getattr(obj, n, None)
+            if v is None:
+                continue
+            try:
+                return int(v)
+            except Exception:
+                continue
+        return 0
+
+    @staticmethod
+    def _flt(obj: Any, *names: str) -> float:
+        if obj is None:
+            return 0.0
+        for n in names:
+            v = obj.get(n) if isinstance(obj, dict) else getattr(obj, n, None)
+            if v is None:
+                continue
+            try:
+                return float(v)
+            except Exception:
+                continue
+        return 0.0
+
+    @staticmethod
+    def _str(obj: Any, *names: str, default: str = "—") -> str:
+        if obj is None:
+            return default
+        for n in names:
+            v = obj.get(n) if isinstance(obj, dict) else getattr(obj, n, None)
+            if v:
+                return str(v)
+        return default
+
+    # ------------------------------------------------------------------
+    # Query lifecycle
+    # ------------------------------------------------------------------
 
     def mark_query_start(self) -> None:
         self._query_start_ts = time.time()
         self._query_active = True
+        self.refresh_values()
 
     def mark_query_end(self) -> None:
         self._query_active = False
+        self.refresh_values()
 
+    # ------------------------------------------------------------------
+    # Render
     # ------------------------------------------------------------------
 
     def refresh_values(self) -> None:
         status = self._coordinator_status()
-
-        # ---- environment ----
-        project_dir = str(status.get("project_dir") or "")
-        data_dir = str(status.get("data_dir") or "")
-        try:
-            self.query_one("#cost-dir", Static).update(
-                f"[{TEXT}]{_esc(_shorten_path(project_dir))}[/]"
-            )
-            self.query_one("#cost-data", Static).update(
-                f"[{TEXT}]{_esc(_shorten_path(data_dir))}[/]"
-            )
-        except Exception:
-            pass
-
-        # ---- model / session ----
-        model = status.get("model") or "—"
-        provider = status.get("provider") or "—"
-        session_id = status.get("session_id") or "—"
-        if len(str(model)) > 30:
-            model = str(model)[:29] + "…"
-        if len(str(session_id)) > 16:
-            session_id = str(session_id)[:16]
-        try:
-            self.query_one("#cost-model", Static).update(
-                f"[{TEXT}]{_esc(model)}[/]"
-            )
-            self.query_one("#cost-provider", Static).update(
-                f"[{TEXT}]{_esc(provider)}[/]"
-            )
-            self.query_one("#cost-session", Static).update(
-                f"[{TEXT}]{_esc(session_id)}[/]"
-            )
-        except Exception:
-            pass
-
-        # ---- current query ----
         ctx = self._loop_context()
+
+        # ---------- environment ----------
+        project_dir = self._str(
+            status, "project_dir", "workspace_dir", "cwd", default=""
+        )
+        data_dir = self._str(status, "data_dir", "home_dir", default="")
+        self._update(
+            "#cost-dir", f"[{TEXT}]{_esc(_shorten_path(project_dir))}[/]"
+        )
+        self._update(
+            "#cost-data", f"[{TEXT}]{_esc(_shorten_path(data_dir))}[/]"
+        )
+
+        # ---------- model / provider / session ----------
+        model = self._str(
+            status, "model", "model_name",
+            default=(
+                str(getattr(self._app, "cfg", {}).get("model") or "—")
+                if isinstance(getattr(self._app, "cfg", None), dict) else "—"
+            ),
+        )
+        provider = self._str(status, "provider", "provider_name", default="—")
+        session_id = self._str(
+            status, "session_id", "session", "current_session_id", default="—"
+        )
+        if len(model) > 30:
+            model = model[:29] + "…"
+        if len(session_id) > 16:
+            session_id = session_id[:16]
+        self._update("#cost-model", f"[{TEXT}]{_esc(model)}[/]")
+        self._update("#cost-provider", f"[{TEXT}]{_esc(provider)}[/]")
+        self._update("#cost-session", f"[{TEXT}]{_esc(session_id)}[/]")
+
+        # ---------- this query ----------
         if ctx is not None:
-            qi = int(getattr(ctx, "input_tokens", 0) or 0)
-            qo = int(getattr(ctx, "output_tokens", 0) or 0)
-            qt = int(getattr(ctx, "tokens_used", 0) or 0) or (qi + qo)
-            qc = int(getattr(ctx, "llm_calls", 0) or 0)
-            qtools = len(getattr(ctx, "actions_taken", []) or [])
-            qdur = time.time() - float(getattr(ctx, "start_time", time.time()))
+            qi = self._num(ctx, "input_tokens", "prompt_tokens")
+            qo = self._num(ctx, "output_tokens", "completion_tokens")
+            qt = self._num(ctx, "tokens_used", "total_tokens") or (qi + qo)
+            qc = self._num(ctx, "llm_calls", "api_calls")
+            actions = getattr(ctx, "actions_taken", None)
+            if actions is None and isinstance(ctx, dict):
+                actions = ctx.get("actions_taken")
+            qtools = len(actions) if actions is not None else 0
+            start_ts = self._flt(ctx, "start_time") or self._query_start_ts
+            qdur = time.time() - start_ts if start_ts else 0.0
         else:
             qi = qo = qt = qc = qtools = 0
-            qdur = 0.0
+            qdur = (
+                time.time() - self._query_start_ts
+                if self._query_active and self._query_start_ts else 0.0
+            )
 
-        try:
-            self.query_one("#cost-q-in", Static).update(
-                f"[{MUTED}]in[/]      [{TEXT}]{_fmt(qi)}[/]"
-            )
-            self.query_one("#cost-q-out", Static).update(
-                f"[{MUTED}]out[/]     [{TEXT}]{_fmt(qo)}[/]"
-            )
-            self.query_one("#cost-q-total", Static).update(
-                f"[{MUTED}]total[/]   [{GREEN}]{_fmt(qt)}[/]"
-            )
-            self.query_one("#cost-q-calls", Static).update(
-                f"[{MUTED}]api calls[/]  [{AMBER}]{_fmt(qc)}[/]"
-            )
-            self.query_one("#cost-q-tools", Static).update(
-                f"[{MUTED}]tool calls[/] [{TEXT}]{_fmt(qtools)}[/]"
-            )
-            self.query_one("#cost-q-dur", Static).update(
-                f"[{MUTED}]duration[/]  [{TEXT}]{qdur:.1f}s[/]"
-            )
-        except Exception:
-            pass
+        self._update(
+            "#cost-q-in", f"[{MUTED}]in[/]      [{TEXT}]{_fmt(qi)}[/]"
+        )
+        self._update(
+            "#cost-q-out", f"[{MUTED}]out[/]     [{TEXT}]{_fmt(qo)}[/]"
+        )
+        self._update(
+            "#cost-q-total", f"[{MUTED}]total[/]   [{GREEN}]{_fmt(qt)}[/]"
+        )
+        self._update(
+            "#cost-q-calls", f"[{MUTED}]api calls[/]  [{AMBER}]{_fmt(qc)}[/]"
+        )
+        self._update(
+            "#cost-q-tools", f"[{MUTED}]tool calls[/] [{TEXT}]{_fmt(qtools)}[/]"
+        )
+        self._update(
+            "#cost-q-dur", f"[{MUTED}]duration[/]  [{TEXT}]{qdur:.1f}s[/]"
+        )
 
-        # ---- session totals ----
-        si = int(status.get("input_tokens", 0) or 0)
-        so = int(status.get("output_tokens", 0) or 0)
-        st = int(status.get("tokens_used", 0) or 0) or (si + so)
-        sc = int(status.get("llm_calls", 0) or 0)
-        stools = int(status.get("tools_used", {}) and sum(status.get("tools_used", {}).values()) or 0)
-        # tools_used is a dict of {tool: count}; sum gives total tool calls.
+        # ---------- session ----------
+        si = self._num(status, "input_tokens", "prompt_tokens", "total_input_tokens")
+        so = self._num(status, "output_tokens", "completion_tokens", "total_output_tokens")
+        st = self._num(status, "tokens_used", "total_tokens") or (si + so)
+        sc = self._num(status, "llm_calls", "api_calls", "total_llm_calls")
+
+        tools_used = None
+        if isinstance(status, dict):
+            tools_used = status.get("tools_used") or status.get("tool_calls")
+        stools = 0
+        if isinstance(tools_used, dict):
+            try:
+                stools = sum(int(v) for v in tools_used.values())
+            except Exception:
+                stools = 0
+        elif isinstance(tools_used, (int, float)):
+            stools = int(tools_used)
         if stools == 0:
-            stools = int(status.get("metrics", {}).get("total_tool_calls", 0) or 0)
-        sturns = int(status.get("turn_count", 0) or 0)
-        scost = status.get("cost", 0.0) or 0.0
+            stools = self._num(status, "total_tool_calls", "tool_calls_total")
 
+        sturns = self._num(
+            status, "turn_count", "turns", "message_count", "messages"
+        )
+        scost = self._flt(status, "cost", "total_cost", "cost_usd")
+
+        # Fall back to app reactives if status is empty.
+        if st == 0:
+            st = int(getattr(self._app, "tokens_used", 0) or 0)
+        if scost == 0.0:
+            scost = float(getattr(self._app, "cost", 0.0) or 0.0)
+        if sturns == 0:
+            sturns = int(getattr(self._app, "message_count", 0) or 0)
+
+        # Last resort: derive session from the live loop context.
+        if st == 0 and ctx is not None:
+            si = self._num(ctx, "input_tokens")
+            so = self._num(ctx, "output_tokens")
+            st = self._num(ctx, "tokens_used") or (si + so)
+            sc = self._num(ctx, "llm_calls")
+            stools = stools or (len(getattr(ctx, "actions_taken", []) or []))
+
+        self._update(
+            "#cost-s-in", f"[{MUTED}]in[/]      [{TEXT}]{_fmt(si)}[/]"
+        )
+        self._update(
+            "#cost-s-out", f"[{MUTED}]out[/]     [{TEXT}]{_fmt(so)}[/]"
+        )
+        self._update(
+            "#cost-s-total", f"[{MUTED}]total[/]   [{GREEN}]{_fmt(st)}[/]"
+        )
+        self._update(
+            "#cost-s-calls", f"[{MUTED}]api calls[/]  [{AMBER}]{_fmt(sc)}[/]"
+        )
+        self._update(
+            "#cost-s-tools", f"[{MUTED}]tool calls[/] [{TEXT}]{_fmt(stools)}[/]"
+        )
+        self._update(
+            "#cost-s-turns", f"[{MUTED}]turns[/]     [{TEXT}]{_fmt(sturns)}[/]"
+        )
+        self._update(
+            "#cost-s-cost",
+            f"[{MUTED}]cost[/]      [{GREEN_GLOW}]{_fmt_cost(scost)}[/]",
+        )
+
+    def _update(self, selector: str, markup: str) -> None:
         try:
-            self.query_one("#cost-s-in", Static).update(
-                f"[{MUTED}]in[/]      [{TEXT}]{_fmt(si)}[/]"
-            )
-            self.query_one("#cost-s-out", Static).update(
-                f"[{MUTED}]out[/]     [{TEXT}]{_fmt(so)}[/]"
-            )
-            self.query_one("#cost-s-total", Static).update(
-                f"[{MUTED}]total[/]   [{GREEN}]{_fmt(st)}[/]"
-            )
-            self.query_one("#cost-s-calls", Static).update(
-                f"[{MUTED}]api calls[/]  [{AMBER}]{_fmt(sc)}[/]"
-            )
-            self.query_one("#cost-s-tools", Static).update(
-                f"[{MUTED}]tool calls[/] [{TEXT}]{_fmt(stools)}[/]"
-            )
-            self.query_one("#cost-s-turns", Static).update(
-                f"[{MUTED}]turns[/]     [{TEXT}]{_fmt(sturns)}[/]"
-            )
-            self.query_one("#cost-s-cost", Static).update(
-                f"[{MUTED}]cost[/]      [{GREEN_GLOW}]{_fmt_cost(scost)}[/]"
-            )
+            self.query_one(selector, Static).update(markup)
         except Exception:
             pass
 
@@ -669,6 +763,9 @@ class DepressionApp(App):
         self.cfg = load_runtime_config()
         self.aws = get_aws_credentials()
 
+        # Signed-in user (for the banner).
+        self._user_name: str = ""
+
         self.busy = False
         self._active_panel = "llm"
         self._agent_worker = None
@@ -705,9 +802,6 @@ class DepressionApp(App):
                     ("llm", LLMPanel(self, id="panel-llm")),
                     ("aws", AWSPanel(self, id="panel-aws")),
                     ("context", ContextPanel(self, id="panel-context")),
-                    # Pass the app, not a session snapshot — TodoPanel
-                    # re-resolves the live session on every poll so its
-                    # session-key matches the one the tool writes under.
                     ("todo", TodoPanel(app_ref=self, id="panel-todo")),
                     ("llmcost", LLMCostPanel(self, id="panel-llmcost")),
                     ("help", HelpPanel(id="panel-help")),
@@ -761,10 +855,112 @@ class DepressionApp(App):
 
         self._wire_events()
 
+        # Show the signed-in user from the env immediately, so the banner
+        # is correct on every launch (not just the first one).
+        self._load_identity_from_env()
+
         self.query_one("#prompt", Input).focus()
         self._refresh_aws_status()
         self._refresh_token_bar()
         self._refresh_llmcost_panel()
+
+        # First run on this install: welcome page + Gmail sign-in.
+        self.call_later(self._maybe_onboard)
+
+    def _load_identity_from_env(self) -> None:
+        """Read the stored identity from the env (global file, live copy)."""
+        try:
+            name = (
+                _os.environ.get("DEPRESSION_USER_NAME")
+                or _os.environ.get("DEPRESSION_USER_EMAIL")
+                or ""
+            )
+        except Exception:
+            name = ""
+        if name:
+            self._user_name = name
+            try:
+                self.sub_title = name
+            except Exception:
+                pass
+            self._refresh_mode_chip()
+
+    async def _maybe_onboard(self) -> None:
+        """
+        First run: show the welcome/login page (blocks until signed in).
+        Later runs: silently re-expose the stored identity.
+        """
+        from agent.tui.onboarding.welcome import push_welcome_if_new_user
+
+        # Disable the prompt while the gate is up so keystrokes can't
+        # race past onboarding.
+        prompt = None
+        try:
+            prompt = self.query_one("#prompt", Input)
+            prompt.disabled = True
+            prompt.placeholder = "sign in to continue…"
+        except Exception:
+            prompt = None
+
+        try:
+            profile = await push_welcome_if_new_user(
+                self, context_manager=self._context_manager()
+            )
+            if profile is not None:
+                self._sync_identity(profile)
+        finally:
+            if prompt is not None:
+                try:
+                    prompt.disabled = False
+                    prompt.placeholder = "ask the agent…"
+                    prompt.focus()
+                except Exception:
+                    pass
+
+    def _context_manager(self) -> Any:
+        try:
+            coordinator = getattr(self, "coordinator", None)
+            for attr in ("plan_agent", "build_agent"):
+                agent = getattr(coordinator, attr, None)
+                context_manager = getattr(agent, "context_manager", None)
+                if context_manager is not None:
+                    return context_manager
+        except Exception:
+            pass
+        return None
+
+    def _sync_identity(self, profile: Any) -> None:
+        """Reflect the signed-in user in the UI and refresh dependent panels."""
+        name = ""
+        try:
+            name = getattr(profile, "display_name", "") or ""
+        except Exception:
+            name = ""
+        if not name:
+            name = (
+                _os.environ.get("DEPRESSION_USER_NAME")
+                or _os.environ.get("DEPRESSION_USER_EMAIL")
+                or ""
+            )
+        self._user_name = name
+
+        try:
+            self.sub_title = name or "depression.ai"
+        except Exception:
+            pass
+
+        try:
+            self._refresh_aws_status()
+        except Exception:
+            pass
+        try:
+            self._refresh_llmcost_panel()
+        except Exception:
+            pass
+        try:
+            self._refresh_mode_chip()
+        except Exception:
+            pass
 
     def _wire_events(self) -> None:
         if self._event_handlers_registered:
@@ -834,33 +1030,41 @@ class DepressionApp(App):
         if not entries:
             return
 
+        # 1. Push items directly into the panel so it renders even if the
+        #    session-key lookup would miss.
+        pushed = []
+        prio_map = {"high": 1, "medium": 3, "low": 5}
+        for e in entries:
+            status = str(e.get("status") or "pending").lower()
+            if status in ("completed", "done"):
+                status = "done"
+            elif status in ("in_progress", "running"):
+                status = "in_progress"
+            pushed.append({
+                "title": str(e.get("content") or "")[:120],
+                "status": status,
+                "priority": prio_map.get(str(e.get("priority") or "medium"), 3),
+            })
+        try:
+            self.query_one("#panel-todo", TodoPanel).set_items(pushed)
+        except Exception:
+            pass
+
+        # 2. Also seed the TodoTool store so other readers see it.
         try:
             from agent.tools.todo import TodoTool, TodoItem
             session = self._session()
             sid = TodoTool._session_key(session)
             store = TodoTool._strong_keys.setdefault(sid, {})
             store.clear()
-            prio_map = {"high": 1, "medium": 3, "low": 5}
-            for i, e in enumerate(entries):
+            for i, item in enumerate(pushed):
                 tid = f"plan_{i}"
-                status = str(e.get("status") or "pending").lower()
-                if status in ("completed", "done"):
-                    status = "done"
-                elif status in ("in_progress", "running"):
-                    status = "in_progress"
                 store[tid] = TodoItem(
                     id=tid,
-                    title=str(e.get("content") or "")[:120],
-                    status=status,
-                    priority=prio_map.get(str(e.get("priority") or "medium"), 3),
+                    title=item["title"],
+                    status=item["status"],
+                    priority=item["priority"],
                 )
-
-            # Nudge the panel so it re-reads the freshly written store
-            # now instead of waiting for its next 0.5s tick.
-            try:
-                self.query_one("#panel-todo", TodoPanel)._refresh()
-            except Exception:
-                pass
         except Exception:
             pass
 
@@ -986,7 +1190,7 @@ class DepressionApp(App):
                     pass
 
     # ------------------------------------------------------------------
-    # MODE CHIP
+    # MODE CHIP  (with welcome <name>)
     # ------------------------------------------------------------------
 
     def _mode_chip(self) -> str:
@@ -1008,10 +1212,18 @@ class DepressionApp(App):
         if self.queue_depth > 0:
             queue = f"  [{DIM}]·[/]  [{AMBER}]⧗ {self.queue_depth} queued[/]"
 
+        # The signed-in user, shown under the banner line.
+        welcome = ""
+        if self._user_name:
+            short = self._user_name
+            if len(short) > 24:
+                short = short[:23] + "…"
+            welcome = f"  [{DIM}]·[/]  [{GREEN}]welcome {_esc(short)}[/]"
+
         return (
             f"{prefix}[{GREEN}]{icon} {self.current_mode.upper()}[/]  "
             f"[{DIM}]·[/]  [{TEXT}]{model}[/]  "
-            f"[{DIM}]·[/]  {ctx}{queue}"
+            f"[{DIM}]·[/]  {ctx}{welcome}{queue}"
         )
 
     _BUSY_PLACEHOLDER = "agent running… type to queue · esc to interrupt"
@@ -1195,7 +1407,6 @@ class DepressionApp(App):
         self.live_total_tokens = 0
         self._refresh_token_bar()
 
-        # Mark the query start on the cost panel so duration ticks.
         try:
             self.query_one("#panel-llmcost", LLMCostPanel).mark_query_start()
         except Exception:
@@ -1456,49 +1667,102 @@ class DepressionApp(App):
 
     @on(Button.Pressed, "#aws-save")
     def save_aws(self) -> None:
-        key = self.query_one("#aws-key", Input).value.strip()
-        secret_input = self.query_one("#aws-secret", Input)
-        secret = secret_input.value.strip()
-        region = str(self.query_one("#aws-region", Select).value or "")
+        """
+        Delegate to the panel's save_credentials(), which is the one path
+        that writes through EnvManager (updates os.environ + notifies
+        subscribers), then refresh local state and MCP config.
+        """
         panel = self.query_one("#panel-aws", AWSPanel)
+        panel.start_radar()
 
-        if not key or not secret or not region:
-            panel.set_status("access key, secret, and region are required")
+        result = panel.save_credentials()
+        if not result.get("ok"):
+            panel.set_status(f"error: {_esc(result.get('error') or 'save failed')}")
+            panel.start_trace(ok=False)
             return
 
-        panel.start_radar()
+        # Reflect the new creds in the app.
+        self.aws = get_aws_credentials()
+        panel.refresh_values()
+        panel.set_status(
+            f"saved to ~/.agent/env · {self.aws.get('region') or DEFAULT_AWS_REGION}"
+        )
+        panel.start_scan(passes=2)
+        panel.start_trace(ok=True)
+
+        # Best-effort MCP config refresh.
+        note = ""
         try:
-            set_aws_credentials(key, secret, region)
-            self.aws = get_aws_credentials()
-            panel.refresh_values()
-            panel.set_status(f"saved to .env · {region}")
-            panel.start_scan(passes=2)
-            panel.start_trace(ok=True)
-
-            note = ""
-            try:
-                from agent.mcp.aws_config import install_aws_preset_into_config
-                mcp_cfg = None
-                if self.coordinator is not None:
-                    for attr in ("plan_agent", "build_agent"):
-                        agent = getattr(self.coordinator, attr, None)
-                        client = getattr(agent, "mcp_client", None) if agent else None
-                        if client is not None and hasattr(client, "config"):
-                            mcp_cfg = client.config
-                            break
-                if mcp_cfg is not None:
-                    if install_aws_preset_into_config(mcp_cfg, region=region):
+            from agent.mcp.aws_config import install_aws_preset_into_config
+            mcp_cfg = None
+            if self.coordinator is not None:
+                for attr in ("plan_agent", "build_agent"):
+                    agent = getattr(self.coordinator, attr, None)
+                    client = getattr(agent, "mcp_client", None) if agent else None
+                    if client is not None and hasattr(client, "config"):
+                        mcp_cfg = client.config
+                        break
+            if mcp_cfg is not None:
+                res = install_aws_preset_into_config(
+                    mcp_cfg, region=self.aws.get("region")
+                )
+                if isinstance(res, dict):
+                    if res.get("installed"):
                         note = " · MCP config updated (restart to apply)"
-            except Exception as exc:
-                note = f" · MCP config refresh skipped: {_esc(exc)}"
-
-            panel.refresh_mcp_status()
-            self._system(
-                f"AWS credentials saved to .env ({region}){note}"
-            )
+                elif res:
+                    note = " · MCP config updated (restart to apply)"
         except Exception as exc:
-            panel.set_status(f"error: {_esc(exc)}")
-            panel.start_trace(ok=False)
+            note = f" · MCP config refresh skipped: {_esc(exc)}"
+
+        panel.refresh_mcp_status()
+        self._system(
+            f"AWS credentials saved to ~/.agent/env "
+            f"({self.aws.get('region') or DEFAULT_AWS_REGION}){note}"
+        )
+
+    # ------------------------------------------------------------------
+    # AWS CHANGE HOOK
+    # ------------------------------------------------------------------
+
+    def on_aws_changed(self) -> None:
+        """
+        Called by the AWS panel after creds change. Invalidates the loop's
+        system-prompt cache and reloads MCP with the new env.
+        """
+        # Invalidate the system prompt cache on both agents.
+        if self.coordinator is not None:
+            for attr in ("plan_agent", "build_agent"):
+                agent = getattr(self.coordinator, attr, None)
+                if agent is None:
+                    continue
+                loop = getattr(agent, "loop", None)
+                if loop is not None:
+                    try:
+                        loop._system_prompt_cache = None
+                        loop._system_prompt_fp = None
+                        loop._project_ctx = None
+                        loop._project_ctx_ts = 0.0
+                    except Exception:
+                        pass
+
+        # Best-effort MCP reload (async; fire and forget).
+        try:
+            if self.coordinator is not None:
+                for attr in ("plan_agent", "build_agent"):
+                    agent = getattr(self.coordinator, attr, None)
+                    client = getattr(agent, "mcp_client", None) if agent else None
+                    if client is None:
+                        continue
+                    if hasattr(client, "reload"):
+                        try:
+                            asyncio.create_task(client.reload())
+                        except Exception:
+                            pass
+                    break
+        except Exception:
+            pass
+
+        self._refresh_aws_status()
 
     # ------------------------------------------------------------------
     # KEYS
