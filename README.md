@@ -36,7 +36,7 @@ The project combines agentic AI, software engineering, system automation, cloud 
 * 🏫 **Moodlakatte Institute of Technology (MIT), Kundapura**
 * 🎓 **Department:** Information Science & Engineering (ISE)
 * 📚 **Project Type:** Academic Major Project
-* 👨‍🎓 **Team:** Final-year ISE students
+* 👨‍🎓 **Team:** TEAM DEPRESSION
 
 **College LinkedIn**
 
