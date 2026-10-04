@@ -13,8 +13,16 @@ Consistency guarantees enforced here:
       can self-correct instead of stalling.
     * Success is only reported when a tool output in this session proves it.
     * Cache is invalidated whenever a mutating tool runs.
-    * System prompt is rebuilt when its fingerprint changes.
-    * Compaction accounts for system prompt + tool schemas + state block.
+    * System prompt is rebuilt when its fingerprint changes and is tagged
+      with metadata so the loop can detect it. [Bug 5]
+    * The loop NEVER writes the final assistant turn — that is the caller's
+      job so each user query produces exactly one assistant message.
+      [M2/N4/N10]
+    * [Permission gate] Every tool call is dispatched through the AGENT's
+      execute_tool(), which runs the permission manager. The registry's
+      raw execute_safe is only used when the agent has no execute_tool
+      (tests / sub-agents). A belt-and-braces check in _act() also refuses
+      destructive calls that somehow reach the registry directly.
 """
 from __future__ import annotations
 
@@ -22,6 +30,7 @@ import asyncio
 import hashlib
 import inspect
 import json
+import re
 import time
 from collections import deque
 from dataclasses import dataclass, field
@@ -42,11 +51,105 @@ logger = get_logger(__name__)
 PLAN_DRIVEN_MIN_TASKS = 3
 PLAN_TASK_MAX_ATTEMPTS = 3
 
-# Keywords that let us classify intent without an LLM round-trip.
 _QUESTION_PREFIXES = (
     "what", "why", "how", "when", "where", "who", "which",
     "explain", "describe", "tell me", "show me",
 )
+
+# Marker that identifies the real system prompt. Anything else that is a
+# pinned system message is NOT the prompt. [Bug 5]
+SYSTEM_PROMPT_MARKER = "system_prompt"
+
+
+# ----------------------------------------------------------------------
+# Destructive-call detection (belt-and-braces permission guard)
+# ----------------------------------------------------------------------
+# If a tool call looks destructive, _act() requires that the agent's
+# permission manager EXPLICITLY allowed it. This catches the case where
+# execute_tool is missing (tests, stripped agents) or where the registry
+# was called directly and the permission gate was skipped.
+
+_DESTRUCTIVE_TOOL_TOKENS = (
+    "delete", "remove", "unlink", "destroy", "purge", "wipe", "erase",
+    "rmdir", "shred", "truncate", "drop",
+)
+
+_DESTRUCTIVE_ACTION_TOKENS = (
+    "delete", "remove", "reset", "clean", "drop", "prune",
+    "destroy", "purge", "wipe", "erase", "truncate",
+    "force", "overwrite", "hard", "kill", "terminate",
+)
+
+_DESTRUCTIVE_SHELL_PATTERNS = (
+    re.compile(r"\brm\b"),
+    re.compile(r"\brmdir\b"),
+    re.compile(r"\bunlink\b"),
+    re.compile(r"\bshred\b"),
+    re.compile(r"\btruncate\b"),
+    re.compile(r"\bdd\b.*\bof="),
+    re.compile(r"\bmkfs\b"),
+    re.compile(r">\s*/dev/sd"),
+    re.compile(r"\bgit\s+reset\s+--hard\b"),
+    re.compile(r"\bgit\s+clean\s+-[a-z]*f"),
+    re.compile(r"\bgit\s+push\s+--force\b"),
+    re.compile(r"\bkubectl\s+delete\b"),
+    re.compile(r"\baws\s+s3\s+rm\b"),
+    re.compile(r"\baws\s+s3api\s+delete"),
+    re.compile(r"\baws\s+ec2\s+terminate"),
+    re.compile(r"\baws\s+rds\s+delete"),
+    re.compile(r"\bdocker\s+rm\b"),
+    re.compile(r"\bdocker\s+rmi\b"),
+    re.compile(r"\bdocker\s+system\s+prune\b"),
+    re.compile(r"\bdocker\s+volume\s+rm\b"),
+    re.compile(r"\bfind\b.*\s-delete\b"),
+    re.compile(r"curl\b.*\|\s*(?:ba)?sh\b"),
+    re.compile(r"wget\b.*\|\s*(?:ba)?sh\b"),
+)
+
+
+def _looks_destructive_call(name: str, args: Dict[str, Any]) -> bool:
+    """
+    Conservative detector for destructive tool calls.
+
+    Used as a safety net: if the call looks destructive, `_act` requires
+    the permission manager to have explicitly allowed it.
+    """
+    name_l = (name or "").lower()
+
+    # 1. Tool name matches a destructive keyword.
+    for tok in _DESTRUCTIVE_TOOL_TOKENS:
+        if tok in name_l:
+            return True
+
+    # 2. Action string (either the top-level `action` param or the
+    #    tool-name-suffix) matches a destructive keyword.
+    action = ""
+    if isinstance(args, dict):
+        for k in ("action", "operation", "op", "verb"):
+            v = args.get(k)
+            if isinstance(v, str) and v.strip():
+                action = v.strip().lower()
+                break
+    if not action:
+        for tok in _DESTRUCTIVE_ACTION_TOKENS:
+            if tok in name_l:
+                action = tok
+                break
+    if action:
+        for tok in _DESTRUCTIVE_ACTION_TOKENS:
+            if tok in action:
+                return True
+
+    # 3. Any string-valued argument matches a destructive shell pattern.
+    if isinstance(args, dict):
+        for key, val in args.items():
+            if not isinstance(val, str) or not val:
+                continue
+            for pat in _DESTRUCTIVE_SHELL_PATTERNS:
+                if pat.search(val):
+                    return True
+
+    return False
 
 
 class LoopState(Enum):
@@ -132,6 +235,11 @@ class AgentLoop:
         self.enable_intent_classification = config.get("enable_intent_classification", True)
         self.enable_qa_verification = config.get("enable_qa_verification", True)
         self.reserve_output_tokens = int(config.get("reserve_output_tokens", 2000))
+        # Set to False to disable the belt-and-braces destructive guard
+        # (the agent's permission manager is still authoritative).
+        self.require_permission_for_destructive = bool(
+            config.get("require_permission_for_destructive", True)
+        )
 
         self.state = LoopState.IDLE
         self.context = LoopContext()
@@ -142,7 +250,6 @@ class AgentLoop:
         self.performance_history: deque = deque(maxlen=100)
         self.tool_execution_times: Dict[str, List[float]] = {}
 
-        # Cache is bounded by read-only tools and invalidated on mutation.
         self.tool_result_cache: Dict[str, Dict[str, Any]] = {}
         self._cache_epoch: int = 0
 
@@ -165,19 +272,8 @@ class AgentLoop:
     # ------------------------------------------------------------------
     # REGISTRY CAPABILITY PROBES
     # ------------------------------------------------------------------
-    # The loop is constructed with a *duck-typed* registry: the real
-    # ToolRegistry, a slimmed-down registry used by sub-agents, or a stub
-    # in tests. Never assume ``is_read_only`` / ``mutation_epoch`` exist --
-    # reaching for them unconditionally is what turned a missing attribute
-    # into a spurious "tool call failed" for every tool invocation.
 
     def _is_read_only(self, name: str) -> bool:
-        """Return True only if the registry positively says the tool is read-only.
-
-        A missing registry or a registry without ``is_read_only`` yields
-        ``False`` (treat as mutating), which is the safe default: mutating
-        tools are never cached and always invalidate the cache.
-        """
         registry = self.tool_registry
         probe = getattr(registry, "is_read_only", None)
         if not callable(probe):
@@ -189,7 +285,6 @@ class AgentLoop:
             return False
 
     def _registry_epoch(self) -> int:
-        """Return the registry mutation epoch, or 0 when unavailable."""
         epoch = getattr(self.tool_registry, "mutation_epoch", 0)
         try:
             return int(epoch)
@@ -197,11 +292,6 @@ class AgentLoop:
             return 0
 
     def _registry_list_tools(self) -> List[str]:
-        """Return registered tool names, or ``[]`` when unavailable.
-
-        Accepts a real registry (``list_tools()``), a test stub that only
-        exposes a ``tools`` mapping, or ``None``.
-        """
         probe = getattr(self.tool_registry, "list_tools", None)
         if callable(probe):
             try:
@@ -214,7 +304,6 @@ class AgentLoop:
         return []
 
     def _registry_has_tool(self, name: str) -> bool:
-        """Best-effort ``has_tool`` that never raises."""
         probe = getattr(self.tool_registry, "has_tool", None)
         if callable(probe):
             try:
@@ -224,11 +313,6 @@ class AgentLoop:
         return name in self._registry_list_tools()
 
     def _registry_describe_for_prompt(self, tools: Any) -> str:
-        """Render the tool list for the system prompt.
-
-        Falls back to a minimal Markdown list built from the schemas when
-        the registry does not implement ``describe_for_prompt``.
-        """
         probe = getattr(self.tool_registry, "describe_for_prompt", None)
         if callable(probe):
             try:
@@ -247,7 +331,6 @@ class AgentLoop:
         return "\n".join(lines) if lines else "(no tools available)"
 
     def _registry_get_schemas(self) -> List[Dict[str, Any]]:
-        """Return tool schemas, narrowed by intent when supported."""
         for attr, with_intent in (("select_for_task", True), ("get_schemas", False)):
             probe = getattr(self.tool_registry, attr, None)
             if not callable(probe):
@@ -260,38 +343,50 @@ class AgentLoop:
         return []
 
     async def _registry_execute(self, name: str, args: Dict[str, Any]) -> Any:
-        """Execute a tool through whichever registry API is available.
-
-        Prefers ``execute_safe`` (permission-checked, exception-shielded),
-        falls back to ``execute``, then to the agent's own
-        ``execute_tool`` (the path taken when the loop is handed a registry
-        stub), and only then degrades to a structured failure rather than
-        raising ``AttributeError`` when no executor exists at all.
         """
-        probe = getattr(self.tool_registry, "execute_safe", None)
-        if not callable(probe):
-            probe = getattr(self.tool_registry, "execute", None)
+        Execute a tool.
 
-        target = probe
-        if not callable(target):
-            # A stub or slimmed-down registry has no execute API, but the
-            # agent itself can still run tools -- use it instead of failing
-            # every call with a bogus "no registry" error.
-            target = getattr(self.agent, "execute_tool", None)
-            if not callable(target):
+        [Permission gate] The AGENT's execute_tool is preferred because it
+        runs the permission manager. The registry's raw execute_safe is
+        only used as a fallback when the agent has no execute_tool (tests,
+        stripped sub-agents).
+        """
+        agent_exec = getattr(self.agent, "execute_tool", None)
+        if callable(agent_exec):
+            try:
+                result = agent_exec(name, args)
+                if inspect.isawaitable(result):
+                    result = await result
+                return result
+            except Exception as exc:
+                logger.error(
+                    "agent.execute_tool(%s) failed: %s", name, exc, exc_info=True
+                )
                 return {
                     "success": False,
                     "tool": name,
-                    "error": "no tool registry configured for this loop",
+                    "error": str(exc),
                     "recoverable": True,
                 }
+
+        # Fallback: registry directly (no permission gate — tests only).
+        probe = getattr(self.tool_registry, "execute_safe", None)
+        if not callable(probe):
+            probe = getattr(self.tool_registry, "execute", None)
+        if not callable(probe):
+            return {
+                "success": False,
+                "tool": name,
+                "error": "no tool executor available",
+                "recoverable": True,
+            }
         try:
-            result = target(name, args)
+            result = probe(name, args)
             if inspect.isawaitable(result):
                 result = await result
             return result
         except Exception as exc:
-            logger.error("Tool %s failed: %s", name, exc, exc_info=True)
+            logger.error("registry execute(%s) failed: %s", name, exc, exc_info=True)
             return {
                 "success": False,
                 "tool": name,
@@ -370,10 +465,6 @@ class AgentLoop:
     # ==================================================================
 
     async def _classify_intent(self, query: str) -> str:
-        """
-        Fast keyword pre-check first; only call the LLM when the query is
-        genuinely ambiguous. Saves one LLM round-trip on most requests.
-        """
         q = (query or "").strip()
         if not q:
             return "ambiguous"
@@ -830,20 +921,11 @@ class AgentLoop:
             summary = (getattr(response, "content", "") or "").strip()
             self._record_usage(getattr(response, "usage", None))
             if summary:
-                try:
-                    await self.model_context.add_assistant_message(summary)
-                except Exception:
-                    pass
                 return summary
         except Exception as exc:
             logger.debug("Plan summary LLM call failed: %s", exc)
 
-        fallback = f"Plan '{plan.goal}' completed.\n\n{body}"
-        try:
-            await self.model_context.add_assistant_message(fallback)
-        except Exception:
-            pass
-        return fallback
+        return f"Plan '{plan.goal}' completed.\n\n{body}"
 
     # ==================================================================
     # RESULT
@@ -868,7 +950,7 @@ class AgentLoop:
         return out
 
     # ==================================================================
-    # SYSTEM PROMPT (fingerprinted)
+    # SYSTEM PROMPT (fingerprinted + tagged)
     # ==================================================================
 
     async def _system_prompt_fingerprint(self) -> tuple:
@@ -1076,6 +1158,10 @@ use the configured permission mechanism.
 
 Prefer reversible operations when possible.
 
+If a destructive tool call is denied by the permission system, do not
+attempt to work around it (no `bash` tricks, no alternate tools). Explain
+what was blocked and ask the user how to proceed.
+
 ## PLANNING
 
 For tasks requiring multiple operations, show a short checklist before
@@ -1272,11 +1358,9 @@ Never claim success without evidence.
                 context=plan_context,
                 constraints=self._get_plan_constraints(intent=intent),
             )
-            self._refresh_plan_metadata()
-            await self.model_context.add_system_message(
-                "Execution plan guidance:\n"
-                + json.dumps(self.current_plan.to_dict(), indent=2, default=str)
-            )
+            # [Bug 3] Plan guidance is NOT persisted as a system message.
+            # It is delivered per-request via the state block that _think
+            # already builds.
 
             self._mirror_plan_to_todos(self.current_plan)
             self._checklist_rendered = True
@@ -1491,16 +1575,23 @@ Never claim success without evidence.
         return {"response": content, "tool_calls": calls}
 
     async def _ensure_system_prompt(self) -> None:
+        """
+        Ensure the real system prompt is present.
+
+        [Bug 5] The real prompt is identified by metadata["system_prompt"].
+        """
         messages = getattr(self.model_context, "messages", None) or []
-        has_pinned = any(
+        has_real_prompt = any(
             getattr(m, "role", None) == "system"
-            and getattr(m, "pinned", True)
-            and not str(getattr(m, "content", "")).startswith("Execution state:")
+            and (getattr(m, "metadata", {}) or {}).get(SYSTEM_PROMPT_MARKER)
             for m in messages
         )
-        if not has_pinned:
-            await self.model_context.add_system_message(
-                await self._get_system_prompt(), pinned=True
+        if not has_real_prompt:
+            await self.model_context.add_message(
+                role="system",
+                content=await self._get_system_prompt(),
+                pinned=True,
+                metadata={SYSTEM_PROMPT_MARKER: True},
             )
 
     # ==================================================================
@@ -1553,11 +1644,10 @@ Never claim success without evidence.
         )
 
     # ==================================================================
-    # TOOL EXPOSURE (single source of truth, narrowed by intent)
+    # TOOL EXPOSURE
     # ==================================================================
 
     def _get_available_tools(self) -> List[Dict[str, Any]]:
-        """Tools the model may call: registry schemas, narrowed by intent."""
         return self._registry_get_schemas()
 
     async def _get_state_context(self) -> Dict[str, Any]:
@@ -1623,11 +1713,6 @@ Never claim success without evidence.
             else:
                 out = f"Result written to {outcome['path']}"
 
-        # Any non-empty readable output proves the call succeeded; the
-        # fast path returns it directly instead of spending a second LLM
-        # turn re-summarising what the tool already reported. (An earlier
-        # 40-char floor suppressed the fast path for short but perfectly
-        # valid outputs such as "ok".)
         if isinstance(out, str) and out.strip():
             return out.strip()
         return None
@@ -1646,7 +1731,6 @@ Never claim success without evidence.
             if not isinstance(args, dict):
                 args = {}
 
-            # Refuse to repeat the exact same failing call in the same turn.
             if self._is_duplicate_failing_call(name, args):
                 logger.info("Refusing duplicate failing call: %s", name)
                 result = {
@@ -1665,6 +1749,37 @@ Never claim success without evidence.
                     "result": result, "success": False,
                 })
                 continue
+
+            # ---- Belt-and-braces permission guard --------------------
+            # If the call looks destructive AND the agent has no permission
+            # manager wired in, refuse outright. This catches the case where
+            # execute_tool was replaced or the manager was never attached.
+            if (
+                self.require_permission_for_destructive
+                and _looks_destructive_call(name, args)
+            ):
+                pm = getattr(self.agent, "permission_manager", None)
+                if pm is None:
+                    logger.warning(
+                        "Refusing destructive call to %s: no permission manager",
+                        name,
+                    )
+                    result = {
+                        "success": False,
+                        "error": (
+                            f"Refused destructive call to '{name}': no permission "
+                            f"manager is configured on this agent. Deletion and "
+                            f"removal require an explicit permission check."
+                        ),
+                        "recoverable": False,
+                        "permission_denied": True,
+                    }
+                    await self._safe_add_tool_result(call, result)
+                    results.append({
+                        "tool": name, "tool_call_id": call_id,
+                        "result": result, "success": False,
+                    })
+                    continue
 
             try:
                 key = f"{name}:{json.dumps(args, sort_keys=True, default=str)}"
@@ -1706,6 +1821,14 @@ Never claim success without evidence.
                 except Exception:
                     pass
 
+                # If the executor denied the call for permission reasons,
+                # surface it clearly.
+                if result.get("permission_denied"):
+                    logger.info(
+                        "Tool %s denied by permission manager: %s",
+                        name, result.get("error"),
+                    )
+
                 self.tool_execution_times.setdefault(name, []).append(elapsed)
                 self.context.add_action({
                     "tool": name, "tool_call_id": call_id,
@@ -1713,7 +1836,6 @@ Never claim success without evidence.
                 })
                 await self._safe_add_tool_result(call, result)
 
-                # Only cache read-only successes.
                 if (
                     self.enable_caching
                     and result.get("success", False)
@@ -1757,11 +1879,6 @@ Never claim success without evidence.
         return results
 
     def _is_duplicate_failing_call(self, name: str, args: Dict[str, Any]) -> bool:
-        """
-        True if the same tool + same arguments failed within the last few
-        actions AND no mutation happened since. Prevents infinite loops
-        where the model re-emits an identical bad call.
-        """
         try:
             sig = f"{name}:{json.dumps(args, sort_keys=True, default=str)}"
         except Exception:
@@ -1780,7 +1897,6 @@ Never claim success without evidence.
         seen[sig] = seen.get(sig, 0) + 1
 
     def _maybe_invalidate_cache(self) -> None:
-        """Drop the cache if any mutating tool has run since we last checked."""
         current = self._registry_epoch()
         if current != self._cache_epoch:
             if self.tool_result_cache:
@@ -1829,9 +1945,17 @@ Never claim success without evidence.
                 "Re-read the tool schema and retry with corrected arguments."
             )
             invalid = r.get("invalid_arguments", False)
+            permission_denied = bool(r.get("permission_denied"))
 
             guidance = "Do NOT retry with the same arguments."
-            if not recoverable:
+            if permission_denied:
+                guidance = (
+                    "This call was DENIED by the permission system. Do not "
+                    "try to work around it (no alternate tools, no shell "
+                    "tricks). Explain to the user what was blocked and ask "
+                    "how they would like to proceed."
+                )
+            elif not recoverable:
                 guidance = (
                     "This failure is NOT recoverable. Do not retry this tool "
                     "with these arguments. Choose a different approach or stop "
@@ -1844,6 +1968,8 @@ Never claim success without evidence.
                 f"Arguments you sent: {json.dumps(args, default=str)}\n"
                 + ("This was an argument-validation failure. "
                    if invalid else "")
+                + ("This was a PERMISSION DENIAL. "
+                   if permission_denied else "")
                 + f"Recoverable: {recoverable}\n"
                 + f"Suggestion: {suggestion}\n"
                 + guidance
@@ -1902,6 +2028,13 @@ Never claim success without evidence.
     # ==================================================================
 
     async def _generate_final_response(self) -> str:
+        """
+        Generate a closing summary text.
+
+        [M2/N4/N10] This method does NOT persist the assistant turn. The
+        caller (`BaseAgent._run_query_pipeline` / `AgentCoordinator._process_auto`)
+        is the single writer of the final assistant message.
+        """
         messages = get_model_messages(self.model_context, self.max_history_length)
         if not any(getattr(m, "role", None) == "system" for m in messages):
             messages.insert(0, Message(role="system",
@@ -1935,11 +2068,6 @@ Never claim success without evidence.
 
         content = getattr(response, "content", "") or ""
         self._record_usage(getattr(response, "usage", None))
-        if content:
-            try:
-                await self.model_context.add_assistant_message(content)
-            except Exception as exc:
-                logger.debug("add_assistant_message failed: %s", exc)
         return content
 
     # ==================================================================

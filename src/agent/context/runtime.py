@@ -12,6 +12,8 @@ Invariants enforced here (all required by OpenAI/Anthropic-compatible APIs):
     * Tool results only attach to the immediately preceding assistant call.
     * No orphan `tool` messages are ever emitted to the provider.
     * Trimming and grouping operate on whole, valid groups atomically.
+    * The newest conversational turn is never dropped, even if it exceeds
+      the requested window. [Bug 2]
 """
 from __future__ import annotations
 
@@ -24,7 +26,6 @@ from agent.utils.logging import get_logger
 logger = get_logger(__name__)
 
 
-# Byte cap for a single tool result payload stored in context.
 TOOL_RESULT_BYTE_CAP = 8 * 1024
 
 
@@ -54,10 +55,6 @@ def _tool_result_id(m: Any) -> str:
 
 
 def _truncate_payload(payload: Any, cap: int = TOOL_RESULT_BYTE_CAP) -> Any:
-    """
-    Truncate a tool result payload by BYTES (multibyte safe), preserving
-    the shape {success, ...}. Long fields are shortened with a marker.
-    """
     if not isinstance(payload, dict):
         try:
             payload = {"success": True, "result": payload}
@@ -70,7 +67,6 @@ def _truncate_payload(payload: Any, cap: int = TOOL_RESULT_BYTE_CAP) -> Any:
     if len(encoded.encode("utf-8")) <= cap:
         return payload
 
-    # Preserve the shape; cap the largest string values.
     trimmed = dict(payload)
     big_keys = sorted(
         (k for k, v in trimmed.items() if isinstance(v, str)),
@@ -96,14 +92,6 @@ def _truncate_payload(payload: Any, cap: int = TOOL_RESULT_BYTE_CAP) -> Any:
 # ----------------------------------------------------------------------
 
 def group_messages(messages: List[Any]) -> List[List[Any]]:
-    """
-    Group messages so an assistant with tool_calls and its ADJACENT
-    tool results are always in the same group.
-
-    Groups are always internally VALID or the assistant's tool_calls are
-    stripped (see validate_group). Orphan tool messages become singletons
-    (and are dropped by repair_context).
-    """
     groups: List[List[Any]] = []
     i, n = 0, len(messages)
     while i < n:
@@ -128,19 +116,16 @@ def group_messages(messages: List[Any]) -> List[List[Any]]:
 
 
 def validate_group(group: List[Any]) -> bool:
-    """True iff the group is a valid provider sequence."""
     if not group:
         return True
     first = group[0]
     if not _is_assistant_with_calls(first):
-        # A bare assistant / user / system / tool message is only valid if
-        # it's not followed by tool results it can't claim.
         if getattr(first, "role", "") == "tool":
             return False
         return True
     declared = _tool_call_ids(first)
     results = [m for m in group[1:] if getattr(m, "role", "") == "tool"]
-    return [ _tool_result_id(m) for m in results ] == declared
+    return [_tool_result_id(m) for m in results] == declared
 
 
 # ----------------------------------------------------------------------
@@ -148,17 +133,6 @@ def validate_group(group: List[Any]) -> bool:
 # ----------------------------------------------------------------------
 
 def repair_context(context_manager: Any, *, fill_missing: bool = True) -> int:
-    """
-    Repair the message list in place. Returns the number of repairs made.
-
-    Policy:
-      - Every assistant tool_call must have exactly one adjacent tool result.
-      - Missing results are FILLED with a synthetic structured error
-        (fill_missing=True, the default) or the assistant's tool_calls are
-        stripped (fill_missing=False).
-      - Orphan tool results are dropped.
-      - Pinned messages and system messages are never dropped.
-    """
     messages = list(getattr(context_manager, "messages", []) or [])
     if not messages:
         return 0
@@ -170,10 +144,7 @@ def repair_context(context_manager: Any, *, fill_missing: bool = True) -> int:
         m = messages[i]
         role = getattr(m, "role", "")
 
-        # Orphan tool result — drop.
         if role == "tool":
-            # Only valid if the previous appended message was the assistant
-            # that declared this id. Otherwise: drop.
             tid = _tool_result_id(m)
             prev = out[-1] if out else None
             if (
@@ -187,7 +158,6 @@ def repair_context(context_manager: Any, *, fill_missing: bool = True) -> int:
             i += 1
             continue
 
-        # Assistant with tool_calls — ensure full set of results.
         if _is_assistant_with_calls(m):
             declared = _tool_call_ids(m)
             results_by_id: dict[str, Any] = {}
@@ -201,7 +171,6 @@ def repair_context(context_manager: Any, *, fill_missing: bool = True) -> int:
             missing = [cid for cid in declared if cid not in results_by_id]
 
             if missing and not fill_missing:
-                # Strip tool_calls metadata; degrade to a plain assistant msg.
                 try:
                     m.metadata = dict(getattr(m, "metadata", {}) or {})
                     m.metadata.pop("tool_calls", None)
@@ -217,13 +186,11 @@ def repair_context(context_manager: Any, *, fill_missing: bool = True) -> int:
                 if cid in results_by_id:
                     out.append(results_by_id[cid])
                 else:
-                    # Synthetic filler
                     out.append(_synthetic_tool_result(m, cid))
                     repairs += 1
             i = j
             continue
 
-        # Anything else
         out.append(m)
         i += 1
 
@@ -234,7 +201,6 @@ def repair_context(context_manager: Any, *, fill_missing: bool = True) -> int:
 
 
 def _synthetic_tool_result(assistant_msg: Any, tool_call_id: str) -> Any:
-    """Build a ContextMessage-shaped filler for a missing tool result."""
     try:
         from agent.context.manager import ContextMessage
     except Exception:
@@ -264,7 +230,6 @@ def _synthetic_tool_result(assistant_msg: Any, tool_call_id: str) -> Any:
         except Exception:
             pass
 
-    # Minimal fallback with the same attribute surface.
     class _Synthetic:
         __slots__ = ("role", "content", "tokens", "pinned", "metadata", "timestamp")
         def __init__(self) -> None:
@@ -277,7 +242,6 @@ def _synthetic_tool_result(assistant_msg: Any, tool_call_id: str) -> Any:
     return _Synthetic()
 
 
-# Back-compat alias — the old name is still imported by other modules.
 def normalize_messages(context_manager: Any) -> None:
     repair_context(context_manager, fill_missing=True)
 
@@ -291,7 +255,6 @@ def _to_provider_message(cm: Any) -> Message:
     kwargs: dict[str, Any] = {"role": cm.role, "content": cm.content}
     if cm.role == "assistant" and metadata.get("tool_calls"):
         kwargs["tool_calls"] = metadata["tool_calls"]
-        # OpenAI-compatible: assistant carrying tool_calls must have null content.
         kwargs["content"] = None
     if cm.role == "tool":
         kwargs["name"] = metadata.get("name")
@@ -308,14 +271,37 @@ def _estimate_msg_tokens(cm: Any) -> int:
         return max(1, len(content) // 4)
 
 
+def _interleave_systems_and_selected(
+    messages: List[Any], selected: List[Any]
+) -> List[Any]:
+    """
+    Return messages in the correct order for the provider.
+
+    [M1] System messages are interleaved by timestamp with the selected
+    tail, not hoisted to the front. Hoisting made stale plan-guidance
+    system messages read like they were current framing.
+    """
+    combined = list(messages) + list(selected)
+    combined.sort(key=lambda m: getattr(m, "timestamp", 0))
+    # Deduplicate by identity, preserving order.
+    seen = set()
+    out: List[Any] = []
+    for m in combined:
+        if id(m) in seen:
+            continue
+        seen.add(id(m))
+        out.append(m)
+    return out
+
+
 def get_model_messages(context_manager: Any, limit: int = 40_000) -> List[Message]:
     """
     Build provider messages from a token-budgeted tail of the conversation.
 
-    `limit` is a TOKEN budget. Backward-compat: values < 500 are treated
-    as a message count instead (old callers passed max_history_length=40).
+    [Bug 2] The count branch (limit < 500) never drops the newest turn.
+    If the newest group alone exceeds the limit, it is TRUNCATED to fit
+    rather than skipped.
     """
-    # Repair once so grouping is guaranteed valid.
     repair_context(context_manager, fill_missing=True)
     messages = list(getattr(context_manager, "messages", []) or [])
 
@@ -326,12 +312,20 @@ def get_model_messages(context_manager: Any, limit: int = 40_000) -> List[Messag
 
     # Back-compat: small limit == message count.
     if limit < 500:
+        cap = max(1, limit)
         selected: List[Any] = []
         for g in reversed(groups):
-            if len(selected) + len(g) > max(1, limit):
+            if len(selected) + len(g) > cap:
+                if selected:
+                    break
+                # Never drop the newest turn: truncate it to fit.
+                selected[0:0] = g[-cap:]
                 break
             selected[0:0] = g
-        return [_to_provider_message(m) for m in system + selected]
+        return [
+            _to_provider_message(m)
+            for m in _interleave_systems_and_selected(system, selected)
+        ]
 
     # Token-budget walk.
     system_tokens = sum(_estimate_msg_tokens(m) for m in system)
@@ -340,14 +334,30 @@ def get_model_messages(context_manager: Any, limit: int = 40_000) -> List[Messag
     used = 0
     for g in reversed(groups):
         cost = sum(_estimate_msg_tokens(m) for m in g)
-        if used + cost > budget and selected:
+        if used + cost > budget:
+            if not selected:
+                # Truncate the newest group to fit.
+                running = 0
+                keep: List[Any] = []
+                for m in reversed(g):
+                    mc = _estimate_msg_tokens(m)
+                    if running + mc > budget:
+                        break
+                    keep.insert(0, m)
+                    running += mc
+                if keep:
+                    selected[0:0] = keep
+                    used += running
             break
         selected[0:0] = g
         used += cost
         if used >= budget:
             break
 
-    return [_to_provider_message(m) for m in system + selected]
+    return [
+        _to_provider_message(m)
+        for m in _interleave_systems_and_selected(system, selected)
+    ]
 
 
 async def add_tool_call(
@@ -371,10 +381,6 @@ async def add_tool_call(
 
 
 async def add_tool_result(context_manager: Any, call: Any, result: Any) -> None:
-    """
-    Persist a tool result. Payload is truncated by bytes to a single cap so
-    plan mode and free-form mode produce identical-sized messages.
-    """
     payload = _truncate_payload(result)
     await context_manager.add_message(
         role="tool",

@@ -12,8 +12,15 @@ from agent.utils.logging import get_logger
 from agent.context.project import ProjectContext
 from agent.context.files import FileContext
 from agent.context.compaction import Compactor, _estimate_message_tokens
+from agent.context.summary_store import SummaryStore
 
 logger = get_logger(__name__)
+
+
+# Cap the number of pinned (protected) messages. If more than this many
+# accumulate, the newest N are kept and the rest are treated as normal
+# messages so they can age out. [Bug 3]
+MAX_PINNED_MESSAGES = 32
 
 
 @dataclass
@@ -49,6 +56,59 @@ class ContextStats:
     compaction_count: int
 
 
+# ----------------------------------------------------------------------
+# HELPERS
+# ----------------------------------------------------------------------
+
+def _is_compaction_summary(m: Any) -> bool:
+    return bool((getattr(m, "metadata", {}) or {}).get("compacted"))
+
+
+def _is_system_prompt(m: Any) -> bool:
+    return bool((getattr(m, "metadata", {}) or {}).get("system_prompt"))
+
+
+def _split_protected(messages: List[Any]) -> tuple[List[Any], List[Any]]:
+    """
+    Split into (protected, rest) using the *explicit* pinned flag only.
+
+    [Bug 3] Before this, role=="system" was treated as protected too, so
+    every plan-guidance message and every compaction summary became
+    unkillable and eventually evicted the real conversation.
+    """
+    protected: List[Any] = []
+    rest: List[Any] = []
+    for m in messages:
+        if bool(getattr(m, "pinned", False)):
+            protected.append(m)
+        else:
+            rest.append(m)
+    return protected, rest
+
+
+def _drop_stale_summaries(messages: List[Any]) -> List[Any]:
+    """
+    Keep at most the newest compaction summary. [Bug 4]
+
+    Older summaries describe turns that are no longer in the window; they
+    are worse than useless — they read as current narrative.
+    """
+    summaries = [m for m in messages if _is_compaction_summary(m)]
+    if len(summaries) <= 1:
+        return messages
+    newest = max(summaries, key=lambda m: getattr(m, "timestamp", 0))
+    return [m for m in messages if not _is_compaction_summary(m) or m is newest]
+
+
+def _cap_protected(protected: List[Any], cap: int) -> List[Any]:
+    """Keep only the newest `cap` protected messages. [Bug 3]"""
+    if len(protected) <= cap:
+        return protected
+    protected_sorted = sorted(protected, key=lambda m: getattr(m, "timestamp", 0))
+    kept_ids = {id(m) for m in protected_sorted[-cap:]}
+    return [m for m in protected if id(m) in kept_ids]
+
+
 class ContextManager:
     """
     Single source of truth for messages, tool results and context state.
@@ -58,6 +118,13 @@ class ContextManager:
         - tool_outputs is a small ring buffer of recent tool results used
           for prompt hints. It never feeds the provider request directly;
           each tool result is ALSO present as a `tool` message.
+
+    Long-term memory:
+        - On compaction, the newest summary is written to a per-session
+          JSONL file via `SummaryStore`.
+        - On session resume, the newest N summaries from disk are
+          re-injected as pinned system messages so prior context survives
+          restarts.
     """
 
     def __init__(
@@ -81,6 +148,10 @@ class ContextManager:
         self.include_file_contents = self.config.get("include_file_contents", True)
         self.include_tool_outputs = self.config.get("include_tool_outputs", True)
         self.enable_summarization = self.config.get("enable_summarization", True)
+        self.persist_summaries = self.config.get("persist_summaries", True)
+        self.recover_summaries_on_load = self.config.get(
+            "recover_summaries_on_load", 3
+        )
 
         token_counter = None
         try:
@@ -113,6 +184,24 @@ class ContextManager:
         self._last_compaction: Optional[float] = None
         self._compaction_count = 0
         self._lock = asyncio.Lock()
+
+        # [long-term memory] Persistent summary store, per session.
+        self.summary_store = SummaryStore(
+            root=self.config.get("summary_dir") or None
+        )
+        self._session_id = self._resolve_session_id()
+
+    # ------------------------------------------------------------------
+    # SESSION ID
+    # ------------------------------------------------------------------
+
+    def _resolve_session_id(self) -> str:
+        try:
+            if self.session is not None and getattr(self.session, "id", None):
+                return str(self.session.id)
+        except Exception:
+            pass
+        return "default"
 
     # ------------------------------------------------------------------
     # LIFECYCLE
@@ -154,7 +243,6 @@ class ContextManager:
         return _estimate_message_tokens(m)
 
     def total_tokens(self) -> int:
-        """Cost of the message log only (tool_outputs is not double-counted)."""
         return sum(
             m.tokens or self._estimate_message_tokens_full(m)
             for m in self.messages
@@ -166,21 +254,14 @@ class ContextManager:
         tool_schemas: Optional[List[Dict[str, Any]]] = None,
         state_block: Optional[str] = None,
     ) -> int:
-        """
-        Cost of everything sent alongside messages[] on every request:
-        system prompt + tool schemas JSON + runtime state block.
-        Callers MUST include this when computing the real budget.
-        """
         total = 0
         if system_prompt:
             total += self._estimate_tokens(system_prompt)
         if tool_schemas:
             try:
-                total += self._estimate_tokens(
-                    json.dumps(tool_schemas, default=str)
-                )
+                total += self._estimate_tokens(json.dumps(tool_schemas, default=str))
             except Exception:
-                total += 512  # conservative
+                total += 512
         if state_block:
             total += self._estimate_tokens(state_block)
         return total
@@ -239,35 +320,45 @@ class ContextManager:
         self,
         content: str,
         context: Optional[Dict[str, Any]] = None,
+        metadata: Optional[Dict[str, Any]] = None,
     ) -> ContextMessage:
+        meta = dict(context or {})
+        if metadata:
+            meta.update(metadata)
         if (
             self.messages
             and self.messages[-1].role == "user"
             and self.messages[-1].content == content
         ):
             return self.messages[-1]
-        return await self.add_message(
-            "user", content, metadata=context or {}
-        )
+        return await self.add_message("user", content, metadata=meta)
 
     async def add_assistant_message(
         self,
         content: str,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> ContextMessage:
-        if (
-            self.messages
-            and self.messages[-1].role == "assistant"
-            and self.messages[-1].content == content
-            and not metadata
-        ):
-            return self.messages[-1]
+        """
+        Add an assistant message.
+
+        [M2/N4] Dedup is checked against the last few assistant messages,
+        not just the immediately previous one.
+        """
+        for m in reversed(self.messages[-8:]):
+            if m.role != "assistant":
+                if m.role == "user":
+                    break
+                continue
+            if m.content == content and not metadata:
+                return m
         return await self.add_message("assistant", content, metadata=metadata)
 
     async def add_system_message(
-        self, content: str, pinned: bool = False
+        self, content: str, pinned: bool = False,
+        metadata: Optional[Dict[str, Any]] = None,
     ) -> ContextMessage:
-        return await self.add_message("system", content, pinned=pinned)
+        meta = dict(metadata or {})
+        return await self.add_message("system", content, pinned=pinned, metadata=meta)
 
     # ------------------------------------------------------------------
     # TOOL MESSAGES
@@ -283,31 +374,39 @@ class ContextManager:
 
     def _trim_messages(self) -> None:
         """
-        Cap the message list. Preserves pinned/system + newest non-pinned
-        messages, then REPAIRS the list atomically so no invalid sequence
-        survives.
+        Cap the message list.
+
+        [Bug 3] Only explicitly pinned messages are protected. System
+        messages are normal citizens. Pinned set is capped. [N7] Repair
+        is only run when we actually trimmed something.
         """
         if len(self.messages) <= self.max_messages:
             return
 
-        pinned, unpinned = [], []
-        for m in self.messages:
-            if m.pinned or m.role == "system":
-                pinned.append(m)
-            else:
-                unpinned.append(m)
+        protected, rest = _split_protected(self.messages)
+        protected = _cap_protected(protected, MAX_PINNED_MESSAGES)
 
-        keep = max(0, self.max_messages - len(pinned))
-        kept = unpinned[-keep:] if keep else []
-        self.messages = sorted(pinned + kept, key=lambda m: m.timestamp)
+        keep = max(0, self.max_messages - len(protected))
+        kept = rest[-keep:] if keep else []
 
-        try:
-            from agent.context.runtime import repair_context
-            repairs = repair_context(self, fill_missing=True)
-            if repairs:
-                logger.debug("trim repair: %d fix(es)", repairs)
-        except Exception as e:
-            logger.debug("repair_context after trim failed: %s", e)
+        merged = protected + kept
+        merged.sort(key=lambda m: getattr(m, "timestamp", 0))
+
+        trimmed = len(self.messages) - len(merged)
+
+        # [Bug 4] Ensure at most one compaction summary survives.
+        merged = _drop_stale_summaries(merged)
+
+        self.messages = merged
+
+        if trimmed > 0:
+            try:
+                from agent.context.runtime import repair_context
+                repairs = repair_context(self, fill_missing=True)
+                if repairs:
+                    logger.debug("trim repair: %d fix(es)", repairs)
+            except Exception as e:
+                logger.debug("repair_context after trim failed: %s", e)
 
     async def add_tool_output(
         self,
@@ -373,36 +472,32 @@ class ContextManager:
 
         msgs = list(self.messages)
         if len(msgs) <= self.recent_messages:
-            return msgs
+            return _drop_stale_summaries(msgs)
 
-        pinned, unpinned = [], []
-        for m in msgs:
-            if m.pinned or m.role == "system":
-                pinned.append(m)
-            else:
-                unpinned.append(m)
+        protected, rest = _split_protected(msgs)
+        protected = _cap_protected(protected, MAX_PINNED_MESSAGES)
 
         selected: List[ContextMessage] = []
-        i = len(unpinned) - 1
+        i = len(rest) - 1
         while i >= 0 and len(selected) < self.recent_messages:
-            m = unpinned[i]
+            m = rest[i]
             if m.role == "tool":
                 tid = str(m.metadata.get("tool_call_id") or "")
                 if (
                     i > 0
-                    and unpinned[i - 1].role == "assistant"
-                    and tid in self._tool_call_ids(unpinned[i - 1])
+                    and rest[i - 1].role == "assistant"
+                    and tid in self._tool_call_ids(rest[i - 1])
                 ):
-                    parent = unpinned[i - 1]
+                    parent = rest[i - 1]
                     ids = self._tool_call_ids(parent)
                     group: List[ContextMessage] = [parent]
                     j = i
                     while (
-                        j < len(unpinned)
-                        and unpinned[j].role == "tool"
-                        and str(unpinned[j].metadata.get("tool_call_id")) in ids
+                        j < len(rest)
+                        and rest[j].role == "tool"
+                        and str(rest[j].metadata.get("tool_call_id")) in ids
                     ):
-                        group.append(unpinned[j])
+                        group.append(rest[j])
                         j += 1
                     if len(selected) + len(group) <= self.recent_messages:
                         selected[0:0] = group
@@ -411,7 +506,9 @@ class ContextManager:
             selected.insert(0, m)
             i -= 1
 
-        return sorted(pinned + selected, key=lambda m: m.timestamp)
+        combined = protected + selected
+        combined.sort(key=lambda m: getattr(m, "timestamp", 0))
+        return _drop_stale_summaries(combined)
 
     async def get_context(
         self,
@@ -453,21 +550,28 @@ class ContextManager:
         return out
 
     # ------------------------------------------------------------------
-    # SESSION SEEDING
+    # SESSION SEEDING + PERSISTED SUMMARY RECOVERY
     # ------------------------------------------------------------------
 
     async def load_from_session(self, session: Any) -> int:
         if session is None:
             return 0
+
+        # Refresh session id in case this manager was created before the
+        # session was set.
+        try:
+            if getattr(session, "id", None):
+                self._session_id = str(session.id)
+        except Exception:
+            pass
+
         history = getattr(session, "history", None)
-        if history is None:
-            return 0
+        entries: List[Any] = []
+        if history is not None:
+            entries = list(history.all()) if hasattr(history, "all") else list(history)
 
-        entries = list(history.all()) if hasattr(history, "all") else list(history)
-        if not entries:
-            return 0
-
-        entries = entries[-max(self.recent_messages * 2, 40):]
+        if entries:
+            entries = entries[-max(self.recent_messages * 2, 40):]
 
         async with self._lock:
             self.messages = []
@@ -504,7 +608,57 @@ class ContextManager:
                 pass
 
         logger.info("Seeded context from session: %d message(s)", len(self.messages))
+
+        # [long-term memory] Pull persisted summaries back in.
+        try:
+            await self.load_persisted_summaries(
+                limit=self.recover_summaries_on_load
+            )
+        except Exception as exc:
+            logger.debug("load_persisted_summaries failed: %s", exc)
+
         return len(self.messages)
+
+    async def load_persisted_summaries(self, limit: int = 3) -> int:
+        """
+        Inject the newest N summaries from disk as pinned system messages.
+
+        Called on resume so the model sees prior-session memory even if
+        the raw history has already been compacted away.
+        """
+        if limit <= 0:
+            return 0
+        try:
+            rows = self.summary_store.load(self._session_id, limit=limit)
+        except Exception as exc:
+            logger.debug("summary load failed: %s", exc)
+            return 0
+
+        if not rows:
+            return 0
+
+        added = 0
+        for row in rows:
+            body = str(row.get("summary") or "").strip()
+            if not body:
+                continue
+            text = f"[PRIOR CONTEXT — recovered from disk]\n{body}"
+            try:
+                await self.add_message(
+                    role="system",
+                    content=text,
+                    pinned=True,
+                    metadata={"compacted": True, "recovered": True},
+                )
+                added += 1
+            except Exception as exc:
+                logger.debug("inject summary failed: %s", exc)
+
+        logger.info(
+            "Re-injected %d persisted summary message(s) for session %s",
+            added, self._session_id,
+        )
+        return added
 
     # ------------------------------------------------------------------
     # COMPACTION
@@ -549,12 +703,40 @@ class ContextManager:
 
             self.messages = result["messages"]
             repair_context(self, fill_missing=True)
+            self.messages = _drop_stale_summaries(self.messages)
 
             while len(self.tool_outputs) > max(1, self.recent_tool_outputs):
                 self.tool_outputs.popleft()
 
             self._last_compaction = time.time()
             self._compaction_count += 1
+
+            # [long-term memory] Persist the newest summary to disk so it
+            # survives restarts and can be re-injected on resume.
+            if self.persist_summaries:
+                try:
+                    newest_summary = None
+                    for m in reversed(self.messages):
+                        if _is_compaction_summary(m):
+                            newest_summary = m
+                            break
+                    if newest_summary is not None:
+                        body = str(getattr(newest_summary, "content", "") or "")
+                        if body:
+                            meta = getattr(newest_summary, "metadata", {}) or {}
+                            self.summary_store.append(
+                                self._session_id,
+                                body,
+                                turns_summarized=int(meta.get("summary_of", 0) or 0),
+                                tokens_before=before,
+                                tokens_after=self.total_tokens(),
+                                metadata={
+                                    "compaction_count": self._compaction_count,
+                                },
+                            )
+                except Exception as exc:
+                    logger.debug("summary persist failed: %s", exc)
+
             return {
                 "compacted": True,
                 "before_tokens": before,

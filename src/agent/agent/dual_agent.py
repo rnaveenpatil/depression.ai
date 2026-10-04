@@ -9,6 +9,12 @@ Two primary agents with distinct roles:
 Both agents share the LLM registry that the user connects via the TUI.
 There is no built-in model catalog; the runtime connection is the sole
 source of providers and the current model.
+
+[Context ownership]
+    The top-level user turn is recorded exactly ONCE per `process_query`
+    call. Every prompt the coordinator builds (plan prompt, execute
+    prompt, review prompt) is passed with `record_user=False`, so
+    orchestration text never lands in the shared conversation log.
 """
 
 from __future__ import annotations
@@ -183,9 +189,7 @@ class BaseAgent:
     async def _resolve_role_model(self) -> None:
         """
         Use whatever model the runtime registry currently has. There is no
-        hardcoded role-specific model and no hardcoded fallback chain. If
-        the user hasn't connected yet, both agents share a None model and
-        every query fails cleanly with "no model selected" until /connect.
+        hardcoded role-specific model and no hardcoded fallback chain.
         """
         current = None
         try:
@@ -194,12 +198,10 @@ class BaseAgent:
             current = None
 
         if current:
-            # Do not touch the registry's selection: the user chose it.
             self._fallback_chain = [current]
             logger.info(
                 "%s agent using user-connected model: %s",
-                self.role.value,
-                current,
+                self.role.value, current,
             )
         else:
             self._fallback_chain = []
@@ -304,11 +306,14 @@ class BaseAgent:
                     description=fn["description"],
                     parameters=fn["parameters"],
                     handler=lambda name=name, **kw: self.mcp_client.call_tool(name, kw),
-                    # [Bug: no tool metadata on MCP] pass metadata so the
-                    # loop's caching + task routing work.
-                    read_only=self.role == AgentRole.PLAN or "list" in name or "get" in name,
-                    mutating=("create" in name or "put" in name or "delete" in name
-                              or "update" in name),
+                    read_only=(
+                        self.role == AgentRole.PLAN
+                        or "list" in name or "get" in name or "describe" in name
+                    ),
+                    mutating=(
+                        "create" in name or "put" in name or "delete" in name
+                        or "update" in name or "modify" in name
+                    ),
                     category="cloud" if is_aws else "misc",
                 )
 
@@ -340,9 +345,7 @@ class BaseAgent:
                 "tool": tool_name,
             }
 
-        # Defence in depth: even if the model somehow emits a write tool name,
-        # PlanAgent's registry will not contain it, so this branch is a
-        # belt-and-braces check.
+        # Defence in depth for plan mode.
         if self.role == AgentRole.PLAN and tool_name not in READ_ONLY_TOOL_NAMES:
             return {
                 "success": False,
@@ -356,9 +359,7 @@ class BaseAgent:
             operation = ""
             if isinstance(params, dict):
                 operation = str(
-                    params.get("operation")
-                    or params.get("service")
-                    or ""
+                    params.get("operation") or params.get("service") or ""
                 ).lower()
             mutating_verbs = (
                 "create", "delete", "put", "update", "modify", "remove",
@@ -422,14 +423,12 @@ class BaseAgent:
                 "tool": tool_name,
             }
 
-        # Redact credentials before the result is stored or sent to the model.
         try:
             result = redact(result)
         except Exception:
             pass
 
         self.context["tool_calls"] = self.context.get("tool_calls", 0) + 1
-        # [Bug: session totals] count per-tool usage for the LLM cost panel.
         tu = self.context.setdefault("tools_used", {})
         tu[tool_name] = tu.get(tool_name, 0) + 1
 
@@ -479,7 +478,13 @@ class BaseAgent:
         self,
         query: str,
         context: Optional[Dict[str, Any]] = None,
+        record_user: bool = True,
     ) -> Dict[str, Any]:
+        """
+        [Bug 1] `record_user=False` is used by the coordinator for every
+        orchestration prompt (plan / execute / review). Only the top-level
+        user turn is recorded.
+        """
         if self.is_shutting_down:
             return {"success": False, "error": "Agent shutting down"}
 
@@ -491,9 +496,13 @@ class BaseAgent:
         if self.subagent_manager:
             subagent_calls = self.subagent_manager.parse_subagent_invocation(query)
             if subagent_calls:
-                return await self._handle_subagent_invocations(subagent_calls, context, query)
+                return await self._handle_subagent_invocations(
+                    subagent_calls, context, query, record_user=record_user
+                )
 
-        return await self._run_query_pipeline(query, context, record_user=True)
+        return await self._run_query_pipeline(
+            query, context, record_user=record_user
+        )
 
     async def _run_query_pipeline(
         self,
@@ -507,6 +516,7 @@ class BaseAgent:
             self.context["turn_count"] = self.context.get("turn_count", 0) + 1
             self.metrics["total_queries"] += 1
 
+            # [Bug 1] Only persist the user turn for genuine user queries.
             if record_user and self.context_manager:
                 await self.context_manager.add_user_message(query, context)
             if record_user and self.session:
@@ -530,6 +540,9 @@ class BaseAgent:
             )
 
             response_text = result.get("response", "")
+
+            # [M2/N4/N10] This is the ONLY place the final assistant turn
+            # is stored. The loop no longer writes it.
             if self.context_manager and response_text:
                 await self.context_manager.add_assistant_message(response_text)
             if self.session and response_text:
@@ -543,8 +556,6 @@ class BaseAgent:
             llm_calls = int(ctx_summary.get("llm_calls", 0) or 0)
             cost = float(ctx_summary.get("cost", 0.0) or 0.0)
 
-            # [Bug: session totals] accumulate everything into the agent's
-            # own context so the coordinator's flat status is accurate.
             self.context["tokens_used"] = self.context.get("tokens_used", 0) + tokens
             self.context["input_tokens"] = self.context.get("input_tokens", 0) + input_tokens
             self.context["output_tokens"] = self.context.get("output_tokens", 0) + output_tokens
@@ -589,6 +600,7 @@ class BaseAgent:
         subagent_calls: List[Any],
         context: Optional[Dict[str, Any]],
         original_query: str,
+        record_user: bool = True,
     ) -> Dict[str, Any]:
         results: List[Dict[str, Any]] = []
         role_map = {
@@ -600,16 +612,14 @@ class BaseAgent:
         for agent_name, sub_query in subagent_calls:
             role = role_map.get(agent_name.lower())
             if not role:
-                results.append(
-                    {
-                        "subagent": agent_name,
-                        "success": False,
-                        "error": (
-                            f"Unknown subagent: {agent_name}. "
-                            f"Available: {', '.join(role_map.keys())}"
-                        ),
-                    }
-                )
+                results.append({
+                    "subagent": agent_name,
+                    "success": False,
+                    "error": (
+                        f"Unknown subagent: {agent_name}. "
+                        f"Available: {', '.join(role_map.keys())}"
+                    ),
+                })
                 continue
             result = await self.subagent_manager.invoke_subagent(
                 role=role, query=sub_query, context=context,
@@ -620,16 +630,14 @@ class BaseAgent:
 
         if remaining_query.strip():
             main_result = await self._run_query_pipeline(
-                remaining_query, context, record_user=True,
+                remaining_query, context, record_user=record_user,
             )
-            results.append(
-                {
-                    "subagent": "main",
-                    "success": main_result.get("success", True),
-                    "result": main_result.get("response", ""),
-                    "main": main_result,
-                }
-            )
+            results.append({
+                "subagent": "main",
+                "success": main_result.get("success", True),
+                "result": main_result.get("response", ""),
+                "main": main_result,
+            })
 
         combined_response = "\n\n".join(
             f"--- @{r.get('subagent', 'main')} ---\n"
@@ -746,17 +754,10 @@ class AgentCoordinator:
           * the coordinator's own fields (current_mode)
           * the ACTIVE agent's session-accumulated counters
           * per-agent summaries for the sidebar / debug views
-
-        [Bug: LLM cost panel blank] Before this change, get_status() only
-        returned nested `plan_agent` / `build_agent` blocks, so the panel
-        (which reads flat keys like tokens_used / llm_calls) showed zeros.
         """
         active = self.get_current_agent()
-
-        # ---- pull from the active agent's AgentContext ----
         ctx = getattr(active, "context", None)
 
-        # AgentContext dataclass (agent.py) or plain dict (dual_agent.py).
         def _get_int(*names: str) -> int:
             for n in names:
                 v = None
@@ -819,7 +820,6 @@ class AgentCoordinator:
         errors = _get_int("errors") or 0
         session_id = _get_str("session_id")
 
-        # ---- model / provider ----
         model = ""
         provider = ""
         try:
@@ -829,14 +829,12 @@ class AgentCoordinator:
         except Exception:
             pass
 
-        # ---- session id fallback ----
         if not session_id:
             try:
                 session_id = active.session.id if active.session else ""
             except Exception:
                 session_id = ""
 
-        # ---- project / data dir ----
         project_dir = ""
         try:
             if active.workspace is not None:
@@ -851,7 +849,6 @@ class AgentCoordinator:
         except Exception:
             data_dir = ""
 
-        # ---- tools count ----
         tool_count = 0
         try:
             if active.tool_registry is not None:
@@ -860,11 +857,8 @@ class AgentCoordinator:
             pass
 
         return {
-            # coordinator-level
             "current_mode": self.current_mode,
             "session_id": session_id,
-
-            # flat counters (panel-facing)
             "status": getattr(active, "status", "idle"),
             "model": model,
             "provider": provider,
@@ -879,8 +873,6 @@ class AgentCoordinator:
             "tools_used": tools_used,
             "tool_count": tool_count,
             "errors": errors,
-
-            # per-agent detail (kept for sidebar / debug)
             "plan_agent": {
                 "status": self.plan_agent.status,
                 "model": self.plan_agent._get_current_model(),
@@ -915,7 +907,10 @@ class AgentCoordinator:
             context = dict(context or {})
             context["build_agent_tools"] = self.build_agent.get_available_tools()
 
-        result = await agent.process_query(query=query, context=context)
+        # [Bug 1] The top-level query IS a real user turn.
+        result = await agent.process_query(
+            query=query, context=context, record_user=True,
+        )
 
         if effective_mode == "plan" and auto_execute and result.get("success"):
             plan_data = result.get("response", "")
@@ -934,8 +929,9 @@ class AgentCoordinator:
             "Continue until all tasks are complete or you encounter blockers.\n"
             "Be specific about what you did and any errors encountered."
         )
+        # [Bug 1] Orchestration prompt: do NOT persist as a user turn.
         build_result = await self.build_agent.process_query(
-            query=build_prompt, context=context,
+            query=build_prompt, context=context, record_user=False,
         )
         result = {
             "success": build_result.get("success", True),
@@ -956,11 +952,29 @@ class AgentCoordinator:
         auto_execute: bool = True,
         max_iterations: int = 3,
     ) -> Dict[str, Any]:
+        """
+        Auto mode.
+
+        [Bug 1] The real user turn is recorded ONCE here. Plan/execute
+        prompts use `record_user=False` and the final answer is written
+        once at the end.
+        """
         logger.info(
             "Processing query (auto mode): %s (max_iterations=%d)",
-            query[:100],
-            max_iterations,
+            query[:100], max_iterations,
         )
+
+        # [Bug 1] Record the real user turn once, up front.
+        if self.build_agent.context_manager:
+            try:
+                await self.build_agent.context_manager.add_user_message(query, context)
+            except Exception as exc:
+                logger.debug("auto-mode record user failed: %s", exc)
+        if self.build_agent.session:
+            try:
+                self.build_agent.session.add_user_message(query)
+            except Exception:
+                pass
 
         current_context = dict(context or {})
         plan_data = ""
@@ -1003,15 +1017,19 @@ class AgentCoordinator:
             try:
                 if plan_loop:
                     plan_loop.enable_planning = False
+                # [Bug 1] Orchestration prompt: NOT a user turn.
                 plan_result = await self.plan_agent.process_query(
-                    query=plan_prompt, context=current_context,
+                    query=plan_prompt, context=current_context, record_user=False,
                 )
             finally:
                 if plan_loop:
                     plan_loop.enable_planning = prev_planning
 
             plan_data = plan_result.get("response", "")
-            logger.info("Plan created (iteration %d): %d chars", iteration + 1, len(plan_data))
+            logger.info(
+                "Plan created (iteration %d): %d chars",
+                iteration + 1, len(plan_data),
+            )
 
             if not auto_execute:
                 return {
@@ -1028,24 +1046,25 @@ class AgentCoordinator:
                 "Continue until all tasks are complete or you encounter blockers.\n"
                 "Be specific about what you did and any errors encountered."
             )
+            # [Bug 1] Orchestration prompt: NOT a user turn.
             build_result = await self.build_agent.process_query(
-                query=build_prompt, context=current_context,
+                query=build_prompt, context=current_context, record_user=False,
             )
 
             execution_result = build_result.get("response", "")
-            execution_history.append(
-                {
-                    "iteration": iteration + 1,
-                    "plan": plan_data,
-                    "execution": execution_result,
-                    "success": build_result.get("success", True),
-                    "tool_calls": build_result.get("tool_calls", 0),
-                }
-            )
+            execution_history.append({
+                "iteration": iteration + 1,
+                "plan": plan_data,
+                "execution": execution_result,
+                "success": build_result.get("success", True),
+                "tool_calls": build_result.get("tool_calls", 0),
+            })
             final_execution = execution_result
 
             if build_result.get("success", True):
-                logger.info("Plan completed successfully in %d iterations", iteration + 1)
+                logger.info(
+                    "Plan completed successfully in %d iterations", iteration + 1
+                )
                 break
 
             if first_error is None and build_result.get("error"):
@@ -1057,6 +1076,19 @@ class AgentCoordinator:
             current_context["iteration"] = iteration + 1
 
         overall_success = all(h.get("success", True) for h in execution_history)
+
+        # [Bug 1] Store ONE assistant turn: the final answer to the user.
+        if final_execution:
+            try:
+                if self.build_agent.context_manager:
+                    await self.build_agent.context_manager.add_assistant_message(
+                        final_execution
+                    )
+                if self.build_agent.session:
+                    self.build_agent.session.add_assistant_message(final_execution)
+            except Exception as exc:
+                logger.debug("auto-mode store final answer failed: %s", exc)
+
         result: Dict[str, Any] = {
             "success": overall_success,
             "plan": plan_data,

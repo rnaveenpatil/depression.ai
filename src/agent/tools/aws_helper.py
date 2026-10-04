@@ -2,24 +2,25 @@
 AWS Helper Tool - unified AWS access with automatic fallback.
 
 Preference order:
-    1. Call `mcp__aws__<tool>` via the MCP client (structured, audited)
-    2. Fall back to the AWS CLI via the shell (bash/terminal)
+    1. Call an MCP `mcp__aws__*` tool via the MCP client.
+    2. Fall back to the AWS CLI via subprocess.
+    3. Fall back to `~/.aws/credentials` when EnvManager is empty.
 
-The LLM gets a single tool name to remember; the fallback logic lives
-here so the model never has to guess.
-
-Credential source: EnvManager.get_aws_env(). This is the one canonical
-place all AWS consumers (CLI, boto3, MCP) must read from.
+Credential source: EnvManager.get_aws_env() (canonical), with a fallback
+to `~/.aws/credentials` + `~/.aws/config` so a user with an existing AWS
+setup works without pasting keys into the panel first.
 """
 
 from __future__ import annotations
 
 import asyncio
+import configparser
 import json
 import os
 import shutil
 import time
-from typing import Any, Dict, List, Optional
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
 
 from agent.tools.registry import BaseTool
 from agent.utils.logging import get_logger
@@ -28,12 +29,22 @@ from agent.utils.env_manager import EnvManager
 logger = get_logger(__name__)
 
 
+# The MCP AWS server has historically exposed different tool names.
+# We try them in order until one succeeds.
+_MCP_CALL_CANDIDATES = (
+    "mcp__aws__call_aws",
+    "mcp__aws__aws_cli",
+    "mcp__aws__execute",
+    "mcp__aws__run",
+)
+
+
 class AWSHelperTool(BaseTool):
     name = "aws"
     description = (
         "Execute AWS operations. Prefers the AWS MCP server for structured, "
-        "audited calls; automatically falls back to the AWS CLI via bash if "
-        "MCP is unavailable. Use this instead of raw bash for any AWS task."
+        "audited calls; automatically falls back to the AWS CLI if MCP is "
+        "unavailable. Use this instead of raw bash for any AWS task."
     )
     parameters = {
         "type": "object",
@@ -81,7 +92,10 @@ class AWSHelperTool(BaseTool):
     def __init__(self, agent: Any = None, workspace: Any = None):
         self.agent = agent
         self.workspace = workspace
-        self.cwd = str(workspace.get_project_dir()) if workspace else os.getcwd()
+        try:
+            self.cwd = str(workspace.get_project_dir()) if workspace else os.getcwd()
+        except Exception:
+            self.cwd = os.getcwd()
 
     # ------------------------------------------------------------------
 
@@ -94,27 +108,39 @@ class AWSHelperTool(BaseTool):
             return self._list_services()
         if action == "call":
             return await self._call(params)
-        return {"success": False, "error": f"Unknown action: {action}"}
+        return {
+            "success": False,
+            "error": f"Unknown action: {action}",
+            "recoverable": True,
+        }
 
     # ------------------------------------------------------------------
     # Public operations
     # ------------------------------------------------------------------
 
     async def _identity(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        mcp_attempt = await self._try_mcp(
-            tool_name="mcp__aws__call_aws",
-            arguments={
-                "operation": "sts get-caller-identity",
-                "profile": params.get("profile"),
-            },
-            prefer=params.get("prefer", "auto"),
-        )
-        if mcp_attempt.get("success") and not mcp_attempt.get("_fallback"):
-            return mcp_attempt
+        prefer = params.get("prefer", "auto")
+
+        for tool_name in _MCP_CALL_CANDIDATES:
+            mcp_attempt = await self._try_mcp(
+                tool_name=tool_name,
+                arguments={
+                    "operation": "sts get-caller-identity",
+                    "profile": params.get("profile"),
+                },
+                prefer=prefer,
+            )
+            if mcp_attempt.get("success") and not mcp_attempt.get("_fallback"):
+                return mcp_attempt
+            if mcp_attempt.get("_not_registered"):
+                continue
+            if mcp_attempt.get("_fallback") and prefer == "mcp":
+                return mcp_attempt
 
         return await self._run_cli(
             ["sts", "get-caller-identity"],
-            prefer=params.get("prefer", "auto"),
+            prefer=prefer,
+            profile=params.get("profile"),
         )
 
     def _list_services(self) -> Dict[str, Any]:
@@ -128,6 +154,7 @@ class AWSHelperTool(BaseTool):
     async def _call(self, params: Dict[str, Any]) -> Dict[str, Any]:
         prefer = params.get("prefer", "auto")
 
+        # Explicit MCP tool name — caller knows what they want.
         if params.get("mcp_tool"):
             return await self._try_mcp(
                 tool_name=str(params["mcp_tool"]),
@@ -137,9 +164,17 @@ class AWSHelperTool(BaseTool):
 
         service = params.get("service")
         operation = params.get("operation")
-        if service and operation:
+        if not (service and operation):
+            return {
+                "success": False,
+                "error": "Provide 'service' + 'operation', or 'mcp_tool'",
+                "recoverable": True,
+            }
+
+        # Try MCP call tool candidates.
+        for tool_name in _MCP_CALL_CANDIDATES:
             mcp_attempt = await self._try_mcp(
-                tool_name="mcp__aws__call_aws",
+                tool_name=tool_name,
                 arguments={
                     "operation": f"{service} {operation}",
                     "params": list(params.get("args") or []),
@@ -148,16 +183,16 @@ class AWSHelperTool(BaseTool):
             )
             if mcp_attempt.get("success") and not mcp_attempt.get("_fallback"):
                 return mcp_attempt
+            if mcp_attempt.get("_not_registered"):
+                continue
+            if mcp_attempt.get("_fallback") and prefer == "mcp":
+                return mcp_attempt
 
-            return await self._run_cli(
-                [service, operation, *(params.get("args") or [])],
-                prefer=prefer,
-            )
-
-        return {
-            "success": False,
-            "error": "Provide 'service' + 'operation', or 'mcp_tool'",
-        }
+        return await self._run_cli(
+            [service, operation, *(params.get("args") or [])],
+            prefer=prefer,
+            profile=params.get("profile"),
+        )
 
     # ------------------------------------------------------------------
     # MCP path
@@ -193,6 +228,7 @@ class AWSHelperTool(BaseTool):
             return {
                 "success": False,
                 "_fallback": True,
+                "_not_registered": True,
                 "error": f"MCP tool '{tool_name}' not registered",
             }
 
@@ -217,22 +253,95 @@ class AWSHelperTool(BaseTool):
         return getattr(self.agent, "mcp_client", None)
 
     # ------------------------------------------------------------------
-    # CLI fallback
+    # Credential resolution (EnvManager + ~/.aws fallback)
     # ------------------------------------------------------------------
 
-    def _build_aws_subprocess_env(self, profile: Optional[str] = None) -> Dict[str, str]:
+    def _read_aws_credentials_file(
+        self, profile: Optional[str] = None
+    ) -> Dict[str, str]:
         """
-        Build the env the AWS CLI subprocess should see.
+        Read ~/.aws/credentials (and config for region) as a fallback when
+        EnvManager has nothing. Only used when the canonical store is empty.
+        """
+        out: Dict[str, str] = {}
+        creds_path = Path(os.path.expanduser("~/.aws/credentials"))
+        cfg_path = Path(os.path.expanduser("~/.aws/config"))
 
-        = os.environ (updated live by EnvManager)
-        + canonical AWS vars from EnvManager.get_aws_env()   <- always overrides
-        + optional AWS_PROFILE
+        section_name = profile or "default"
+
+        if creds_path.is_file():
+            try:
+                parser = configparser.RawConfigParser()
+                parser.read(creds_path)
+                if parser.has_section(section_name):
+                    for k, v in parser.items(section_name):
+                        out[k] = v
+            except Exception as exc:
+                logger.debug("Could not read %s: %s", creds_path, exc)
+
+        if cfg_path.is_file():
+            try:
+                parser = configparser.RawConfigParser()
+                parser.read(cfg_path)
+                # In config, named profiles are "profile <name>", default is "default".
+                cfg_section = section_name if section_name == "default" else f"profile {section_name}"
+                if parser.has_section(cfg_section):
+                    for k, v in parser.items(cfg_section):
+                        out.setdefault(k, v)
+            except Exception as exc:
+                logger.debug("Could not read %s: %s", cfg_path, exc)
+
+        return out
+
+    def _resolve_env(self, profile: Optional[str] = None) -> Tuple[Dict[str, str], str]:
         """
-        env = os.environ.copy()
-        env.update(EnvManager.get().get_aws_env())
+        Build the env for the AWS CLI subprocess.
+
+        Returns (env, source) where source is "env_manager" or "aws_file"
+        or "none".
+        """
+        env = {**os.environ}
+
+        # 1. Canonical: EnvManager (writes here go to ~/.agent/env).
+        try:
+            canonical = EnvManager.get().get_aws_env()
+        except Exception:
+            canonical = {}
+
+        if canonical.get("AWS_ACCESS_KEY_ID") and canonical.get("AWS_SECRET_ACCESS_KEY"):
+            env.update(canonical)
+            if profile:
+                env["AWS_PROFILE"] = profile
+            return env, "env_manager"
+
+        # 2. Fallback: ~/.aws/credentials + ~/.aws/config.
+        file_creds = self._read_aws_credentials_file(profile)
+        mapped: Dict[str, str] = {}
+        if file_creds.get("aws_access_key_id"):
+            mapped["AWS_ACCESS_KEY_ID"] = file_creds["aws_access_key_id"]
+        if file_creds.get("aws_secret_access_key"):
+            mapped["AWS_SECRET_ACCESS_KEY"] = file_creds["aws_secret_access_key"]
+        if file_creds.get("aws_session_token"):
+            mapped["AWS_SESSION_TOKEN"] = file_creds["aws_session_token"]
+        if file_creds.get("region"):
+            mapped["AWS_DEFAULT_REGION"] = file_creds["region"]
+            mapped["AWS_REGION"] = file_creds["region"]
+
+        if mapped:
+            env.update(mapped)
+            if profile:
+                env["AWS_PROFILE"] = profile
+            return env, "aws_file"
+
+        # 3. Nothing.
         if profile:
             env["AWS_PROFILE"] = profile
-        return env
+            return env, "profile_only"
+        return env, "none"
+
+    # ------------------------------------------------------------------
+    # CLI path
+    # ------------------------------------------------------------------
 
     async def _run_cli(
         self,
@@ -244,6 +353,7 @@ class AWSHelperTool(BaseTool):
             return {
                 "success": False,
                 "error": "mcp requested but unavailable; set prefer='auto' for fallback",
+                "recoverable": True,
             }
 
         if not shutil.which("aws"):
@@ -253,21 +363,25 @@ class AWSHelperTool(BaseTool):
                     "AWS CLI not found. Install it, or fix the MCP server so "
                     "the MCP path is used."
                 ),
+                "recoverable": False,
             }
 
         cmd = ["aws", *args]
-        env = self._build_aws_subprocess_env(profile=profile)
+        env, source = self._resolve_env(profile=profile)
 
-        # Fail fast with a clear message if no creds at all
-        if not env.get("AWS_ACCESS_KEY_ID") and not env.get("AWS_PROFILE"):
+        if source == "none":
             return {
                 "success": False,
                 "_source": "cli",
                 "error": (
-                    "No AWS credentials available. Add them in the AWS panel "
-                    "or set AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY."
+                    "No AWS credentials found. Save them via the AWS panel "
+                    "(they go to ~/.agent/env), or set AWS_ACCESS_KEY_ID + "
+                    "AWS_SECRET_ACCESS_KEY in the environment, or create "
+                    "~/.aws/credentials."
                 ),
+                "credentials_source": "none",
                 "command": " ".join(cmd),
+                "recoverable": True,
             }
 
         t0 = time.time()
@@ -295,6 +409,7 @@ class AWSHelperTool(BaseTool):
                 "_source": "cli",
                 "error": f"aws CLI timed out after {self.timeout}s",
                 "command": " ".join(cmd),
+                "credentials_source": source,
             }
 
         out = stdout.decode(errors="replace")
@@ -304,6 +419,7 @@ class AWSHelperTool(BaseTool):
             "success": proc.returncode == 0,
             "_source": "cli",
             "command": " ".join(cmd),
+            "credentials_source": source,
             "exit_code": proc.returncode,
             "stdout": out,
             "stderr": err,

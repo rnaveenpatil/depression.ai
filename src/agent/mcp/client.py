@@ -14,7 +14,8 @@ Built-in presets:
     - github      : repositories, issues, PRs
     - browser     : research docs and websites
     - database    : SQL / SQLite / Postgres / MySQL queries
-    - aws         : AWS CLI MCP (reads credentials from the canonical EnvManager)
+    - aws         : AWS MCP (reads credentials from the canonical EnvManager,
+                    falls back to ~/.aws/credentials)
 
 Features:
     - Multi-server management
@@ -248,23 +249,56 @@ class StdioTransport(MCPTransportBase):
         Env for the child MCP process.
 
         Always: os.environ + config.env.
-        Additionally for AWS MCP servers: overlay the canonical AWS vars from
-        EnvManager so freshly-saved credentials reach the child process even
-        if the parent's os.environ hasn't been reloaded yet.
+
+        For AWS MCP servers, credentials come from EnvManager first, and
+        from ~/.aws/credentials as a fallback. Detection is broader than
+        before: server name, args, env keys, or explicit command all
+        count as "this is an AWS server".
         """
         env = {**os.environ, **self.config.env}
 
+        name_l = (self.config.name or "").lower()
+        args_str = " ".join(str(a) for a in (self.config.args or [])).lower()
+        env_keys = " ".join(str(k) for k in (self.config.env or {}).keys()).lower()
+        cmd_str = (self.config.command or "").lower()
+
         is_aws = (
-            self.config.name == "aws"
-            or "aws" in (self.config.name or "").lower()
-            or any(
-                "aws" in str(a).lower()
-                for a in (self.config.args or [])
-            )
+            "aws" in name_l
+            or "aws" in args_str
+            or "aws" in env_keys
+            or "aws" in cmd_str
         )
+
         if is_aws:
             try:
-                env.update(EnvManager.get().get_aws_env())
+                aws_env = EnvManager.get().get_aws_env()
+                if aws_env:
+                    env.update(aws_env)
+                else:
+                    # Try ~/.aws/credentials as a fallback.
+                    try:
+                        from agent.mcp.aws_config import _read_aws_file_credentials
+                        file_creds = _read_aws_file_credentials()
+                        mapped: Dict[str, str] = {}
+                        if file_creds.get("aws_access_key_id"):
+                            mapped["AWS_ACCESS_KEY_ID"] = file_creds["aws_access_key_id"]
+                        if file_creds.get("aws_secret_access_key"):
+                            mapped["AWS_SECRET_ACCESS_KEY"] = file_creds["aws_secret_access_key"]
+                        if file_creds.get("aws_session_token"):
+                            mapped["AWS_SESSION_TOKEN"] = file_creds["aws_session_token"]
+                        if file_creds.get("region"):
+                            mapped["AWS_DEFAULT_REGION"] = file_creds["region"]
+                            mapped["AWS_REGION"] = file_creds["region"]
+                        if mapped:
+                            env.update(mapped)
+                    except Exception as e:
+                        logger.debug("AWS file creds overlay failed: %s", e)
+
+                if not env.get("AWS_ACCESS_KEY_ID") and not env.get("AWS_PROFILE"):
+                    logger.warning(
+                        "AWS MCP server '%s' launching with no credentials",
+                        self.config.name,
+                    )
             except Exception as e:
                 logger.debug("Could not overlay AWS env for MCP child: %s", e)
 
@@ -747,9 +781,10 @@ class MCPPresets:
         """
         AWS MCP server.
 
-        Reads credentials from the canonical EnvManager and passes them to
-        the child process only. Returns a disabled stub if uvx or credentials
-        are missing, so the caller can decide to fall back to the bash tool.
+        Reads credentials from the canonical EnvManager (falling back to
+        ~/.aws/credentials) and passes them to the child process only.
+        Returns a disabled stub if uvx or credentials are missing, so the
+        caller can decide to fall back to the bash tool.
         """
         cfg_dict = build_aws_mcp_config(
             region=region, profile=profile, server_name=name,
@@ -1230,12 +1265,33 @@ class MCPClient:
 
     async def reload(self) -> None:
         """
-        Tear down and re-initialize every server. Used after credentials
-        change so the child MCP processes respawn with the new env.
+        Tear down and re-initialize every server.
+
+        Called after credentials change so child MCP processes respawn
+        with fresh env. Safe to call even when not initialized.
+
+        Re-reads the server configs from the config dict so a newly-saved
+        AWS credential turns a previously-disabled AWS server back on.
         """
         registry = self._tool_registry
-        await self.shutdown()
+        was_initialized = self._initialized
+
+        try:
+            await self.shutdown()
+        except Exception as exc:
+            logger.debug("MCP shutdown during reload failed: %s", exc)
+
+        # Re-read server configs so the AWS preset reflects new creds.
+        try:
+            self.servers_cfg = self._load_servers()
+        except Exception as exc:
+            logger.debug("MCP config reload failed: %s", exc)
+
         await self.initialize(tool_registry=registry)
+        logger.info(
+            "MCP client reloaded (was_initialized=%s, servers=%d)",
+            was_initialized, len(self.servers_cfg),
+        )
 
     # ------------------------------------------------------------------
     # TOOLS
