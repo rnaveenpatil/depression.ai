@@ -3,6 +3,15 @@
 Flow: session context -> LLM -> tool calls -> permission/execution -> tool
 results -> canonical context -> LLM, repeated until the model returns a final
 answer. AgentLoop owns execution telemetry only; ContextManager owns history.
+
+Consistency guarantees enforced here:
+    * The tool list the model sees == the tools the runtime can execute
+      (single source: ToolRegistry.get_schemas()).
+    * Every assistant tool_call gets exactly one tool result before the next
+      LLM turn (no orphan tool_call_ids).
+    * Tool failures are injected back into the model's context as structured
+      guidance so the agent can self-correct instead of stalling.
+    * Success is only reported when a tool output in this session proves it.
 """
 from __future__ import annotations
 
@@ -27,6 +36,10 @@ logger = get_logger(__name__)
 
 PLAN_DRIVEN_MIN_TASKS = 3
 PLAN_TASK_MAX_ATTEMPTS = 3
+
+# Tools whose output can safely be returned as a "final answer" in the
+# one-shot fast path. Anything that mutates state must NOT be fast-pathed.
+FAST_PATH_READ_TOOLS = {"read", "filesystem", "grep", "glob", "search"}
 
 
 class LoopState(Enum):
@@ -136,6 +149,10 @@ class AgentLoop:
     def model_context(self):
         return self.agent.context_manager
 
+    # ==================================================================
+    # PUBLIC ENTRY
+    # ==================================================================
+
     async def run(
         self,
         query: str,
@@ -183,6 +200,8 @@ class AgentLoop:
 
             return await self._run_free_form(query)
 
+        except asyncio.CancelledError:
+            raise
         except TimeoutError as exc:
             self.context.errors.append(str(exc))
             self.state = LoopState.ERROR
@@ -195,9 +214,9 @@ class AgentLoop:
             self._update_metrics()
             return self._result(False, error=str(exc))
 
-    # ------------------------------------------------------------------
+    # ==================================================================
     # INTENT CLASSIFICATION
-    # ------------------------------------------------------------------
+    # ==================================================================
 
     async def _classify_intent(self, query: str) -> str:
         try:
@@ -230,9 +249,9 @@ class AgentLoop:
             logger.debug("Intent classification failed: %s", exc)
             return "unknown"
 
-    # ------------------------------------------------------------------
+    # ==================================================================
     # FREE-FORM LOOP
-    # ------------------------------------------------------------------
+    # ==================================================================
 
     async def _run_free_form(self, query: str) -> Dict[str, Any]:
         while not self.should_stop and self.context.iteration < self.max_iterations:
@@ -250,6 +269,10 @@ class AgentLoop:
 
                 self.state = LoopState.OBSERVING
                 await self._observe(results)
+
+                # Feed structured failure guidance back to the model so it
+                # can self-correct on the next turn instead of stalling.
+                await self._inject_failure_guidance(results)
 
                 self.state = LoopState.EVALUATING
                 if not await self._evaluate(results):
@@ -276,11 +299,12 @@ class AgentLoop:
         final = await self._generate_final_response()
         self._update_metrics()
         success = bool(final and final.strip())
-        return self._result(success, final, error=None if success else "empty final response")
+        return self._result(success, final,
+                            error=None if success else "empty final response")
 
-    # ------------------------------------------------------------------
+    # ==================================================================
     # PLAN-DRIVEN LOOP
-    # ------------------------------------------------------------------
+    # ==================================================================
 
     async def _run_plan_driven(
         self,
@@ -343,9 +367,7 @@ class AgentLoop:
                 break
 
             turn_result = await self._execute_task_turn(
-                task=task,
-                plan=plan,
-                system_prompt=system_prompt,
+                task=task, plan=plan, system_prompt=system_prompt,
             )
 
             if turn_result is None:
@@ -372,16 +394,34 @@ class AgentLoop:
             stalled = True
             break
 
-        completed = sum(
-            1 for t in plan._all_tasks() if t.status == TaskStatus.COMPLETED
-        )
-        total = len(plan._all_tasks())
+        failed = [
+            t for t in plan._all_tasks()
+            if t.status in (TaskStatus.FAILED, TaskStatus.SKIPPED)
+        ]
         all_done = plan.is_complete()
 
         if all_done or stalled:
             summary = await self._summarize_plan(plan, system_prompt)
             self.state = LoopState.STOPPED
             self._update_metrics()
+
+            if failed:
+                # Do NOT report success if any task failed or was skipped.
+                lines = [
+                    "⚠️ Completed with unresolved items:",
+                    *[
+                        f"- {t.description}: {t.error or 'failed'}"
+                        for t in failed
+                    ],
+                    "",
+                    summary,
+                ]
+                return self._result(
+                    False,
+                    "\n".join(lines),
+                    error=f"{len(failed)} task(s) failed or skipped",
+                )
+
             return self._result(True, summary)
 
         return None
@@ -407,8 +447,12 @@ class AgentLoop:
         if qa:
             task_prompt += f"QA criterion (must pass to complete): {qa}\n\n"
         task_prompt += (
-            "Use tools as needed. When the task is complete, respond with a "
-            "short summary of what you did prefixed by 'TASK COMPLETE:'. "
+            "Use tools as needed. VERIFY your work before declaring completion: "
+            "if you wrote or edited a file, read it back; if you ran a fix, "
+            "re-run the failing command and quote the output.\n"
+            "When the task is complete and verified, respond with a short "
+            "summary prefixed by 'TASK COMPLETE:' that includes the exact "
+            "evidence (command output or diff).\n"
             "If the task cannot be completed, respond with 'TASK FAILED: <reason>'.\n"
             "Do not describe the plan — execute this task."
         )
@@ -431,6 +475,8 @@ class AgentLoop:
                     temperature=0.4,
                     max_tokens=2000,
                 )
+            except asyncio.CancelledError:
+                raise
             except Exception as exc:
                 logger.error("Plan task turn failed: %s", exc)
                 return {"success": False, "retry": True}
@@ -438,7 +484,9 @@ class AgentLoop:
             self._record_usage(getattr(response, "usage", None))
 
             content = (getattr(response, "content", "") or "").strip()
-            tool_calls = list(getattr(response, "tool_calls", []) or [])
+            tool_calls = list(getattr(response, "tool_calls", []) or [])[
+                : self.max_tool_calls_per_iteration
+            ]
 
             if not tool_calls:
                 upper = content.upper()
@@ -484,10 +532,20 @@ class AgentLoop:
             results = await self._act(tool_calls)
             await self._observe(results)
 
-            for tc, res in zip(tool_calls, results):
-                payload = res.get("result") or {}
-                if not isinstance(payload, dict):
-                    payload = {"success": True, "result": payload}
+            # Guarantee one tool message per tool_call id, in order.
+            by_id = {r.get("tool_call_id"): r for r in results}
+            for tc in tool_calls:
+                r = by_id.get(tc.id)
+                if r is None:
+                    payload = {
+                        "success": False,
+                        "error": "internal: no result produced for this tool call",
+                        "recoverable": False,
+                    }
+                else:
+                    payload = r.get("result") or {}
+                    if not isinstance(payload, dict):
+                        payload = {"success": True, "result": payload}
                 try:
                     payload = redact(payload)
                 except Exception:
@@ -520,7 +578,9 @@ class AgentLoop:
                         role="system",
                         content=(
                             "You are a strict verifier. Reply PASS or "
-                            "FAIL: <short reason>."
+                            "FAIL: <short reason>. Only PASS if the reported "
+                            "result contains concrete evidence (command output, "
+                            "diff, file content) proving the QA criterion."
                         ),
                     ),
                     Message(
@@ -579,8 +639,11 @@ class AgentLoop:
                         role="user",
                         content=(
                             "Write a short closing summary: 2–4 sentences "
-                            "describing what you did, why, and anything the "
-                            "user should know. Do not repeat the step list.\n\n"
+                            "describing what you actually did, why, and "
+                            "anything the user should know. Cite the concrete "
+                            "evidence (command output, diff, or file content) "
+                            "that proves each major step. Do not repeat the "
+                            "step list. Do not claim unverified success.\n\n"
                             f"Plan: {plan.goal}\n\n"
                             f"Task outcomes:\n{body}"
                         ),
@@ -607,9 +670,9 @@ class AgentLoop:
             pass
         return fallback
 
-    # ------------------------------------------------------------------
+    # ==================================================================
     # RESULT
-    # ------------------------------------------------------------------
+    # ==================================================================
 
     def _result(
         self,
@@ -629,9 +692,9 @@ class AgentLoop:
             out["error"] = error
         return out
 
-    # ------------------------------------------------------------------
+    # ==================================================================
     # SYSTEM PROMPT
-    # ------------------------------------------------------------------
+    # ==================================================================
 
     async def _get_system_prompt(self) -> str:
         if self._system_prompt_cache is not None:
@@ -643,53 +706,223 @@ class AgentLoop:
         env_block = self._build_environment_block()
         aws_block = self._build_aws_guidance()
 
-        self._system_prompt_cache = (
-            "You are an advanced AI CLI agent. Complete the user's request "
-            "accurately and verifiably.\n\n"
+        self._system_prompt_cache = ("""
+            You are an advanced AI CLI agent. Your job is to complete the user's task,
+not merely explain how to do it. Inspect, modify, execute, test, and verify
+when necessary.
 
-            "## How you work\n"
-            "1. **Explore first** — read the relevant files before you change "
-            "anything. Use `read`, `grep`, `glob` instead of shelling out.\n"
-            "2. **Act minimally** — the smallest change that solves the "
-            "problem. Use `edit`/`write`, not `bash sed`/`echo >`.\n"
-            "3. **Verify** — run the command that proves it works and report "
-            "its actual output. Never claim success without evidence.\n"
-            "4. **Prefer purpose-built tools** over `bash`. Use `bash` only "
-            "for one-shot commands that exit on their own.\n"
-            "5. **Never run servers in `bash`** (dev servers, `flutter run`, "
-            "`npm run dev`, `vite`, `uvicorn`, `nodemon`) — use the "
-            "`process` tool with action='start'.\n"
-            "6. **Never print credentials** — API keys, AWS keys, tokens. "
-            "The runtime injects them where needed.\n\n"
+## CORE RULES
 
-            "## Planning — VERY IMPORTANT\n"
-            "For any request that needs 2 or more steps, your FIRST response "
-            "MUST start with a checklist so the user knows what you are about "
-            "to do. For each step, identify the problem you found and the "
-            "action you are taking next. This is not optional. Use this exact "
-            "format — a markdown checkbox list, one line per step, nothing "
-            "else on those lines:\n\n"
-            "    - [ ] first step\n"
-            "    - [ ] second step\n"
-            "    - [ ] third step\n\n"
-            "Rules for the checklist:\n"
-            "- 3 to 8 steps. Short descriptions, one line each.\n"
-            "- Write it ONCE at the top of your FIRST response.\n"
-            "- Do NOT write a numbered list like `1. step` — the user's UI "
-            "only recognizes the `- [ ]` format.\n"
-            "- Do NOT wrap the checklist in a heading like `**Steps:**`.\n"
-            "- Do NOT repeat the checklist on later turns, after tool calls, "
-            "or before permission prompts.\n"
-            "- Do NOT ask permission for each step — just do the work.\n\n"
+1. Understand the user's goal before acting.
+2. Inspect relevant files/code first.
+3. Use the most specific tool available instead of bash.
+4. Make the smallest change that solves the problem.
+5. Never invent tool results, file contents, command output, or success.
+6. Never expose API keys, passwords, tokens, AWS secrets, private keys, or
+   other credentials.
 
-            "## After you finish\n"
-            "Write a short closing summary: 2–4 sentences describing what "
-            "you actually did, why you chose that approach, and anything "
-            "the user should know. Do not repeat the checklist.\n\n"
+## TOOL SELECTION
+
+Prefer:
+- read/list/glob/search → inspect files
+- edit/write/append → modify files
+- process → long-running applications/servers
+- bash → short commands that terminate
+- git tools → git operations
+- AWS tools → AWS operations
+
+Use bash only when no suitable specialized tool exists.
+
+Never run long-lived applications or servers through bash.
+Use process.start for them.
+
+## WORKFLOW
+
+For a multi-step task:
+
+1. Inspect
+2. Identify the actual problem
+3. Plan the minimum fix
+4. Modify
+5. Verify
+6. Test
+7. Report evidence
+
+Do not perform unnecessary steps.
+
+## TOOL ERRORS
+
+A tool error is information, not automatically a task failure.
+
+When a tool fails:
+
+1. Read the complete error.
+2. Identify the actual cause.
+3. Compare the error with the tool's parameters/schema.
+4. Correct the cause.
+5. Retry with corrected arguments.
+
+Never repeat the exact same failed call.
+
+If the error indicates a missing file, invalid path, wrong parameter,
+permission problem, timeout, dependency problem, or incorrect command,
+adapt the next action accordingly.
+
+If the failure cannot be safely resolved, stop that operation and explain
+the exact blocker.
+
+Do not blame the tool without analysing its error.
+
+## VERIFICATION
+
+After changing something, verify the resulting state.
+
+For files:
+- read the changed section/file when practical.
+
+For commands:
+- rerun the command that previously failed.
+
+For bugs:
+- reproduce the original failure, apply the fix, then rerun the same
+  operation to prove the problem is resolved.
+
+For applications:
+- start the application only when useful for verification.
+
+Exit code 0 alone is not proof that the intended result exists.
+
+Never claim "fixed", "working", or "successful" without evidence.
+
+## APPLICATION RUNNING
+
+After fixing code, determine whether running the application would provide
+meaningful verification.
+
+If running it would help verify the fix, ask the user:
+
+"Would you like me to run the application and verify the fix?"
+
+Do not ask this when:
+- the user explicitly asked you to run it
+- the application must be run to complete the requested task
+- automated tests already provide sufficient verification
+- running it would be irrelevant or unnecessarily expensive
+
+If the user agrees:
+- start it using the process tool
+- monitor the startup result
+- report whether it started successfully
+- if appropriate, show the relevant output/status to the user
+
+Never claim that an application works merely because its process started.
+
+## LONG-RUNNING PROCESSES
+
+Use process.start for:
+- development servers
+- web applications
+- Flutter applications
+- Vite
+- npm dev servers
+- uvicorn
+- nodemon
+- watchers
+- interactive programs
+
+Use bash for short commands that should terminate.
+
+Do not retry a command that may still be running.
+
+## STATE
+
+Keep track of:
+- current working directory
+- files inspected
+- files changed
+- important errors
+- tests performed
+- verification status
+
+Never assume a previous operation succeeded without its result confirming it.
+
+## TOOL ARGUMENTS
+
+Use only parameters defined by the tool schema.
+
+Never invent parameter names or argument formats.
+
+If a tool rejects arguments:
+- inspect the error
+- correct the arguments
+- retry with the corrected call
+
+Do not repeatedly guess.
+
+## PERMISSIONS
+
+Never bypass permission checks.
+
+For destructive or high-risk operations such as deletion, overwriting,
+production deployment, infrastructure destruction, or credential changes,
+use the configured permission mechanism.
+
+Prefer reversible operations when possible.
+
+## PLANNING
+
+For tasks requiring multiple operations, show a short checklist before
+execution:
+
+- [ ] inspect
+- [ ] identify and fix
+- [ ] verify
+- [ ] test
+
+Mark an item complete only when evidence confirms it.
+
+Do not repeat the checklist.
+
+For simple tasks, skip the checklist.
+
+## TOKEN EFFICIENCY
+
+Do not narrate every successful tool call.
+
+Do not repeat information already known.
+
+Do not quote large files or logs unless necessary.
+
+After a successful routine tool call, immediately continue with the next
+useful action.
+
+Explicitly explain only:
+- important findings
+- failures
+- unexpected results
+- verification evidence
+- decisions requiring the user's input
+
+Prefer concise reasoning and concrete actions.
+
+## FINAL RESPONSE
+
+After completing the task:
+
+- state what was changed
+- state what was verified
+- mention important test output briefly
+- mention anything still unverified
+- ask whether the user wants the application run if that is the next
+  useful verification step
+
+Never claim success without evidence.
+"""
+
             + env_block
             + aws_block
             + "\n\n## Available Tools\n"
-            + self._get_tools_description()
+            + self.tool_registry.describe_for_prompt()
             + "\n\n## Project\n"
             + json.dumps(project, indent=2, default=str)
             + "\n\n## Permissions\n"
@@ -722,11 +955,13 @@ class AgentLoop:
             mcp_aws_tools: List[str] = []
             if mcp_client is not None:
                 try:
-                    mcp_aws_tools = [
-                        t["function"]["name"]
-                        for t in mcp_client.list_tools()
-                        if t["function"]["name"].startswith("mcp__aws__")
-                    ]
+                    # Only advertise MCP tools that are actually registered
+                    # with the runtime registry — never advertise what we
+                    # cannot execute.
+                    for t in mcp_client.list_tools():
+                        name = t.get("function", {}).get("name", "")
+                        if name.startswith("mcp__aws__") and self.tool_registry.has_tool(name):
+                            mcp_aws_tools.append(name)
                 except Exception:
                     mcp_aws_tools = []
 
@@ -753,15 +988,6 @@ class AgentLoop:
         except Exception as exc:
             logger.debug("AWS guidance build failed: %s", exc)
             return ""
-
-    def _get_tools_description(self) -> str:
-        lines = []
-        for name, tool in self.tool_registry.tools.items():
-            lines.append(
-                f"- {name}: {tool.description}\n"
-                f"  Parameters: {json.dumps(tool.parameters, default=str)}"
-            )
-        return "\n".join(lines)
 
     async def _get_project_context(self) -> Dict[str, Any]:
         now = time.time()
@@ -802,9 +1028,9 @@ class AgentLoop:
             "auto_approve": getattr(p, "auto_approve", False),
         }
 
-    # ------------------------------------------------------------------
+    # ==================================================================
     # PLANNING
-    # ------------------------------------------------------------------
+    # ==================================================================
 
     async def _should_plan(self, q: str, intent: str = "unknown") -> bool:
         if intent in ("question", "ambiguous"):
@@ -908,13 +1134,13 @@ class AgentLoop:
         return {
             "max_tasks": 20,
             "timeout": self.default_timeout,
-            "available_tools": list(self.tool_registry.tools.keys()),
+            "available_tools": self.tool_registry.list_tools(),
             "intent": intent,
         }
 
-    # ------------------------------------------------------------------
+    # ==================================================================
     # THINK
-    # ------------------------------------------------------------------
+    # ==================================================================
 
     async def _think(self) -> Dict[str, Any]:
         await self._ensure_system_prompt()
@@ -952,7 +1178,10 @@ class AgentLoop:
             retry_messages = list(messages) + [
                 Message(
                     role="user",
-                    content="Please provide your answer now, or call a tool if you still need information.",
+                    content=(
+                        "Please provide your answer now, or call a tool if you "
+                        "still need information."
+                    ),
                 )
             ]
             self.context.llm_calls += 1
@@ -964,6 +1193,15 @@ class AgentLoop:
             )
             calls = list(getattr(response, "tool_calls", []) or [])
             content = getattr(response, "content", None) or ""
+
+        # Cap BEFORE storing — guarantees the assistant message we persist
+        # and the tool results we later attach are always 1:1.
+        if len(calls) > self.max_tool_calls_per_iteration:
+            logger.info(
+                "Capping tool calls from %d to %d",
+                len(calls), self.max_tool_calls_per_iteration,
+            )
+            calls = calls[: self.max_tool_calls_per_iteration]
 
         self._record_usage(getattr(response, "usage", None))
 
@@ -993,8 +1231,9 @@ class AgentLoop:
 
         if calls:
             await add_tool_call(self.model_context, content, calls)
-        else:
+        elif content.strip():
             await self.model_context.add_assistant_message(content)
+        # else: empty response with no calls — do not store; retry already ran.
 
         self.context.tool_calls.extend(calls)
         return {"response": content, "tool_calls": calls}
@@ -1013,29 +1252,41 @@ class AgentLoop:
                 await self._get_system_prompt(), pinned=True
             )
 
-    def _record_usage(self, usage: Any) -> None:
-        u = usage or {}
-        if not isinstance(u, dict):
-            # Try dataclass / namedtuple style first, then attributes.
-            u = getattr(u, "__dict__", None) or {}
-            if not u:
-                u = {
-                    "prompt_tokens": int(getattr(usage, "prompt_tokens", 0) or 0),
-                    "completion_tokens": int(getattr(usage, "completion_tokens", 0) or 0),
-                    "total_tokens": int(getattr(usage, "total_tokens", 0) or 0),
+    # ==================================================================
+    # USAGE / COST
+    # ==================================================================
+
+    @staticmethod
+    def _normalize_usage(usage: Any) -> Dict[str, int]:
+        if usage is None:
+            return {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+        if isinstance(usage, dict):
+            d = usage
+        else:
+            d = getattr(usage, "__dict__", None) or {}
+            if not d:
+                d = {
+                    "prompt_tokens": getattr(usage, "prompt_tokens", 0),
+                    "completion_tokens": getattr(usage, "completion_tokens", 0),
+                    "total_tokens": getattr(usage, "total_tokens", 0),
                 }
-        prompt = int(u.get("prompt_tokens", 0) or 0)
-        completion = int(u.get("completion_tokens", 0) or 0)
-        total = int(u.get("total_tokens", 0) or 0) or (prompt + completion)
-        self.context.tokens_used += total
-        self.context.input_tokens += prompt
-        self.context.output_tokens += completion
+        prompt = int(d.get("prompt_tokens", 0) or 0)
+        completion = int(d.get("completion_tokens", 0) or 0)
+        total = int(d.get("total_tokens", 0) or 0) or (prompt + completion)
+        return {
+            "prompt_tokens": prompt,
+            "completion_tokens": completion,
+            "total_tokens": total,
+        }
+
+    def _record_usage(self, usage: Any) -> None:
+        u = self._normalize_usage(usage)
+        self.context.tokens_used += u["total_tokens"]
+        self.context.input_tokens += u["prompt_tokens"]
+        self.context.output_tokens += u["completion_tokens"]
         self.context.cost += self._compute_cost(u)
 
-    def _compute_cost(self, usage: Any) -> float:
-        usage = usage or {}
-        if not isinstance(usage, dict):
-            usage = getattr(usage, "__dict__", {}) or {}
+    def _compute_cost(self, usage: Dict[str, int]) -> float:
         try:
             model = self.llm.get_current_model()
         except Exception:
@@ -1045,25 +1296,18 @@ class AgentLoop:
         output_rate = meta.get("cost_output", 0.0) or 0.0
         if not input_rate and not output_rate:
             return 0.0
-        prompt_tokens = usage.get("prompt_tokens", 0) or 0
-        completion_tokens = usage.get("completion_tokens", 0) or 0
         return (
-            (prompt_tokens / 1_000_000) * input_rate
-            + (completion_tokens / 1_000_000) * output_rate
+            (usage.get("prompt_tokens", 0) / 1_000_000) * input_rate
+            + (usage.get("completion_tokens", 0) / 1_000_000) * output_rate
         )
 
+    # ==================================================================
+    # TOOL EXPOSURE (single source of truth)
+    # ==================================================================
+
     def _get_available_tools(self) -> List[Dict[str, Any]]:
-        return [
-            {
-                "type": "function",
-                "function": {
-                    "name": name,
-                    "description": tool.description,
-                    "parameters": tool.parameters,
-                },
-            }
-            for name, tool in self.tool_registry.tools.items()
-        ]
+        # Same list the system prompt is built from.
+        return self.tool_registry.get_schemas()
 
     async def _get_state_context(self) -> Dict[str, Any]:
         return {
@@ -1091,9 +1335,9 @@ class AgentLoop:
             ],
         }
 
-    # ------------------------------------------------------------------
+    # ==================================================================
     # FAST PATH
-    # ------------------------------------------------------------------
+    # ==================================================================
 
     async def _maybe_fast_path(
         self,
@@ -1107,7 +1351,11 @@ class AgentLoop:
             return None
         if thought.get("response"):
             return None
-        if getattr(calls[0], "name", "") in ("question",):
+        tool_name = getattr(calls[0], "name", "")
+        if tool_name in ("question",):
+            return None
+        # Only read-only tools may produce a final answer directly.
+        if tool_name not in FAST_PATH_READ_TOOLS:
             return None
 
         outcome = results[0].get("result") or {}
@@ -1127,164 +1375,192 @@ class AgentLoop:
             else:
                 out = f"Result written to {outcome['path']}"
 
-        if isinstance(out, str) and out.strip():
+        # Reject trivial strings — those are not answers.
+        if isinstance(out, str) and len(out.strip()) >= 40:
             return out.strip()
-        # Do not return raw JSON as if it were the model's answer. Fall
-        # through to a real final-response turn instead.
         return None
 
-    # ------------------------------------------------------------------
+    # ==================================================================
     # ACT
-    # ------------------------------------------------------------------
+    # ==================================================================
 
     async def _act(self, calls: List[ToolCall]) -> List[Dict[str, Any]]:
+        """
+        Execute every call. Guarantees one entry in the returned list per
+        input call, with a `tool_call_id`. Never raises (except CancelledError).
+        """
         results: List[Dict[str, Any]] = []
-        for call in list(calls)[: self.max_tool_calls_per_iteration]:
-            try:
-                key = f"{call.name}:{json.dumps(call.arguments, sort_keys=True, default=str)}"
-                cache_entry = self.tool_result_cache.get(key) if self.enable_caching else None
 
+        for call in calls:
+            call_id = getattr(call, "id", None) or f"call_{len(results)}"
+            name = getattr(call, "name", "?")
+            args = getattr(call, "arguments", {}) or {}
+            if not isinstance(args, dict):
+                args = {}
+
+            try:
+                # --- cache hit (only for successful, recent calls) ---
+                key = f"{name}:{json.dumps(args, sort_keys=True, default=str)}"
+                cache_entry = (
+                    self.tool_result_cache.get(key) if self.enable_caching else None
+                )
                 if (
                     cache_entry
                     and time.time() - cache_entry["timestamp"] < 60
                     and cache_entry["result"].get("success", False)
                 ):
                     result = cache_entry["result"]
-                    await add_tool_result(self.model_context, call, result)
+                    await self._safe_add_tool_result(call, result)
                     self.completed_tool_calls.append(call)
-                    self.context.add_action(
-                        {
-                            "tool": call.name,
-                            "tool_call_id": call.id,
-                            "params": call.arguments,
-                            "result": result,
-                            "time": 0.0,
-                            "cached": True,
-                        }
-                    )
-                    results.append(
-                        {
-                            "tool": call.name,
-                            "tool_call_id": call.id,
-                            "result": result,
-                            "cached": True,
-                        }
-                    )
-                    await self._trigger_event(
-                        "on_tool_executed",
-                        {
-                            "tool": call.name,
-                            "tool_call_id": call.id,
-                            "params": call.arguments,
-                            "result": result,
-                            "cached": True,
-                        },
-                    )
+                    self.context.add_action({
+                        "tool": name, "tool_call_id": call_id,
+                        "params": args, "result": result,
+                        "time": 0.0, "cached": True,
+                    })
+                    results.append({
+                        "tool": name, "tool_call_id": call_id,
+                        "result": result, "cached": True,
+                    })
+                    await self._trigger_event("on_tool_executed", {
+                        "tool": name, "tool_call_id": call_id,
+                        "params": args, "result": result, "cached": True,
+                    })
                     continue
 
+                # --- real execution ---
                 start = time.time()
-                result = await self.agent.execute_tool(call.name, call.arguments)
+                result = await self.tool_registry.execute_safe(name, args)
                 elapsed = time.time() - start
 
                 if not isinstance(result, dict):
                     result = {"success": True, "result": result}
-
                 try:
                     result = redact(result)
                 except Exception:
                     pass
 
-                self.tool_execution_times.setdefault(call.name, []).append(elapsed)
-                self.context.add_action(
-                    {
-                        "tool": call.name,
-                        "tool_call_id": call.id,
-                        "params": call.arguments,
-                        "result": result,
-                        "time": elapsed,
-                    }
-                )
-                await add_tool_result(self.model_context, call, result)
+                self.tool_execution_times.setdefault(name, []).append(elapsed)
+                self.context.add_action({
+                    "tool": name, "tool_call_id": call_id,
+                    "params": args, "result": result, "time": elapsed,
+                })
+                await self._safe_add_tool_result(call, result)
 
                 if self.enable_caching and result.get("success", False):
                     self.tool_result_cache[key] = {
-                        "result": result,
-                        "timestamp": time.time(),
+                        "result": result, "timestamp": time.time(),
                     }
 
                 self.completed_tool_calls.append(call)
-                results.append(
-                    {
-                        "tool": call.name,
-                        "tool_call_id": call.id,
-                        "result": result,
-                        "execution_time": elapsed,
-                    }
-                )
-                await self._trigger_event(
-                    "on_tool_executed",
-                    {
-                        "tool": call.name,
-                        "tool_call_id": call.id,
-                        "params": call.arguments,
-                        "result": result,
-                        "execution_time": elapsed,
-                    },
-                )
+                results.append({
+                    "tool": name, "tool_call_id": call_id,
+                    "result": result, "execution_time": elapsed,
+                })
+                await self._trigger_event("on_tool_executed", {
+                    "tool": name, "tool_call_id": call_id,
+                    "params": args, "result": result,
+                    "execution_time": elapsed,
+                })
 
+            except asyncio.CancelledError:
+                raise
             except Exception as exc:
-                logger.error("Tool %s failed: %s", getattr(call, "name", "?"), exc, exc_info=True)
-                result = {"success": False, "error": str(exc)}
-                try:
-                    await add_tool_result(self.model_context, call, result)
-                except Exception as inner:
-                    logger.debug("add_tool_result failed: %s", inner)
-                results.append(
-                    {
-                        "tool": call.name,
-                        "tool_call_id": call.id,
-                        "result": result,
-                        "error": str(exc),
-                        "success": False,
-                    }
-                )
-                await self._trigger_event(
-                    "on_tool_executed",
-                    {
-                        "tool": call.name,
-                        "tool_call_id": call.id,
-                        "params": call.arguments,
-                        "result": result,
-                        "error": str(exc),
-                    },
-                )
+                logger.error("Tool %s failed: %s", name, exc, exc_info=True)
+                result = {
+                    "success": False,
+                    "error": f"{type(exc).__name__}: {exc}",
+                    "recoverable": True,
+                    "suggestion": "Inspect the error and retry with corrected arguments.",
+                }
+                await self._safe_add_tool_result(call, result)
+                results.append({
+                    "tool": name, "tool_call_id": call_id,
+                    "result": result, "error": str(exc), "success": False,
+                })
+                await self._trigger_event("on_tool_executed", {
+                    "tool": name, "tool_call_id": call_id,
+                    "params": args, "result": result, "error": str(exc),
+                })
 
         return results
+
+    async def _safe_add_tool_result(self, call: ToolCall, result: Dict[str, Any]) -> None:
+        try:
+            await add_tool_result(self.model_context, call, result)
+        except Exception as inner:
+            logger.error(
+                "add_tool_result failed for %s: %s",
+                getattr(call, "id", "?"), inner, exc_info=True,
+            )
 
     async def _observe(self, results: List[Dict[str, Any]]) -> None:
         for x in results:
             r = x.get("result") or {}
-            self.context.add_observation(
-                {
-                    "timestamp": time.time(),
-                    "tool": x.get("tool"),
-                    "tool_call_id": x.get("tool_call_id"),
-                    "success": bool(r.get("success", False)),
-                    "error": x.get("error") or r.get("error"),
-                    "execution_time": x.get("execution_time", 0),
-                    "result": r,
-                }
+            self.context.add_observation({
+                "timestamp": time.time(),
+                "tool": x.get("tool"),
+                "tool_call_id": x.get("tool_call_id"),
+                "success": bool(r.get("success", False)),
+                "error": x.get("error") or r.get("error"),
+                "execution_time": x.get("execution_time", 0),
+                "result": r,
+            })
+
+    async def _inject_failure_guidance(self, results: List[Dict[str, Any]]) -> None:
+        """
+        Append a system message for every failed tool call so the model
+        sees the exact error + its own arguments + a suggestion. This is
+        what turns "half the work" into "the agent fixes itself".
+        """
+        for x in results:
+            r = x.get("result") or {}
+            if r.get("success", False):
+                continue
+            tool = x.get("tool", "?")
+            err = r.get("error") or x.get("error") or "unknown error"
+            suggestion = r.get("suggestion") or (
+                "Re-read the tool schema and retry with corrected arguments."
             )
+            invalid = r.get("invalid_arguments", False)
+            msg = (
+                f"Tool '{tool}' failed.\n"
+                f"Error: {err}\n"
+                f"Arguments you sent: {json.dumps(x.get('params') or {}, default=str)}\n"
+                + ("This was an argument-validation failure. "
+                   if invalid else "")
+                + f"Suggestion: {suggestion}"
+            )
+            try:
+                await self.model_context.add_system_message(msg)
+            except Exception as exc:
+                logger.debug("add_system_message (failure guidance) failed: %s", exc)
 
     async def _evaluate(self, results: List[Dict[str, Any]]) -> bool:
         if not results:
             return True
 
+        # Per-tool failure counters (not just identical signatures).
+        per_tool = self.context.metadata.setdefault("tool_failures", {})
+        for x in results:
+            r = x.get("result") or {}
+            tool = x.get("tool", "?")
+            if not r.get("success", False):
+                per_tool[tool] = per_tool.get(tool, 0) + 1
+
+        for tool, count in per_tool.items():
+            if count >= 5:
+                logger.warning(
+                    "Stopping loop: tool '%s' failed %d times", tool, count
+                )
+                return False
+
+        # Identical failure signature repeated 3x.
         signature = tuple(
             sorted(
                 (
                     r.get("tool"),
-                    str((r.get("result") or {}).get("error", r.get("error", "")))[:120],
+                    str((r.get("result") or {}).get("error",
+                                                     r.get("error", "")))[:120],
                 )
                 for r in results
                 if not (r.get("result") or {}).get("success", False)
@@ -1307,22 +1583,25 @@ class AgentLoop:
             return False
         return True
 
-    # ------------------------------------------------------------------
+    # ==================================================================
     # FINAL RESPONSE
-    # ------------------------------------------------------------------
+    # ==================================================================
 
     async def _generate_final_response(self) -> str:
         messages = get_model_messages(self.model_context, self.max_history_length)
         if not any(getattr(m, "role", None) == "system" for m in messages):
-            messages.insert(0, Message(role="system", content=await self._get_system_prompt()))
+            messages.insert(0, Message(role="system",
+                                       content=await self._get_system_prompt()))
         messages.append(
             Message(
                 role="user",
                 content=(
-                    "Provide the final response to the user. Include a "
-                    "short closing summary (2–4 sentences) of what you "
-                    "actually did, why, and anything they should know. "
-                    "Do not claim unverified success."
+                    "Provide the final response to the user. Include a short "
+                    "closing summary (2–4 sentences) of what you actually did, "
+                    "why, and anything they should know. Cite the concrete "
+                    "evidence (command output, diff, or file content) that "
+                    "proves each major step. Do not claim unverified success. "
+                    "If anything is unverified or blocked, say so explicitly."
                 ),
             )
         )
@@ -1334,6 +1613,8 @@ class AgentLoop:
                 temperature=0.3,
                 max_tokens=2000,
             )
+        except asyncio.CancelledError:
+            raise
         except Exception as exc:
             logger.error("Final response generation failed: %s", exc)
             return ""
@@ -1347,23 +1628,21 @@ class AgentLoop:
                 logger.debug("add_assistant_message failed: %s", exc)
         return content
 
-    # ------------------------------------------------------------------
+    # ==================================================================
     # METRICS / LIFECYCLE
-    # ------------------------------------------------------------------
+    # ==================================================================
 
     def _update_metrics(self) -> None:
-        self.performance_history.append(
-            {
-                "timestamp": time.time(),
-                "duration": time.time() - self.context.start_time,
-                "iterations": self.context.iteration,
-                "tool_calls": len(self.completed_tool_calls),
-                "tokens": self.context.tokens_used,
-                "llm_calls": self.context.llm_calls,
-                "errors": len(self.context.errors),
-                "intent": self.context.intent,
-            }
-        )
+        self.performance_history.append({
+            "timestamp": time.time(),
+            "duration": time.time() - self.context.start_time,
+            "iterations": self.context.iteration,
+            "tool_calls": len(self.completed_tool_calls),
+            "tokens": self.context.tokens_used,
+            "llm_calls": self.context.llm_calls,
+            "errors": len(self.context.errors),
+            "intent": self.context.intent,
+        })
 
     async def reset(self) -> None:
         self.context = LoopContext()
@@ -1396,7 +1675,8 @@ class AgentLoop:
             "max_iterations": self.max_iterations,
             "has_plan": self.current_plan is not None,
             "plan_completion": (
-                self.current_plan.get_completion_percentage() if self.current_plan else 0
+                self.current_plan.get_completion_percentage()
+                if self.current_plan else 0
             ),
             "tool_calls_completed": len(self.completed_tool_calls),
             "tool_calls_pending": len(self.pending_tool_calls),

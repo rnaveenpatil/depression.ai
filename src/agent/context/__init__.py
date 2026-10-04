@@ -11,7 +11,9 @@ Exports:
     Compactor       — Context compaction
 """
 
-from agent.context.manager import ContextManager, ContextMessage, ToolOutput, ContextStats
+from agent.context.manager import (
+    ContextManager, ContextMessage, ToolOutput, ContextStats,
+)
 from agent.context.files import FileContext
 from agent.context.project import ProjectContext
 from agent.context.compaction import Compactor

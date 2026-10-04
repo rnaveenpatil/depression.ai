@@ -29,6 +29,7 @@ from enum import Enum
 
 from agent.utils.logging import get_logger
 from agent.utils.errors import ConfigError
+from agent._version import get_version
 
 logger = get_logger(__name__)
 
@@ -645,7 +646,7 @@ class Config:
         empty, or validates the given model against the registry.
       - `resolve_temperature()` uses TemperatureResolver for adaptive temps.
     """
-    version: str = "1.0.0"
+    version: str = field(default_factory=get_version)
     debug: bool = False
     llm: LLMConfig = field(default_factory=LLMConfig)
     session: SessionConfig = field(default_factory=SessionConfig)

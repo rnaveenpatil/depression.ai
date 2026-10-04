@@ -51,6 +51,9 @@ class FileEntry:
     write_count: int = 0
     hash: Optional[str] = None
     binary: bool = False
+    # Set when the file was attempted but could not be read. Callers can
+    # distinguish "empty file" from "read failed".
+    read_error: Optional[str] = None
 
 
 class FileContext:
@@ -76,7 +79,7 @@ class FileContext:
         # Prefer an injected TokenCounter; fall back to a local heuristic.
         self._counter = token_counter
 
-        self._files: Dict[str, FileEntry] = {}   # key: normalized absolute path
+        self._files: Dict[str, FileEntry] = {}
         self._total_tokens = 0
         self._lock = asyncio.Lock()
 
@@ -102,6 +105,10 @@ class FileContext:
         """
         Add or refresh a file in context.
         If `content` is None, the file is read from disk.
+
+        Returns True if the entry was created or refreshed (even if the
+        read failed — read_error will be set on the entry in that case).
+        Returns False only for invalid paths or missing files.
         """
         try:
             abs_path = self._normalize(path)
@@ -122,24 +129,32 @@ class FileContext:
             rel = self._rel(abs_path)
             entry = self._files.get(str(abs_path))
 
-            # If unchanged and already cached, just bump accessed_at
-            if entry and entry.mtime == stat.st_mtime and entry.size == stat.st_size:
+            # If unchanged and already cached with content, just bump
+            # accessed_at. Do not skip if a previous read failed.
+            if (
+                entry
+                and entry.mtime == stat.st_mtime
+                and entry.size == stat.st_size
+                and entry.read_error is None
+            ):
                 entry.accessed_at = time.time()
                 entry.read_count += 1
                 return True
 
-            # Read content
-            text, truncated, is_binary = "", False, False
+            text, truncated, is_binary, read_error = "", False, False, None
             if content is not None:
                 text = content
             elif self.include_contents:
-                text, truncated, is_binary = await asyncio.to_thread(
+                text, truncated, is_binary, read_error = await asyncio.to_thread(
                     self._read_file, abs_path
                 )
+                if read_error:
+                    # Log at warning level so operators see permission or
+                    # I/O problems instead of silently treating them as empty.
+                    logger.warning(f"Read failed for {abs_path}: {read_error}")
 
             tokens = self._estimate_tokens(text)
 
-            # Evict if we'd exceed max_files
             if entry is None and len(self._files) >= self.max_files:
                 self._evict_oldest()
 
@@ -157,6 +172,7 @@ class FileContext:
                 write_count=entry.write_count if entry else 0,
                 added_at=entry.added_at if entry else time.time(),
                 accessed_at=time.time(),
+                read_error=read_error,
             )
 
             if entry:
@@ -169,7 +185,7 @@ class FileContext:
             return True
 
     async def get_content(self, path: str) -> Optional[str]:
-        """Get cached content for a file (reads if not cached)"""
+        """Get cached content for a file (reads if not cached)."""
         abs_path = self._normalize(path)
         async with self._lock:
             entry = self._files.get(str(abs_path))
@@ -202,7 +218,7 @@ class FileContext:
         return len(self._files)
 
     async def get_summary(self, max_files: int = 10) -> List[Dict[str, Any]]:
-        """Return a compact list of tracked files"""
+        """Return a compact list of tracked files."""
         async with self._lock:
             items = sorted(
                 self._files.values(),
@@ -216,19 +232,23 @@ class FileContext:
                     "tokens": e.tokens,
                     "truncated": e.truncated,
                     "binary": e.binary,
+                    "read_error": e.read_error,
                     "content": e.content if self.include_contents else None,
                 }
                 for e in items
             ]
 
     async def as_prompt(self, max_chars: int = 4000) -> str:
-        """Render tracked files as an LLM-friendly string"""
+        """Render tracked files as an LLM-friendly string."""
         files = await self.get_summary(max_files=15)
         parts = []
         remaining = max_chars
         for f in files:
             header = f"--- {f['path']} ({f['size']} bytes) ---"
-            body = f.get("content") or "(content not loaded)"
+            if f.get("read_error"):
+                body = f"(read failed: {f['read_error']})"
+            else:
+                body = f.get("content") or "(content not loaded)"
             block = f"{header}\n{body}\n"
             if len(block) > remaining:
                 block = block[:remaining] + "\n… (truncated)\n"
@@ -254,14 +274,24 @@ class FileContext:
         except ValueError:
             return str(abs_path)
 
-    def _read_file(self, path: Path) -> Tuple[str, bool, bool]:
-        """Return (content, truncated, is_binary)"""
+    def _read_file(self, path: Path) -> Tuple[str, bool, bool, Optional[str]]:
+        """
+        Return (content, truncated, is_binary, read_error).
+        read_error is None on success; a short message on failure.
+        """
         try:
             with open(path, "rb") as f:
                 raw = f.read(self.max_file_bytes + 1)
+        except FileNotFoundError:
+            return "", False, False, "file not found"
+        except PermissionError:
+            return "", False, False, "permission denied"
+        except IsADirectoryError:
+            return "", False, False, "path is a directory"
+        except OSError as e:
+            return "", False, False, f"os error: {e}"
         except Exception as e:
-            logger.debug(f"Read failed for {path}: {e}")
-            return "", False, False
+            return "", False, False, str(e)
 
         is_binary = b"\x00" in raw[:1024]
         truncated = len(raw) > self.max_file_bytes
@@ -269,7 +299,7 @@ class FileContext:
             raw = raw[: self.max_file_bytes]
 
         if is_binary:
-            return "", truncated, True
+            return "", truncated, True, None
 
         try:
             text = raw.decode("utf-8", errors="replace")
@@ -277,8 +307,8 @@ class FileContext:
             try:
                 text = raw.decode("latin-1", errors="replace")
             except Exception:
-                return "", truncated, True
-        return text, truncated, False
+                return "", truncated, True, "decode failed"
+        return text, truncated, False, None
 
     def _hash(self, text: str) -> str:
         return hashlib.sha1(text.encode("utf-8", errors="ignore")).hexdigest()[:16]
@@ -294,12 +324,23 @@ class FileContext:
         return _default_token_counter(text)
 
     def _evict_oldest(self) -> None:
+        """
+        Evict by a combined score so that a critical file read once at
+        startup is not the first to go. Score = last access time, but a
+        file that has been read multiple times gets a small boost.
+        """
         if not self._files:
             return
-        oldest_key = min(
-            self._files.keys(),
-            key=lambda k: self._files[k].accessed_at,
-        )
+        now = time.time()
+
+        def score(entry: FileEntry) -> float:
+            # Files read more than once are more valuable; treat each read
+            # as extending the effective freshness by a small window.
+            recency = now - entry.accessed_at
+            read_bonus = min(entry.read_count, 10) * 3.0
+            return recency - read_bonus
+
+        oldest_key = max(self._files.keys(), key=lambda k: score(self._files[k]))
         entry = self._files.pop(oldest_key, None)
         if entry:
             self._total_tokens -= entry.tokens
@@ -319,6 +360,7 @@ class FileContext:
                     "write_count": e.write_count,
                     "truncated": e.truncated,
                     "binary": e.binary,
+                    "read_error": e.read_error,
                 }
                 for e in self._files.values()
             ],

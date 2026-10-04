@@ -14,7 +14,7 @@ Built-in presets:
     - github      : repositories, issues, PRs
     - browser     : research docs and websites
     - database    : SQL / SQLite / Postgres / MySQL queries
-    - aws         : AWS CLI MCP (reads credentials from .env)
+    - aws         : AWS CLI MCP (reads credentials from the canonical EnvManager)
 
 Features:
     - Multi-server management
@@ -25,6 +25,11 @@ Features:
     - Per-server auth (Bearer, API key headers, OAuth token)
     - Health checks and heartbeats
     - Async-first design
+    - Canonical credential source (EnvManager) — AWS MCP servers spawn with
+      live credentials, not stale env.
+    - Tools are pushed into the agent's ToolRegistry on discovery, so the
+      loop's `_get_available_tools()` (== ToolRegistry.get_schemas()) exposes
+      exactly what the runtime can execute.
 """
 
 from __future__ import annotations
@@ -45,6 +50,8 @@ import httpx
 
 from agent.utils.logging import get_logger
 from agent.utils.errors import MCPError, MCPConnectionError, MCPTimeoutError
+from agent.utils.env_manager import EnvManager
+from agent._version import get_version
 from agent.mcp.aws_config import (
     build_aws_mcp_config,
     build_aws_cli_fallback_status,
@@ -236,6 +243,33 @@ class StdioTransport(MCPTransportBase):
         self._process: Optional[asyncio.subprocess.Process] = None
         self._read_task: Optional[asyncio.Task] = None
 
+    def _build_child_env(self) -> Dict[str, str]:
+        """
+        Env for the child MCP process.
+
+        Always: os.environ + config.env.
+        Additionally for AWS MCP servers: overlay the canonical AWS vars from
+        EnvManager so freshly-saved credentials reach the child process even
+        if the parent's os.environ hasn't been reloaded yet.
+        """
+        env = {**os.environ, **self.config.env}
+
+        is_aws = (
+            self.config.name == "aws"
+            or "aws" in (self.config.name or "").lower()
+            or any(
+                "aws" in str(a).lower()
+                for a in (self.config.args or [])
+            )
+        )
+        if is_aws:
+            try:
+                env.update(EnvManager.get().get_aws_env())
+            except Exception as e:
+                logger.debug("Could not overlay AWS env for MCP child: %s", e)
+
+        return env
+
     async def connect(self) -> None:
         self.state = MCPState.CONNECTING
 
@@ -245,7 +279,7 @@ class StdioTransport(MCPTransportBase):
             )
 
         cmd = shutil.which(self.config.command) or self.config.command
-        env = {**os.environ, **self.config.env}
+        env = self._build_child_env()
 
         try:
             self._process = await asyncio.create_subprocess_exec(
@@ -713,9 +747,9 @@ class MCPPresets:
         """
         AWS MCP server.
 
-        Reads credentials from .env and passes them to the child process
-        only. Returns a disabled stub if uvx or credentials are missing,
-        so the caller can decide to fall back to the bash tool.
+        Reads credentials from the canonical EnvManager and passes them to
+        the child process only. Returns a disabled stub if uvx or credentials
+        are missing, so the caller can decide to fall back to the bash tool.
         """
         cfg_dict = build_aws_mcp_config(
             region=region, profile=profile, server_name=name,
@@ -832,7 +866,7 @@ class MCPClient:
 
     Usage:
         client = MCPClient(config)
-        await client.initialize()
+        await client.initialize(tool_registry=agent.tool_registry)
         tools = client.list_tools()
         result = await client.call_tool("mcp__filesystem__read_file", {...})
     """
@@ -850,6 +884,9 @@ class MCPClient:
         self._initialized = False
         self._health_task: Optional[asyncio.Task] = None
         self._heartbeat_interval = config.get("heartbeat_interval", 30.0)
+
+        # The agent's ToolRegistry (set by initialize/register_tools_into).
+        self._tool_registry: Any = None
 
     # ------------------------------------------------------------------
     # SERVER CONFIG LOADING
@@ -1025,11 +1062,25 @@ class MCPClient:
     # LIFECYCLE
     # ------------------------------------------------------------------
 
-    async def initialize(self) -> None:
+    async def initialize(self, tool_registry: Any = None) -> None:
+        """
+        Connect all configured servers, discover tools, and (if a registry
+        is provided) push every MCP tool into it.
+
+        Passing the registry is what makes the loop's `_get_available_tools()`
+        expose MCP tools to the model — otherwise the model is told about
+        tools it cannot call.
+        """
+        if tool_registry is not None:
+            self._tool_registry = tool_registry
+
         if not self.enabled:
             logger.info("MCP client disabled")
             return
         if self._initialized:
+            # Already connected: at minimum, ensure tools are registered.
+            if self._tool_registry is not None:
+                self.register_tools_into(self._tool_registry)
             return
 
         if not self.servers_cfg:
@@ -1048,6 +1099,10 @@ class MCPClient:
 
         self._initialized = True
         self._health_task = asyncio.create_task(self._health_loop())
+
+        # Push tools into the agent's registry so the loop can expose them.
+        if self._tool_registry is not None:
+            self.register_tools_into(self._tool_registry)
 
         logger.info(
             f"MCP client initialized: "
@@ -1083,7 +1138,7 @@ class MCPClient:
                 },
                 "clientInfo": {
                     "name": "cli-agent",
-                    "version": "1.0.0",
+                    "version": get_version(),
                 },
             })
             logger.debug(
@@ -1093,6 +1148,10 @@ class MCPClient:
             await transport.notify("notifications/initialized")
 
             await self._discover_server(cfg.name, transport)
+
+            # Register freshly discovered tools with the agent registry.
+            if self._tool_registry is not None:
+                self.register_tools_into(self._tool_registry)
 
         except Exception as e:
             logger.warning(f"MCP handshake with '{cfg.name}' failed: {e}")
@@ -1169,6 +1228,15 @@ class MCPClient:
         self._initialized = False
         logger.info("MCP client shutdown complete")
 
+    async def reload(self) -> None:
+        """
+        Tear down and re-initialize every server. Used after credentials
+        change so the child MCP processes respawn with the new env.
+        """
+        registry = self._tool_registry
+        await self.shutdown()
+        await self.initialize(tool_registry=registry)
+
     # ------------------------------------------------------------------
     # TOOLS
     # ------------------------------------------------------------------
@@ -1243,6 +1311,43 @@ class MCPClient:
         raise MCPError(f"Invalid MCP tool name: {full_name}")
 
     # ------------------------------------------------------------------
+    # REGISTRATION INTO THE AGENT'S ToolRegistry
+    # ------------------------------------------------------------------
+
+    def register_tools_into(self, tool_registry: Any) -> int:
+        """
+        Push every MCP tool into the agent's ToolRegistry as an external
+        tool. Idempotent — safe to call again after a reconnect or after
+        a `tools/list_changed` notification.
+
+        Returns the number of tools successfully registered.
+        """
+        if tool_registry is None:
+            return 0
+
+        count = 0
+        for full_name, tool in self.tools.items():
+            # Bind by default-arg to avoid late-binding closure bugs.
+            async def _handler(_name: str = full_name, **kwargs):
+                return await self.call_tool(_name, kwargs)
+
+            try:
+                tool_registry.register_external(
+                    name=full_name,
+                    handler=_handler,
+                    description=f"[{tool.server}] {tool.description}",
+                    parameters=tool.input_schema or {
+                        "type": "object", "properties": {},
+                    },
+                )
+                count += 1
+            except Exception as e:
+                logger.debug("Failed to register MCP tool %s: %s", full_name, e)
+        if count:
+            logger.info("Registered %d MCP tools into ToolRegistry", count)
+        return count
+
+    # ------------------------------------------------------------------
     # RESOURCES / PROMPTS
     # ------------------------------------------------------------------
 
@@ -1289,6 +1394,9 @@ class MCPClient:
                     await self._discover_server(name, transport)
                 except Exception:
                     pass
+            # Re-push into the agent's tool registry so the model sees them.
+            if self._tool_registry is not None:
+                self.register_tools_into(self._tool_registry)
 
     # ------------------------------------------------------------------
     # HEALTH

@@ -3,6 +3,14 @@ Session and SessionManager.
 
 Session         — a single conversation with id, name, messages, state.
 SessionManager  — create / load / save / list / delete sessions on disk.
+
+Note on state duplication:
+    Session.history is the PERSISTENT TRANSCRIPT (what the user sees on
+    resume). It is NOT the source of truth for the model's conversation.
+    The runtime's ContextManager owns the model-facing message list, and
+    seeds from this transcript exactly once per session load via
+    ContextManager.load_from_session(). After that, only ContextManager
+    writes to the model's view.
 """
 
 from __future__ import annotations
@@ -221,8 +229,6 @@ class SessionManager:
             "max_messages_per_session", 5000
         )
         self.default_name: str = cfg.get("default_name", "session")
-        # Opt-in: on boot with no --session/--new-session, resume the most
-        # recent session. Default False (start fresh) to match most CLIs.
         self.resume_last: bool = cfg.get("resume_last", False)
 
         self._current: Optional[Session] = None
@@ -364,7 +370,7 @@ class SessionManager:
                 logger.debug("DB save failed: %s", e)
 
         self._last_save = time.time()
-        self._enforce_max_sessions()
+        await self._enforce_max_sessions()
         logger.debug("Saved session: %s", session.id)
         return True
 
@@ -421,7 +427,7 @@ class SessionManager:
                 count += 1
         return count
 
-    def _enforce_max_sessions(self) -> None:
+    async def _enforce_max_sessions(self) -> None:
         if self.max_sessions <= 0 or len(self._index) <= self.max_sessions:
             return
         sorted_sids = sorted(
@@ -436,21 +442,13 @@ class SessionManager:
             except Exception:
                 pass
             self._index.pop(sid, None)
-        # Fire-and-forget; index will be re-saved on next call.
-        try:
-            asyncio.get_running_loop().create_task(self._save_index())
-        except Exception:
-            pass
+        await self._save_index()
 
     # ------------------------------------------------------------------
     # CURRENT SESSION
     # ------------------------------------------------------------------
 
     async def get_or_create_session(self) -> Session:
-        """
-        If resume_last is enabled and a prior session exists, load it.
-        Otherwise create a fresh session.
-        """
         if self._current:
             return self._current
 
