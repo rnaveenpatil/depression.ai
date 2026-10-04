@@ -41,7 +41,7 @@ from agent.tui.onboarding.firebase_auth import (
 from agent.tui.onboarding.firebase_config import FirebaseConfig, load_firebase_config
 from agent.tui.onboarding.google_oauth import GoogleOAuthSignIn, oauthlib_available
 from agent.tui.onboarding.identity import apply_identity, export_identity
-from agent.tui.onboarding.profile import ProfileStore, UserProfile
+from agent.tui.onboarding.profile import ProfileStore, UserProfile, guest_profile
 from agent.tui.theme import (
     AMBER,
     BG,
@@ -221,6 +221,7 @@ class WelcomeScreen(ModalScreen[Optional[UserProfile]]):
         Binding("enter", "sign_in", "Sign in", priority=True),
         Binding("g", "sign_in", "Sign in", priority=True),
         Binding("t", "manual", "Paste token", priority=True),
+        Binding("c", "guest", "Continue as guest", priority=True),
         Binding("escape", "clear_status", "Clear message", priority=True),
     ]
 
@@ -392,6 +393,32 @@ class WelcomeScreen(ModalScreen[Optional[UserProfile]]):
         except Exception:
             return
         self._status(f"[{AMBER}]Paste a Firebase ID token, then press enter.[/]")
+
+    def action_guest(self) -> None:
+        """
+        Continue without Google.
+
+        Saves a real, local-only guest identity (``uid == "local-guest"``,
+        ``signed_in == False``) so the first-run gate does not reappear and
+        no Gmail features are enabled for this install.
+        """
+        if self._busy or self._done:
+            return
+        self._set_busy(True, f"[{AMBER}]Setting up a local profile\u2026[/]")
+        try:
+            profile = guest_profile()
+            self.store.save(profile)
+            export_identity(profile, env_path=self._env_path)
+        except Exception as exc:
+            logger.error("Guest setup failed: %s", exc, exc_info=True)
+            self._set_busy(
+                False,
+                f"[{ERROR}]Could not continue as guest: {_esc(_one_line(exc))}[/]",
+            )
+            return
+        self._set_busy(False)
+        self._status(f"[{GREEN}]Continuing as {_esc(profile.display_name)}.[/]")
+        self._finish(profile)
 
     async def action_sign_in(self) -> None:
         if self._busy:

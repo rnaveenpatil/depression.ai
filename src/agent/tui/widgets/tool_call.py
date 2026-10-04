@@ -79,6 +79,10 @@ _WEB_TOOLS = {"webfetch", "websearch", "web"}
 
 _BASH_PREVIEW_LINES = 8
 _GENERIC_PREVIEW_LINES = 4
+_SEARCH_PREVIEW = 4
+_SEARCH_EXPANDED = 40
+_ERROR_PREVIEW_CHARS = 800
+_ERROR_EXPANDED_CHARS = 8000
 
 _PULSE = ("▏", "▎", "▍", "▌", "▋", "▊", "▉", "█", "▉", "▊", "▋", "▌", "▍", "▎")
 _AWS_SPIN = ("◐", "◓", "◑", "◒")
@@ -487,8 +491,7 @@ class ToolCallWidget(Vertical):
             return f"[{TEXT}]{_esc(result)[:800]}[/]"
 
         if not result.get("success", True):
-            err = result.get("error") or "tool failed"
-            return f"[{ERROR}]{_esc(err)[:800]}[/]"
+            return self._render_error(str(result.get("error") or ""))
 
         if self._tool in _DIFF_TOOLS:
             rendered = self._render_diff(result)
@@ -505,15 +508,33 @@ class ToolCallWidget(Vertical):
 
         return self._render_generic(result)
 
+    def _render_error(self, err: str, fallback: str = "tool failed") -> str:
+        """
+        Render a failure body without silently clipping it.
+
+        The first _ERROR_PREVIEW_CHARS characters are shown inline; the
+        remainder is always retrievable by expanding the card with `e`.
+        """
+        text = str(err or fallback)
+        limit = _ERROR_EXPANDED_CHARS if self._expanded else _ERROR_PREVIEW_CHARS
+        body = f"[{ERROR}]{_esc(text[:limit])}[/]"
+        if len(text) > limit:
+            hidden = len(text) - limit
+            hint = "" if self._expanded else " · press e"
+            body += (
+                f"\n[{AMBER}]… {hidden} more char"
+                f"{'s' if hidden != 1 else ''}{hint}[/]"
+            )
+        return body
+
     def _render_aws(self, result: Dict[str, Any]) -> str:
         if not isinstance(result, dict):
-            return f"[{TEXT}]{_esc(result)[:800]}[/]"
+            return f"[{TEXT}]{_esc(str(result)[:800])}[/]"
 
         if not result.get("success", True):
-            err = result.get("error") or "aws call failed"
             color = _service_color(self._aws_service)
-            return (
-                f"[{color}]┃[/] [{ERROR}]{_esc(err)[:800]}[/]"
+            return f"[{color}]┃[/] " + self._render_error(
+                str(result.get("error") or ""), "aws call failed"
             )
 
         summary = _summarize_aws_result(
@@ -632,15 +653,29 @@ class ToolCallWidget(Vertical):
             return f"[{MUTED}]no matches for[/] [{TEXT}]'{pattern}'[/]"
         matches = result.get("matches") or []
         lines = [f"[{GREEN}]{count}[/] [{MUTED}]match{'es' if count != 1 else ''} for[/] [{TEXT}]'{pattern}'[/]"]
-        for m in matches[:4]:
+        available = len(matches)
+        limit = _SEARCH_EXPANDED if self._expanded else _SEARCH_PREVIEW
+        for m in matches[:limit]:
             if isinstance(m, dict):
                 path = _esc(m.get("path", ""))
                 text = _esc(m.get("text", "")[:70])
                 lines.append(f"[{DIM}]{path}[/]  [{MUTED}]{text}[/]")
             else:
                 lines.append(f"[{DIM}]{_esc(m)}[/]")
-        if count > 4:
-            lines.append(f"[{AMBER}]… {count - 4} more matches · press e[/]")
+        shown = min(available, limit)
+        hidden = available - shown
+        if hidden > 0:
+            hint = "" if self._expanded else " · press e"
+            lines.append(
+                f"[{AMBER}]… {hidden} more "
+                f"match{'es' if hidden != 1 else ''}{hint}[/]"
+            )
+        elif count > available:
+            extra = count - available
+            lines.append(
+                f"[{AMBER}]… {extra} more match"
+                f"{'es' if extra != 1 else ''} not in payload[/]"
+            )
         return "\n".join(lines)
 
     def _render_web(self, result: Dict[str, Any]) -> str:
@@ -653,8 +688,16 @@ class ToolCallWidget(Vertical):
             head = f"[{DIM}]{url}[/]"
         if not content:
             return head
-        preview = _esc(content.strip().replace("\n", " ")[:180])
-        return head + f"\n[{TEXT}]{preview}[/]"
+        stripped = content.strip()
+        if self._expanded:
+            return head + "\n" + "\n".join(
+                f"[{TEXT}]{_esc(ln)}[/]" for ln in stripped.splitlines()
+            )
+        preview = _esc(stripped.replace("\n", " ")[:180])
+        out = head + f"\n[{TEXT}]{preview}[/]"
+        if len(stripped) > 180:
+            out += f"\n[{AMBER}]… more text · press e[/]"
+        return out
 
     def _render_generic(self, result: Dict[str, Any]) -> str:
         preview = (

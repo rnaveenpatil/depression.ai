@@ -13,6 +13,7 @@ source of providers and the current model.
 
 from __future__ import annotations
 
+import inspect
 import asyncio
 import json
 import time
@@ -401,7 +402,18 @@ class BaseAgent:
                 }
 
         try:
-            result = await self.tool_registry.execute_safe(tool_name, params)
+            runner = getattr(self.tool_registry, "execute_safe", None)
+            if not callable(runner):
+                runner = getattr(self.tool_registry, "execute", None)
+            if not callable(runner):
+                return {
+                    "success": False,
+                    "error": "no tool registry configured",
+                    "tool": tool_name,
+                }
+            result = runner(tool_name, params)
+            if inspect.isawaitable(result):
+                result = await result
         except Exception as e:
             wrapped = handle_exception(e, reraise=False)
             return {

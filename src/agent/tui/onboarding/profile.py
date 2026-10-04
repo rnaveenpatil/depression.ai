@@ -94,13 +94,22 @@ class UserProfile:
 
 def guest_profile(*_args: Any, **_kwargs: Any) -> UserProfile:
     """
-    Removed. Guest mode was dropped: sign-in is required.
+    Identity for a local install that has not signed in with Google.
 
-    Kept as an explicit failure so any stray import surfaces immediately
-    rather than silently producing a fake identity.
+    This is a *real*, savable profile — not an error. It marks the install
+    as owned by a local guest (``uid == "local-guest"``) while remaining
+    explicitly signed out, so the first-run gate does not reappear and no
+    Gmail-specific features (mail, calendar) are enabled for it.
     """
-    raise NotImplementedError(
-        "guest_profile() was removed — sign-in with Google is now required."
+    return UserProfile(
+        uid="local-guest",
+        email="",
+        name="Local user",
+        photo_url="",
+        provider="local",
+        email_verified=False,
+        signed_in=False,
+        metadata={"local": True, "gmail": False},
     )
 
 

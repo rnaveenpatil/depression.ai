@@ -219,9 +219,9 @@ class EnvManager:
 
     def _read_aws_from_disk(self) -> Dict[str, Optional[str]]:
         """
-        Prefer ~/.agent/env; fall back to legacy project .env only if the
-        global file has nothing. Never return project creds when global
-        creds exist.
+        Prefer the PROJECT ``.env`` (where ``save_aws_credentials`` writes),
+        falling back to the global file so pre-existing installs that only
+        have ``~/.agent/env`` keep working.
         """
         creds: Dict[str, Optional[str]] = {
             "access_key": None,
@@ -230,21 +230,14 @@ class EnvManager:
             "session_token": None,
         }
 
-        g = load_env_file(GLOBAL_ENV_PATH)
-        if g.get(AWS_ENVS["access_key"]) and g.get(AWS_ENVS["secret_key"]):
-            creds["access_key"] = g.get(AWS_ENVS["access_key"])
-            creds["secret_key"] = g.get(AWS_ENVS["secret_key"])
-            creds["region"] = g.get(AWS_ENVS["region"]) or "us-east-1"
-            creds["session_token"] = g.get(AWS_ENVS["session_token"])
-            return creds
-
-        # Legacy fallback: project .env (read-only, never written back here)
-        p = load_env_file(find_env_file())
-        if p.get(AWS_ENVS["access_key"]) and p.get(AWS_ENVS["secret_key"]):
-            creds["access_key"] = p.get(AWS_ENVS["access_key"])
-            creds["secret_key"] = p.get(AWS_ENVS["secret_key"])
-            creds["region"] = p.get(AWS_ENVS["region"]) or "us-east-1"
-            creds["session_token"] = p.get(AWS_ENVS["session_token"])
+        for source in (find_env_file(), GLOBAL_ENV_PATH):
+            data = load_env_file(source)
+            if data.get(AWS_ENVS["access_key"]) and data.get(AWS_ENVS["secret_key"]):
+                creds["access_key"] = data.get(AWS_ENVS["access_key"])
+                creds["secret_key"] = data.get(AWS_ENVS["secret_key"])
+                creds["region"] = data.get(AWS_ENVS["region"]) or "us-east-1"
+                creds["session_token"] = data.get(AWS_ENVS["session_token"])
+                return creds
 
         return creds
 
@@ -279,10 +272,13 @@ class EnvManager:
         session_token: Optional[str] = None,
     ) -> None:
         """
-        Persist AWS creds to the GLOBAL file, mirror them into os.environ,
-        bump the generation counter, and notify subscribers.
+        Persist AWS creds to the PROJECT ``.env`` (the checkout owns its own
+        credentials), mirror them into os.environ, bump the generation
+        counter, and notify subscribers.
         """
-        env_vars = load_env_file(GLOBAL_ENV_PATH)
+        # AWS creds are PROJECT-scoped: written next to the project's .env.
+        aws_env_path = find_env_file()
+        env_vars = load_env_file(aws_env_path)
 
         def _set(key: str, value: Optional[str]) -> None:
             if value is None:
@@ -297,7 +293,7 @@ class EnvManager:
         _set(AWS_ENVS["region"], region)
         _set(AWS_ENVS["session_token"], session_token)
 
-        write_env_file(env_vars, GLOBAL_ENV_PATH)
+        write_env_file(env_vars, aws_env_path)
 
         # --- live process update (the actual bug #1 fix) ---
         def _mirror(key: str, value: Optional[str]) -> None:

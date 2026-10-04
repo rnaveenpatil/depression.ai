@@ -177,7 +177,7 @@ class TodoPanel(Vertical):
             return
 
         if not items:
-            self._paint(f"[{DIM}]waiting for tasks…[/]")
+            self._paint(f"[{DIM}]no tasks yet[/]")
             return
 
         # Sort: in-progress first, then pending by priority, then done.
