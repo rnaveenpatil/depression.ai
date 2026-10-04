@@ -16,6 +16,34 @@
 
 > **A team that builds ON ETHICS**
 
+## 🎓 Academic Institution & Project Context
+
+<p align="center">
+  <img src="https://raw.githubusercontent.com/rnaveenpatil/depression.ai/main/assets/mit_logo.png" alt="Moodlakatte Institute of Technology (MIT), Kundapura" width="220">
+</p>
+
+<p align="center">
+  <b>Moodlakatte Institute of Technology (MIT), Kundapura</b><br>
+  Department of Information Science & Engineering (ISE)
+</p>
+
+`depression.ai` is being developed as an **academic major project** by **final-year Information Science & Engineering (ISE) students** of Moodlakatte Institute of Technology (MIT), Kundapura.
+
+The project combines agentic AI, software engineering, system automation, cloud operations and LLM integration as part of the team's academic work.
+
+**College**
+
+* 🏫 **Moodlakatte Institute of Technology (MIT), Kundapura**
+* 🎓 **Department:** Information Science & Engineering (ISE)
+* 📚 **Project Type:** Academic Major Project
+* 👨‍🎓 **Team:** Final-year ISE students
+
+**College LinkedIn**
+
+* 🔗 https://www.linkedin.com/company/mitkundapura/posts/
+
+---
+
 ## 🧑‍💻 R Naveen Patil
 
 <p align="center">
@@ -393,31 +421,268 @@ The TUI can be used to configure the AWS environment when supported by the insta
 
 ### AWS Access Key Setup
 
-A typical AWS access-key workflow is:
+> **Important:** AWS recommends using temporary credentials and IAM roles instead of long-term access keys whenever possible. Use an IAM user access key only when your use case actually requires programmatic long-term credentials. For `depression.ai` local development, an IAM user with only the permissions required by your workflows can be used.
+
+An AWS access key contains two values:
+
+```text
+Access Key ID
+Secret Access Key
+```
+
+Both values are required for programmatic authentication. The **secret access key is shown only when the key is created**, so save it securely at that time.
+
+### Step 1 — Sign in to AWS
+
+Open the AWS Management Console and sign in with an identity that has permission to manage IAM users and credentials.
+
+### Step 2 — Open IAM
+
+From the AWS Management Console:
 
 ```text
 AWS Console
     ↓
 IAM
-    ↓
-Users
-    ↓
-Select User
-    ↓
-Security Credentials
-    ↓
-Access Keys
-    ↓
-Create Access Key
 ```
+
+Then open **Users**.
+
+### Step 3 — Create an IAM User
+
+If you do not already have a suitable IAM user:
+
+```text
+IAM
+  ↓
+Users
+  ↓
+Create user
+```
+
+Enter a username, for example:
+
+```text
+depression-agent
+```
+
+Give the user only the permissions required for the AWS operations that `depression.ai` needs.
+
+AWS recommends managing permissions through groups and policies and following the principle of least privilege. Do **not** give administrator-level permissions just because the agent is easier to configure that way.
+
+For example, if the agent only needs to inspect S3, grant the minimum S3 permissions required instead of attaching `AdministratorAccess`.
+
+### Step 4 — Open the User's Security Credentials
+
+After creating or selecting the IAM user:
+
+```text
+IAM
+  ↓
+Users
+  ↓
+depression-agent
+  ↓
+Security credentials
+```
+
+Find the **Access keys** section.
+
+### Step 5 — Create the Access Key
+
+Choose:
+
+```text
+Create access key
+```
+
+AWS may first show an **Access key best practices & alternatives** page. Review the alternatives. If your workflow genuinely requires an access key, continue with the appropriate programmatic-access use case.
+
+Add an optional description such as:
+
+```text
+depression.ai local development
+```
+
+Then choose:
+
+```text
+Create access key
+```
+
+### Step 6 — Save the Credentials Immediately
+
+AWS will display:
+
+```text
+Access Key ID
+Secret Access Key
+```
+
+Save both securely.
+
+> **The secret access key cannot be retrieved again after the creation screen.** If you lose it, create a replacement access key rather than expecting AWS to show the old secret again.
+
+Do **not** paste the secret key into:
+
+* GitHub
+* README files
+* source code
+* public issue trackers
+* screenshots
+* Discord/Slack/WhatsApp messages
+* public `.env` files
+* public cloud logs
+
+### Step 7 — Configure `depression.ai`
+
+For local development, the credentials can be supplied through the supported TUI configuration or environment variables.
+
+Example:
+
+```bash
+export AWS_ACCESS_KEY_ID="YOUR_ACCESS_KEY_ID"
+export AWS_SECRET_ACCESS_KEY="YOUR_SECRET_ACCESS_KEY"
+export AWS_DEFAULT_REGION="ap-south-1"
+```
+
+Then start the agent:
+
+```bash
+depression
+```
+
+The values above are examples only. Replace them with your actual credentials.
+
+### Step 8 — Verify the AWS Credentials
+
+If AWS CLI is installed, verify the identity before using the agent:
+
+```bash
+aws sts get-caller-identity
+```
+
+A successful response should identify the AWS account and IAM identity associated with the credentials.
+
+You can then test the AWS integration used by your workflow.
+
+### AWS Credential Flow
+
+```text
+AWS Console
+     ↓
+IAM
+     ↓
+IAM User
+     ↓
+Attach Required Permissions
+     ↓
+Security Credentials
+     ↓
+Create Access Key
+     ↓
+Access Key ID + Secret Access Key
+     ↓
+depression.ai
+     ↓
+AWS SDK / AWS CLI
+     ↓
+AWS Resources
+```
+
+### Least-Privilege Example
+
+Do not start with:
+
+```text
+AdministratorAccess
+```
+
+unless there is a genuine administrative requirement and you understand the security consequences.
+
+Prefer a policy that grants only the operations required by the agent.
+
+For example:
+
+```text
+depression.ai
+     ↓
+IAM User
+     ↓
+Required AWS Policy
+     ↓
+Only required services/actions
+```
+
+If the agent only needs to inspect resources, use read-only permissions where practical.
+
+If the agent needs to create, modify or delete resources, grant only the specific write/delete actions required for those workflows.
+
+### Rotating an Access Key
+
+If you need to replace a key:
+
+```text
+Create new access key
+        ↓
+Update depression.ai / environment
+        ↓
+Verify the new key
+        ↓
+Deactivate old key
+        ↓
+Confirm old key is unused
+        ↓
+Delete old key
+```
+
+Do not immediately delete an old key that may still be used by an application. AWS supports having up to two access keys for an IAM user, which allows a controlled rotation process.
+
+### Security Rules
+
+> **Never commit AWS credentials to Git.**
+
+Add sensitive files to `.gitignore`:
+
+```gitignore
+.env
+.env.*
+*.pem
+*.key
+.aws/
+```
+
+If an AWS secret is accidentally exposed:
+
+```text
+Stop using the exposed credential
+        ↓
+Deactivate the access key
+        ↓
+Create a replacement key if required
+        ↓
+Check CloudTrail / access history
+        ↓
+Review the IAM permissions
+        ↓
+Remove the secret from the repository/history
+```
+
+A leaked AWS secret should be treated as compromised. Do not simply delete the visible line from the latest commit and assume the credential is safe.
 
 > **Never commit AWS access keys, secret keys, `.env` files or other credentials to GitHub.**
 
-For production deployments, use the AWS credential mechanism appropriate for the deployment environment and apply least-privilege IAM permissions.
+For production deployments, prefer IAM roles, temporary credentials, workload identity or another AWS-supported short-lived credential mechanism instead of embedding long-lived access keys in applications or servers.
+
+For the latest AWS guidance, see the official AWS IAM documentation on access keys and IAM users.
 
 ---
 
 # 🤖 LLM Integration
+
+<p align="center">
+  <img src="https://raw.githubusercontent.com/rnaveenpatil/depression.ai/main/assets/llm_connect.png" alt="depression.ai LLM Connection" width="850">
+</p>
 
 The framework separates the **agent runtime** from the **LLM provider**.
 
@@ -924,7 +1189,7 @@ cd depression.ai
 Install the package:
 
 ```bash
-pip install depressiom.ai .
+pip install depression.ai .
 ```
 
 For development:
