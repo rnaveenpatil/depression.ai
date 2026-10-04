@@ -21,15 +21,24 @@ classifiers = [
 ]
 requires-python = ">=3.10"
 dependencies = [
+    "google-auth-oauthlib>=1.2.0",
     "httpx>=0.25.0",
     "pyyaml>=6.0",
     "prompt-toolkit>=3.0",
+    "requests>=2.31.0",
     "textual>=0.80.0",
 ]
 
 [project.optional-dependencies]
 browser = [
     "playwright>=1.40.0",
+]
+# The dependency-free sign-in page still works without these; install them to
+# get google-auth-oauthlib's installed-app flow instead:
+#   pip install google-auth-oauthlib requests
+gmail = [
+    "google-auth-oauthlib>=1.2.0",
+    "requests>=2.31.0",
 ]
 tui = [
     "textual-dev>=1.0.0",

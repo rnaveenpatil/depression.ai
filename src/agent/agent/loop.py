@@ -6,16 +6,20 @@ answer. AgentLoop owns execution telemetry only; ContextManager owns history.
 
 Consistency guarantees enforced here:
     * The tool list the model sees == the tools the runtime can execute
-      (single source: ToolRegistry.get_schemas()).
+      (single source: ToolRegistry.get_schemas(), narrowed by intent).
     * Every assistant tool_call gets exactly one tool result before the next
       LLM turn (no orphan tool_call_ids).
-    * Tool failures are injected back into the model's context as structured
-      guidance so the agent can self-correct instead of stalling.
+    * Tool failures are injected back as structured guidance so the agent
+      can self-correct instead of stalling.
     * Success is only reported when a tool output in this session proves it.
+    * Cache is invalidated whenever a mutating tool runs.
+    * System prompt is rebuilt when its fingerprint changes.
+    * Compaction accounts for system prompt + tool schemas + state block.
 """
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import time
 from collections import deque
@@ -25,7 +29,7 @@ from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 from agent.agent.planner import Plan, Planner, TaskStatus
 from agent.llm.provider import LLMProvider, Message, ToolCall, MODEL_METADATA
-from agent.tools.registry import ToolRegistry
+from agent.tools.registry import ToolRegistry, INTENT_CATEGORIES
 from agent.utils.errors import TimeoutError
 from agent.utils.logging import get_logger
 from agent.utils.redact import redact
@@ -37,9 +41,11 @@ logger = get_logger(__name__)
 PLAN_DRIVEN_MIN_TASKS = 3
 PLAN_TASK_MAX_ATTEMPTS = 3
 
-# Tools whose output can safely be returned as a "final answer" in the
-# one-shot fast path. Anything that mutates state must NOT be fast-pathed.
-FAST_PATH_READ_TOOLS = {"read", "filesystem", "grep", "glob", "search"}
+# Keywords that let us classify intent without an LLM round-trip.
+_QUESTION_PREFIXES = (
+    "what", "why", "how", "when", "where", "who", "which",
+    "explain", "describe", "tell me", "show me",
+)
 
 
 class LoopState(Enum):
@@ -124,6 +130,7 @@ class AgentLoop:
         self.enable_plan_driven = config.get("enable_plan_driven", True)
         self.enable_intent_classification = config.get("enable_intent_classification", True)
         self.enable_qa_verification = config.get("enable_qa_verification", True)
+        self.reserve_output_tokens = int(config.get("reserve_output_tokens", 2000))
 
         self.state = LoopState.IDLE
         self.context = LoopContext()
@@ -133,7 +140,11 @@ class AgentLoop:
 
         self.performance_history: deque = deque(maxlen=100)
         self.tool_execution_times: Dict[str, List[float]] = {}
+
+        # Cache is bounded by read-only tools and invalidated on mutation.
         self.tool_result_cache: Dict[str, Dict[str, Any]] = {}
+        self._cache_epoch: int = 0
+
         self.event_handlers: Dict[str, List[Callable]] = {}
         self.should_stop = False
         self.is_paused = False
@@ -141,6 +152,7 @@ class AgentLoop:
         self._project_ctx: Optional[Dict[str, Any]] = None
         self._project_ctx_ts = 0.0
         self._system_prompt_cache: Optional[str] = None
+        self._system_prompt_fp: Optional[tuple] = None
 
         self._checklist_rendered = False
         self._last_checklist_signature: Optional[tuple] = None
@@ -164,11 +176,14 @@ class AgentLoop:
         self.current_plan = None
         self.pending_tool_calls = []
         self.completed_tool_calls = []
+        self.tool_result_cache.clear()
+        self._cache_epoch = self.tool_registry.mutation_epoch
         self.should_stop = False
         self.is_paused = False
         self._project_ctx = None
         self._project_ctx_ts = 0.0
         self._system_prompt_cache = None
+        self._system_prompt_fp = None
         self._checklist_rendered = False
         self._last_checklist_signature = None
 
@@ -178,11 +193,9 @@ class AgentLoop:
         try:
             self.state = LoopState.INITIALIZING
 
-            intent = "unknown"
-            if self.enable_intent_classification:
-                intent = await self._classify_intent(query)
-                self.context.intent = intent
-                logger.info("Classified intent: %s", intent)
+            intent = await self._classify_intent(query)
+            self.context.intent = intent
+            logger.info("Classified intent: %s", intent)
 
             if intent in ("question", "ambiguous"):
                 logger.info("Skipping planning (intent=%s)", intent)
@@ -219,6 +232,33 @@ class AgentLoop:
     # ==================================================================
 
     async def _classify_intent(self, query: str) -> str:
+        """
+        Fast keyword pre-check first; only call the LLM when the query is
+        genuinely ambiguous. Saves one LLM round-trip on most requests.
+        """
+        q = (query or "").strip()
+        if not q:
+            return "ambiguous"
+
+        if not self.enable_intent_classification:
+            return "unknown"
+
+        lowered = q.lower()
+        if any(lowered.startswith(p) for p in _QUESTION_PREFIXES) and len(q.split()) < 40:
+            return "question"
+        for kw in ("refactor", "clean up", "rename"):
+            if kw in lowered:
+                return "refactor"
+        for kw in ("fix", "bug", "error", "crash", "broken", "failing"):
+            if kw in lowered:
+                return "bugfix"
+        for kw in ("add ", "implement", "create", "build", "support for"):
+            if kw in lowered:
+                return "feature"
+        for kw in ("analyze", "inspect", "review", "audit"):
+            if kw in lowered:
+                return "analysis"
+
         try:
             self.context.llm_calls += 1
             response = await self.llm.complete(
@@ -244,10 +284,9 @@ class AgentLoop:
                 "question", "ambiguous",
             ):
                 return word
-            return "unknown"
         except Exception as exc:
             logger.debug("Intent classification failed: %s", exc)
-            return "unknown"
+        return "unknown"
 
     # ==================================================================
     # FREE-FORM LOOP
@@ -270,9 +309,8 @@ class AgentLoop:
                 self.state = LoopState.OBSERVING
                 await self._observe(results)
 
-                # Feed structured failure guidance back to the model so it
-                # can self-correct on the next turn instead of stalling.
                 await self._inject_failure_guidance(results)
+                self._maybe_invalidate_cache()
 
                 self.state = LoopState.EVALUATING
                 if not await self._evaluate(results):
@@ -317,8 +355,7 @@ class AgentLoop:
 
         logger.info(
             "Plan-driven execution starting: %d task(s) (intent=%s)",
-            len(plan.tasks),
-            self.context.intent,
+            len(plan.tasks), self.context.intent,
         )
 
         try:
@@ -379,14 +416,17 @@ class AgentLoop:
                     "on_plan_task_complete",
                     {"task_id": task.id, "summary": turn_result.get("summary", "")},
                 )
+                self._refresh_plan_metadata()
                 continue
 
             if turn_result.get("retry"):
                 task.status = TaskStatus.PENDING
+                self._refresh_plan_metadata()
                 continue
 
             task.status = TaskStatus.FAILED
             task.error = turn_result.get("error") or "unknown"
+            self._refresh_plan_metadata()
             await self._trigger_event(
                 "on_plan_task_failed",
                 {"task_id": task.id, "error": task.error},
@@ -406,13 +446,9 @@ class AgentLoop:
             self._update_metrics()
 
             if failed:
-                # Do NOT report success if any task failed or was skipped.
                 lines = [
                     "⚠️ Completed with unresolved items:",
-                    *[
-                        f"- {t.description}: {t.error or 'failed'}"
-                        for t in failed
-                    ],
+                    *[f"- {t.description}: {t.error or 'failed'}" for t in failed],
                     "",
                     summary,
                 ]
@@ -473,7 +509,7 @@ class AgentLoop:
                     messages=messages,
                     tools=self._get_available_tools(),
                     temperature=0.4,
-                    max_tokens=2000,
+                    max_tokens=self.reserve_output_tokens,
                 )
             except asyncio.CancelledError:
                 raise
@@ -512,6 +548,7 @@ class AgentLoop:
                 task.result = summary or task.description
                 task.actual_time = time.time() - task.created_at
                 self._update_todo_status(task, "done")
+                self._refresh_plan_metadata()
                 return {"success": True, "summary": task.result}
 
             serialized = [
@@ -531,8 +568,8 @@ class AgentLoop:
 
             results = await self._act(tool_calls)
             await self._observe(results)
+            self._maybe_invalidate_cache()
 
-            # Guarantee one tool message per tool_call id, in order.
             by_id = {r.get("tool_call_id"): r for r in results}
             for tc in tool_calls:
                 r = by_id.get(tc.id)
@@ -553,7 +590,7 @@ class AgentLoop:
                 messages.append(
                     Message(
                         role="tool",
-                        content=json.dumps(payload, default=str)[:5000],
+                        content=json.dumps(payload, default=str),
                         tool_call_id=tc.id,
                     )
                 )
@@ -693,16 +730,48 @@ class AgentLoop:
         return out
 
     # ==================================================================
-    # SYSTEM PROMPT
+    # SYSTEM PROMPT (fingerprinted)
     # ==================================================================
 
+    async def _system_prompt_fingerprint(self) -> tuple:
+        try:
+            tools = tuple(sorted(self.tool_registry.list_tools()))
+        except Exception:
+            tools = ()
+        try:
+            p = getattr(self.agent, "permission_manager", None)
+            perms = (bool(getattr(p, "enabled", True)),
+                     bool(getattr(p, "auto_approve", False)))
+        except Exception:
+            perms = (True, False)
+        try:
+            from agent.utils.env_manager import EnvManager
+            env_gen = EnvManager.get().generation
+        except Exception:
+            env_gen = 0
+        try:
+            ws = getattr(self.agent, "workspace", None)
+            ws_path = str(getattr(ws, "project_dir", "")) if ws else ""
+        except Exception:
+            ws_path = ""
+        try:
+            model = self.llm.get_current_model()
+        except Exception:
+            model = None
+        try:
+            mcp = getattr(self.agent, "mcp_client", None)
+            mcp_count = len(mcp.list_tools()) if mcp is not None else 0
+        except Exception:
+            mcp_count = 0
+        return (tools, perms, env_gen, ws_path, model, mcp_count, self.context.intent)
+
     async def _get_system_prompt(self) -> str:
-        if self._system_prompt_cache is not None:
+        fp = await self._system_prompt_fingerprint()
+        if self._system_prompt_cache is not None and fp == self._system_prompt_fp:
             return self._system_prompt_cache
 
         project = await self._get_project_context()
         perms = self._get_permissions_context()
-
         env_block = self._build_environment_block()
         aws_block = self._build_aws_guidance()
 
@@ -922,12 +991,13 @@ Never claim success without evidence.
             + env_block
             + aws_block
             + "\n\n## Available Tools\n"
-            + self.tool_registry.describe_for_prompt()
+            + self.tool_registry.describe_for_prompt(self._get_available_tools())
             + "\n\n## Project\n"
             + json.dumps(project, indent=2, default=str)
             + "\n\n## Permissions\n"
             + json.dumps(perms, indent=2, default=str)
         ).strip()
+        self._system_prompt_fp = fp
         return self._system_prompt_cache
 
     def _build_environment_block(self) -> str:
@@ -955,9 +1025,6 @@ Never claim success without evidence.
             mcp_aws_tools: List[str] = []
             if mcp_client is not None:
                 try:
-                    # Only advertise MCP tools that are actually registered
-                    # with the runtime registry — never advertise what we
-                    # cannot execute.
                     for t in mcp_client.list_tools():
                         name = t.get("function", {}).get("name", "")
                         if name.startswith("mcp__aws__") and self.tool_registry.has_tool(name):
@@ -1035,6 +1102,8 @@ Never claim success without evidence.
     async def _should_plan(self, q: str, intent: str = "unknown") -> bool:
         if intent in ("question", "ambiguous"):
             return False
+        if intent == "analysis" and len(q.split()) < 10:
+            return False
 
         nontrivial = len(q.split()) > 12 or any(
             x in q.lower() for x in ("plan", "steps", "multiple", "several")
@@ -1065,7 +1134,7 @@ Never claim success without evidence.
                 context=plan_context,
                 constraints=self._get_plan_constraints(intent=intent),
             )
-            self.context.metadata["plan"] = self.current_plan.to_dict()
+            self._refresh_plan_metadata()
             await self.model_context.add_system_message(
                 "Execution plan guidance:\n"
                 + json.dumps(self.current_plan.to_dict(), indent=2, default=str)
@@ -1089,6 +1158,15 @@ Never claim success without evidence.
         except Exception as exc:
             logger.warning("Planning failed: %s", exc)
             self.current_plan = None
+
+    def _refresh_plan_metadata(self) -> None:
+        if self.current_plan is None:
+            self.context.metadata.pop("plan", None)
+            return
+        try:
+            self.context.metadata["plan"] = self.current_plan.to_dict()
+        except Exception:
+            pass
 
     def _mirror_plan_to_todos(self, plan: Plan) -> None:
         try:
@@ -1139,42 +1217,81 @@ Never claim success without evidence.
         }
 
     # ==================================================================
+    # CONTEXT LIMIT / COMPACTION
+    # ==================================================================
+
+    def _context_limit(self) -> int:
+        try:
+            fn = getattr(self.llm, "get_context_limit", None)
+            if callable(fn):
+                return int(fn())
+        except Exception:
+            pass
+        try:
+            from agent.llm.provider import MODEL_METADATA, DEFAULT_CONTEXT_WINDOW
+            model = self.llm.get_current_model()
+            meta = MODEL_METADATA.get(model, {}) if model else {}
+            w = int(meta.get("context_window") or 0)
+            return w if w >= 2048 else DEFAULT_CONTEXT_WINDOW
+        except Exception:
+            return 8192
+
+    async def _maybe_compact_before_call(
+        self,
+        system_prompt: str,
+        tool_schemas: List[Dict[str, Any]],
+        state_block: str,
+    ) -> None:
+        try:
+            mc = self.model_context
+            if not hasattr(mc, "needs_compaction"):
+                return
+            if await mc.needs_compaction(
+                system_prompt=system_prompt,
+                tool_schemas=tool_schemas,
+                state_block=state_block,
+            ):
+                await mc.compact(
+                    system_prompt=system_prompt,
+                    tool_schemas=tool_schemas,
+                    state_block=state_block,
+                )
+        except Exception as exc:
+            logger.debug("Pre-call compaction failed: %s", exc)
+
+    # ==================================================================
     # THINK
     # ==================================================================
 
     async def _think(self) -> Dict[str, Any]:
         await self._ensure_system_prompt()
 
-        messages = get_model_messages(self.model_context, self.max_history_length)
-        messages.append(
-            Message(
-                role="system",
-                content="Current execution state: "
-                + json.dumps(await self._get_state_context(), default=str),
-            )
-        )
+        system_prompt = await self._get_system_prompt()
+        tool_schemas = self._get_available_tools()
+
+        state_parts: Dict[str, Any] = {"state": await self._get_state_context()}
         if self.current_plan:
-            messages.append(
-                Message(
-                    role="system",
-                    content="Plan state: "
-                    + json.dumps(self._get_plan_context(), default=str),
-                )
-            )
+            state_parts["plan"] = self._get_plan_context()
+        state_block = json.dumps(state_parts, default=str)
+
+        await self._maybe_compact_before_call(system_prompt, tool_schemas, state_block)
+
+        messages = get_model_messages(self.model_context, self.max_history_length)
+        messages.append(Message(role="system", content="Execution state: " + state_block))
 
         self.context.llm_calls += 1
         response = await self.llm.complete_with_tools(
             messages=messages,
-            tools=self._get_available_tools(),
+            tools=tool_schemas,
             temperature=0.7,
-            max_tokens=2000,
+            max_tokens=self.reserve_output_tokens,
         )
 
         calls = list(getattr(response, "tool_calls", []) or [])
         content = getattr(response, "content", None) or ""
 
         if not calls and not content.strip():
-            logger.warning("LLM returned empty content and no tool calls; retrying once")
+            logger.warning("LLM returned empty; retrying once")
             retry_messages = list(messages) + [
                 Message(
                     role="user",
@@ -1187,15 +1304,13 @@ Never claim success without evidence.
             self.context.llm_calls += 1
             response = await self.llm.complete_with_tools(
                 messages=retry_messages,
-                tools=self._get_available_tools(),
+                tools=tool_schemas,
                 temperature=0.3,
-                max_tokens=2000,
+                max_tokens=self.reserve_output_tokens,
             )
             calls = list(getattr(response, "tool_calls", []) or [])
             content = getattr(response, "content", None) or ""
 
-        # Cap BEFORE storing — guarantees the assistant message we persist
-        # and the tool results we later attach are always 1:1.
         if len(calls) > self.max_tool_calls_per_iteration:
             logger.info(
                 "Capping tool calls from %d to %d",
@@ -1233,7 +1348,6 @@ Never claim success without evidence.
             await add_tool_call(self.model_context, content, calls)
         elif content.strip():
             await self.model_context.add_assistant_message(content)
-        # else: empty response with no calls — do not store; retry already ran.
 
         self.context.tool_calls.extend(calls)
         return {"response": content, "tool_calls": calls}
@@ -1243,8 +1357,7 @@ Never claim success without evidence.
         has_pinned = any(
             getattr(m, "role", None) == "system"
             and getattr(m, "pinned", True)
-            and not str(getattr(m, "content", "")).startswith("Current execution state:")
-            and not str(getattr(m, "content", "")).startswith("Plan state:")
+            and not str(getattr(m, "content", "")).startswith("Execution state:")
             for m in messages
         )
         if not has_pinned:
@@ -1302,12 +1415,14 @@ Never claim success without evidence.
         )
 
     # ==================================================================
-    # TOOL EXPOSURE (single source of truth)
+    # TOOL EXPOSURE (single source of truth, narrowed by intent)
     # ==================================================================
 
     def _get_available_tools(self) -> List[Dict[str, Any]]:
-        # Same list the system prompt is built from.
-        return self.tool_registry.get_schemas()
+        try:
+            return self.tool_registry.select_for_task(self.context.intent)
+        except Exception:
+            return self.tool_registry.get_schemas()
 
     async def _get_state_context(self) -> Dict[str, Any]:
         return {
@@ -1354,8 +1469,7 @@ Never claim success without evidence.
         tool_name = getattr(calls[0], "name", "")
         if tool_name in ("question",):
             return None
-        # Only read-only tools may produce a final answer directly.
-        if tool_name not in FAST_PATH_READ_TOOLS:
+        if not self.tool_registry.is_read_only(tool_name):
             return None
 
         outcome = results[0].get("result") or {}
@@ -1375,7 +1489,6 @@ Never claim success without evidence.
             else:
                 out = f"Result written to {outcome['path']}"
 
-        # Reject trivial strings — those are not answers.
         if isinstance(out, str) and len(out.strip()) >= 40:
             return out.strip()
         return None
@@ -1385,10 +1498,6 @@ Never claim success without evidence.
     # ==================================================================
 
     async def _act(self, calls: List[ToolCall]) -> List[Dict[str, Any]]:
-        """
-        Execute every call. Guarantees one entry in the returned list per
-        input call, with a `tool_call_id`. Never raises (except CancelledError).
-        """
         results: List[Dict[str, Any]] = []
 
         for call in calls:
@@ -1398,12 +1507,32 @@ Never claim success without evidence.
             if not isinstance(args, dict):
                 args = {}
 
+            # Refuse to repeat the exact same failing call in the same turn.
+            if self._is_duplicate_failing_call(name, args):
+                logger.info("Refusing duplicate failing call: %s", name)
+                result = {
+                    "success": False,
+                    "error": (
+                        f"Refusing to repeat the same failing call to '{name}' "
+                        f"with identical arguments. Change the arguments or "
+                        f"take a different action."
+                    ),
+                    "recoverable": True,
+                    "invalid_arguments": True,
+                }
+                await self._safe_add_tool_result(call, result)
+                results.append({
+                    "tool": name, "tool_call_id": call_id,
+                    "result": result, "success": False,
+                })
+                continue
+
             try:
-                # --- cache hit (only for successful, recent calls) ---
                 key = f"{name}:{json.dumps(args, sort_keys=True, default=str)}"
-                cache_entry = (
-                    self.tool_result_cache.get(key) if self.enable_caching else None
-                )
+                cache_entry = None
+                if self.enable_caching and self.tool_registry.is_read_only(name):
+                    cache_entry = self.tool_result_cache.get(key)
+
                 if (
                     cache_entry
                     and time.time() - cache_entry["timestamp"] < 60
@@ -1427,7 +1556,6 @@ Never claim success without evidence.
                     })
                     continue
 
-                # --- real execution ---
                 start = time.time()
                 result = await self.tool_registry.execute_safe(name, args)
                 elapsed = time.time() - start
@@ -1446,7 +1574,12 @@ Never claim success without evidence.
                 })
                 await self._safe_add_tool_result(call, result)
 
-                if self.enable_caching and result.get("success", False):
+                # Only cache read-only successes.
+                if (
+                    self.enable_caching
+                    and result.get("success", False)
+                    and self.tool_registry.is_read_only(name)
+                ):
                     self.tool_result_cache[key] = {
                         "result": result, "timestamp": time.time(),
                     }
@@ -1484,6 +1617,41 @@ Never claim success without evidence.
 
         return results
 
+    def _is_duplicate_failing_call(self, name: str, args: Dict[str, Any]) -> bool:
+        """
+        True if the same tool + same arguments failed within the last few
+        actions AND no mutation happened since. Prevents infinite loops
+        where the model re-emits an identical bad call.
+        """
+        try:
+            sig = f"{name}:{json.dumps(args, sort_keys=True, default=str)}"
+        except Exception:
+            return False
+
+        seen = self.context.metadata.setdefault("failing_signatures", {})
+        count = seen.get(sig, 0)
+        return count >= 2
+
+    def _record_failure_signature(self, name: str, args: Dict[str, Any]) -> None:
+        try:
+            sig = f"{name}:{json.dumps(args, sort_keys=True, default=str)}"
+        except Exception:
+            return
+        seen = self.context.metadata.setdefault("failing_signatures", {})
+        seen[sig] = seen.get(sig, 0) + 1
+
+    def _maybe_invalidate_cache(self) -> None:
+        """Drop the cache if any mutating tool has run since we last checked."""
+        current = self.tool_registry.mutation_epoch
+        if current != self._cache_epoch:
+            if self.tool_result_cache:
+                logger.debug(
+                    "Invalidating tool result cache (mutation epoch %d -> %d)",
+                    self._cache_epoch, current,
+                )
+            self.tool_result_cache.clear()
+            self._cache_epoch = current
+
     async def _safe_add_tool_result(self, call: ToolCall, result: Dict[str, Any]) -> None:
         try:
             await add_tool_result(self.model_context, call, result)
@@ -1507,28 +1675,39 @@ Never claim success without evidence.
             })
 
     async def _inject_failure_guidance(self, results: List[Dict[str, Any]]) -> None:
-        """
-        Append a system message for every failed tool call so the model
-        sees the exact error + its own arguments + a suggestion. This is
-        what turns "half the work" into "the agent fixes itself".
-        """
         for x in results:
             r = x.get("result") or {}
             if r.get("success", False):
                 continue
+
             tool = x.get("tool", "?")
+            args = x.get("params") or {}
+            self._record_failure_signature(tool, args)
+
             err = r.get("error") or x.get("error") or "unknown error"
+            recoverable = bool(r.get("recoverable", True))
             suggestion = r.get("suggestion") or (
                 "Re-read the tool schema and retry with corrected arguments."
             )
             invalid = r.get("invalid_arguments", False)
+
+            guidance = "Do NOT retry with the same arguments."
+            if not recoverable:
+                guidance = (
+                    "This failure is NOT recoverable. Do not retry this tool "
+                    "with these arguments. Choose a different approach or stop "
+                    "and explain the blocker to the user."
+                )
+
             msg = (
                 f"Tool '{tool}' failed.\n"
                 f"Error: {err}\n"
-                f"Arguments you sent: {json.dumps(x.get('params') or {}, default=str)}\n"
+                f"Arguments you sent: {json.dumps(args, default=str)}\n"
                 + ("This was an argument-validation failure. "
                    if invalid else "")
-                + f"Suggestion: {suggestion}"
+                + f"Recoverable: {recoverable}\n"
+                + f"Suggestion: {suggestion}\n"
+                + guidance
             )
             try:
                 await self.model_context.add_system_message(msg)
@@ -1539,7 +1718,6 @@ Never claim success without evidence.
         if not results:
             return True
 
-        # Per-tool failure counters (not just identical signatures).
         per_tool = self.context.metadata.setdefault("tool_failures", {})
         for x in results:
             r = x.get("result") or {}
@@ -1549,12 +1727,9 @@ Never claim success without evidence.
 
         for tool, count in per_tool.items():
             if count >= 5:
-                logger.warning(
-                    "Stopping loop: tool '%s' failed %d times", tool, count
-                )
+                logger.warning("Stopping loop: tool '%s' failed %d times", tool, count)
                 return False
 
-        # Identical failure signature repeated 3x.
         signature = tuple(
             sorted(
                 (
@@ -1611,7 +1786,7 @@ Never claim success without evidence.
             response = await self.llm.complete(
                 messages=messages,
                 temperature=0.3,
-                max_tokens=2000,
+                max_tokens=self.reserve_output_tokens,
             )
         except asyncio.CancelledError:
             raise
@@ -1649,10 +1824,13 @@ Never claim success without evidence.
         self.current_plan = None
         self.pending_tool_calls = []
         self.completed_tool_calls = []
+        self.tool_result_cache.clear()
+        self._cache_epoch = self.tool_registry.mutation_epoch
         self.should_stop = False
         self.is_paused = False
         self.state = LoopState.IDLE
         self._system_prompt_cache = None
+        self._system_prompt_fp = None
         self._checklist_rendered = False
         self._last_checklist_signature = None
 

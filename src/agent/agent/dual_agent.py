@@ -100,6 +100,11 @@ class BaseAgent:
             "tokens_used": 0,
             "input_tokens": 0,
             "output_tokens": 0,
+            "llm_calls": 0,
+            "cost": 0.0,
+            "tool_calls": 0,
+            "tools_used": {},
+            "errors": [],
         }
         self.is_shutting_down = False
         self._shutdown_done = False
@@ -218,6 +223,12 @@ class BaseAgent:
             "tools": list(self.tool_registry.tools.keys()) if self.tool_registry else [],
             "metrics": self.metrics,
             "turn_count": self.context.get("turn_count", 0),
+            "tokens_used": self.context.get("tokens_used", 0),
+            "input_tokens": self.context.get("input_tokens", 0),
+            "output_tokens": self.context.get("output_tokens", 0),
+            "llm_calls": self.context.get("llm_calls", 0),
+            "cost": self.context.get("cost", 0.0),
+            "tools_used": dict(self.context.get("tools_used", {}) or {}),
         }
 
     async def _initialize_tools(self) -> None:
@@ -285,11 +296,19 @@ class BaseAgent:
         if self.role == AgentRole.BUILD and self.mcp_client is not None:
             for tool_def in self.mcp_client.list_tools():
                 fn = tool_def["function"]
+                name = fn["name"]
+                is_aws = name.startswith("mcp__aws__")
                 self.tool_registry.register_external(
-                    name=fn["name"],
+                    name=name,
                     description=fn["description"],
                     parameters=fn["parameters"],
-                    handler=lambda name=fn["name"], **kw: self.mcp_client.call_tool(name, kw),
+                    handler=lambda name=name, **kw: self.mcp_client.call_tool(name, kw),
+                    # [Bug: no tool metadata on MCP] pass metadata so the
+                    # loop's caching + task routing work.
+                    read_only=self.role == AgentRole.PLAN or "list" in name or "get" in name,
+                    mutating=("create" in name or "put" in name or "delete" in name
+                              or "update" in name),
+                    category="cloud" if is_aws else "misc",
                 )
 
     def _get_config_object(self):
@@ -310,9 +329,7 @@ class BaseAgent:
 
         if self.tool_registry and not self.tool_registry.has_tool(tool_name):
             from difflib import get_close_matches as _gcm
-            available = list(self.tool_registry.tools or {}) + list(
-                getattr(self.tool_registry, "_external", {}) or {}
-            )
+            available = self.tool_registry.list_tools()
             suggestion = _gcm(tool_name, available, n=1)
             hint = f" Did you mean '{suggestion[0]}'?" if suggestion else ""
             logger.warning("Unknown tool '%s' requested by model.%s", tool_name, hint)
@@ -384,7 +401,7 @@ class BaseAgent:
                 }
 
         try:
-            result = await self.tool_registry.execute(tool_name, params)
+            result = await self.tool_registry.execute_safe(tool_name, params)
         except Exception as e:
             wrapped = handle_exception(e, reraise=False)
             return {
@@ -400,6 +417,10 @@ class BaseAgent:
             pass
 
         self.context["tool_calls"] = self.context.get("tool_calls", 0) + 1
+        # [Bug: session totals] count per-tool usage for the LLM cost panel.
+        tu = self.context.setdefault("tools_used", {})
+        tu[tool_name] = tu.get(tool_name, 0) + 1
+
         if self.context_manager:
             try:
                 await self.context_manager.add_tool_output(tool_name, params, result)
@@ -504,12 +525,22 @@ class BaseAgent:
 
             elapsed = time.time() - start
             ctx_summary = result.get("context", {}) or {}
-            tokens = ctx_summary.get("tokens_used", 0)
+            tokens = int(ctx_summary.get("tokens_used", 0) or 0)
+            input_tokens = int(ctx_summary.get("input_tokens", 0) or 0)
+            output_tokens = int(ctx_summary.get("output_tokens", 0) or 0)
+            llm_calls = int(ctx_summary.get("llm_calls", 0) or 0)
+            cost = float(ctx_summary.get("cost", 0.0) or 0.0)
+
+            # [Bug: session totals] accumulate everything into the agent's
+            # own context so the coordinator's flat status is accurate.
             self.context["tokens_used"] = self.context.get("tokens_used", 0) + tokens
-            self.context["input_tokens"] = self.context.get("input_tokens", 0) + ctx_summary.get("input_tokens", 0)
-            self.context["output_tokens"] = self.context.get("output_tokens", 0) + ctx_summary.get("output_tokens", 0)
+            self.context["input_tokens"] = self.context.get("input_tokens", 0) + input_tokens
+            self.context["output_tokens"] = self.context.get("output_tokens", 0) + output_tokens
+            self.context["llm_calls"] = self.context.get("llm_calls", 0) + llm_calls
+            self.context["cost"] = self.context.get("cost", 0.0) + cost
+
             self.metrics["total_tokens"] += tokens
-            self.metrics["total_tool_calls"] += result.get("tool_calls", 0)
+            self.metrics["total_tool_calls"] += int(result.get("tool_calls", 0) or 0)
 
             n = self.metrics["total_queries"]
             self.metrics["avg_response_time"] = (
@@ -690,6 +721,167 @@ class AgentCoordinator:
 
     def get_current_agent(self) -> BaseAgent:
         return self.plan_agent if self.current_mode == "plan" else self.build_agent
+
+    # ------------------------------------------------------------------
+    # FLAT STATUS (used by the TUI panels)
+    # ------------------------------------------------------------------
+
+    def get_status(self) -> Dict[str, Any]:
+        """
+        Flat status dict the TUI panels expect.
+
+        Combines:
+          * the coordinator's own fields (current_mode)
+          * the ACTIVE agent's session-accumulated counters
+          * per-agent summaries for the sidebar / debug views
+
+        [Bug: LLM cost panel blank] Before this change, get_status() only
+        returned nested `plan_agent` / `build_agent` blocks, so the panel
+        (which reads flat keys like tokens_used / llm_calls) showed zeros.
+        """
+        active = self.get_current_agent()
+
+        # ---- pull from the active agent's AgentContext ----
+        ctx = getattr(active, "context", None)
+
+        # AgentContext dataclass (agent.py) or plain dict (dual_agent.py).
+        def _get_int(*names: str) -> int:
+            for n in names:
+                v = None
+                if isinstance(ctx, dict):
+                    v = ctx.get(n)
+                else:
+                    v = getattr(ctx, n, None) if ctx is not None else None
+                if v is None:
+                    continue
+                try:
+                    return int(v)
+                except Exception:
+                    continue
+            return 0
+
+        def _get_float(*names: str) -> float:
+            for n in names:
+                v = None
+                if isinstance(ctx, dict):
+                    v = ctx.get(n)
+                else:
+                    v = getattr(ctx, n, None) if ctx is not None else None
+                if v is None:
+                    continue
+                try:
+                    return float(v)
+                except Exception:
+                    continue
+            return 0.0
+
+        def _get_dict(*names: str) -> Dict[str, Any]:
+            for n in names:
+                v = None
+                if isinstance(ctx, dict):
+                    v = ctx.get(n)
+                else:
+                    v = getattr(ctx, n, None) if ctx is not None else None
+                if isinstance(v, dict):
+                    return dict(v)
+            return {}
+
+        def _get_str(*names: str) -> str:
+            for n in names:
+                v = None
+                if isinstance(ctx, dict):
+                    v = ctx.get(n)
+                else:
+                    v = getattr(ctx, n, None) if ctx is not None else None
+                if v:
+                    return str(v)
+            return ""
+
+        tokens_used = _get_int("tokens_used", "total_tokens")
+        input_tokens = _get_int("input_tokens", "prompt_tokens")
+        output_tokens = _get_int("output_tokens", "completion_tokens")
+        llm_calls = _get_int("llm_calls", "api_calls")
+        cost = _get_float("cost", "total_cost")
+        turn_count = _get_int("turn_count")
+        tools_used = _get_dict("tools_used")
+        errors = _get_int("errors") or 0
+        session_id = _get_str("session_id")
+
+        # ---- model / provider ----
+        model = ""
+        provider = ""
+        try:
+            if active.llm is not None:
+                model = active.llm.get_current_model() or ""
+                provider = active.llm.get_current_provider() or ""
+        except Exception:
+            pass
+
+        # ---- session id fallback ----
+        if not session_id:
+            try:
+                session_id = active.session.id if active.session else ""
+            except Exception:
+                session_id = ""
+
+        # ---- project / data dir ----
+        project_dir = ""
+        try:
+            if active.workspace is not None:
+                project_dir = str(getattr(active.workspace, "project_dir", "") or "")
+        except Exception:
+            project_dir = ""
+
+        data_dir = ""
+        try:
+            from agent.utils.platform import get_data_dir
+            data_dir = str(get_data_dir("agent"))
+        except Exception:
+            data_dir = ""
+
+        # ---- tools count ----
+        tool_count = 0
+        try:
+            if active.tool_registry is not None:
+                tool_count = len(active.tool_registry.list_tools())
+        except Exception:
+            pass
+
+        return {
+            # coordinator-level
+            "current_mode": self.current_mode,
+            "session_id": session_id,
+
+            # flat counters (panel-facing)
+            "status": getattr(active, "status", "idle"),
+            "model": model,
+            "provider": provider,
+            "project_dir": project_dir,
+            "data_dir": data_dir,
+            "turn_count": turn_count,
+            "tokens_used": tokens_used,
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "llm_calls": llm_calls,
+            "cost": cost,
+            "tools_used": tools_used,
+            "tool_count": tool_count,
+            "errors": errors,
+
+            # per-agent detail (kept for sidebar / debug)
+            "plan_agent": {
+                "status": self.plan_agent.status,
+                "model": self.plan_agent._get_current_model(),
+                "tools": self.plan_agent.get_available_tools(),
+            },
+            "build_agent": {
+                "status": self.build_agent.status,
+                "model": self.build_agent._get_current_model(),
+                "tools": self.build_agent.get_available_tools(),
+            },
+        }
+
+    # ------------------------------------------------------------------
 
     async def process_query(
         self,
@@ -891,21 +1083,6 @@ class AgentCoordinator:
         self._shutdown_done = True
         await self.plan_agent.shutdown()
         await self.build_agent.shutdown()
-
-    def get_status(self) -> Dict[str, Any]:
-        return {
-            "current_mode": self.current_mode,
-            "plan_agent": {
-                "status": self.plan_agent.status,
-                "model": self.plan_agent._get_current_model(),
-                "tools": self.plan_agent.get_available_tools(),
-            },
-            "build_agent": {
-                "status": self.build_agent.status,
-                "model": self.build_agent._get_current_model(),
-                "tools": self.build_agent.get_available_tools(),
-            },
-        }
 
 
 async def create_dual_agent_system(

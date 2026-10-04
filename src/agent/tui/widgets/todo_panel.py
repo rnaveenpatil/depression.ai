@@ -2,27 +2,25 @@
 Todo panel — status-driven list with distinct colours per state.
 
 Rendering:
-    ▶  in-progress     amber   (#ffcc44)
-    ○  pending         muted   (#3d8c5c)
-    ●  done            green   (#00ff66), struck through
-    ◼  blocked         red     (#ff4466)
-    ✕  cancelled       dim     (#1a5c33)
+    ▶  in-progress     amber
+    ○  pending         muted
+    ●  done            green, struck through
+    ◼  blocked         red
+    ✕  cancelled       dim
 
-Header shows `X/Y done`. Polls the shared TodoTool store every 0.5s.
+Header shows `X/Y done`. Two refresh paths, so the panel is never blank
+when there's data to show:
 
-The colour of the DONE glyph is bright green (not dim) so it stands out
-against pending items. The task title for done items is dimmed so the
-list reads as "these are behind us".
+    1. Polls the shared TodoTool store every 0.5s.
+    2. `set_items([...])` — the app calls this directly from
+       `_on_plan_updated` so a fresh plan is rendered immediately without
+       waiting for the next tick.
 
-NOTE
-----
-The session is resolved *lazily on every refresh* rather than being
-captured at construction time. `DepressionApp.compose()` builds this
-panel before `on_mount` runs, and at that point `coordinator.build_agent`
-/ `plan_agent` may not yet have a `.session` attached. Caching the
-session up-front produced a `_session_key` that never matched the one
-used by `TodoTool` / the plan-update handler, so the panel read from an
-empty bucket and rendered nothing.
+The store resolution:
+    * Try the live session's bucket (via app._session()).
+    * If that's empty, walk every bucket and take the newest non-empty
+      one. This is what fixes the "silently blank" panel when the session
+      key used by the writer and reader happened to differ.
 """
 
 from __future__ import annotations
@@ -75,19 +73,18 @@ class TodoPanel(Vertical):
 
     def __init__(self, app_ref: Any = None, session: Any = None, **kwargs: Any):
         super().__init__(**kwargs)
-        # Prefer the app reference so we can re-resolve the live session
-        # on each tick. `session` is kept as a fallback for standalone use.
         self._app = app_ref
         self._session = session
         self._store: Dict[str, Any] = {}
+        # Items pushed directly by the app take priority over the store
+        # until the store catches up.
+        self._pushed_items: List[Any] = []
         self._header: Optional[Static] = None
         self._body: Optional[Static] = None
         self._last_render = ""
 
     def compose(self) -> ComposeResult:
-        self._header = Static(
-            f"[bold {GREEN}]▌ TODO[/]", markup=True
-        )
+        self._header = Static(f"[bold {GREEN}]▌ TODO[/]", markup=True)
         self._body = Static("", markup=True)
         yield self._header
         yield self._body
@@ -97,12 +94,28 @@ class TodoPanel(Vertical):
         self.set_interval(0.5, self._refresh)
 
     # ------------------------------------------------------------------
+    # Public API — called by the app
+    # ------------------------------------------------------------------
+
+    def set_items(self, items: List[Any]) -> None:
+        """
+        Replace the panel's items with a list pushed by the app.
+
+        Items are dicts with keys: title, status, priority (optional).
+        The panel keeps them until the store poll finds a newer set.
+        """
+        self._pushed_items = list(items or [])
+        self._refresh()
+
+    def clear(self) -> None:
+        self._pushed_items = []
+        self._refresh()
+
+    # ------------------------------------------------------------------
     # Session / store resolution
     # ------------------------------------------------------------------
 
     def _current_session(self) -> Any:
-        """Ask the app for the live session each time; fall back to the
-        snapshot captured at construction."""
         if self._app is not None:
             try:
                 live = self._app._session()  # type: ignore[attr-defined]
@@ -113,27 +126,40 @@ class TodoPanel(Vertical):
         return self._session
 
     def _resolve_store(self) -> Dict[str, Any]:
-        from agent.tools.todo import TodoTool
+        """Return the best available bucket from the TodoTool store."""
+        try:
+            from agent.tools import todo as todo_mod  # local import
+            TodoTool = getattr(todo_mod, "TodoTool")
+        except Exception:
+            self._store = {}
+            return {}
 
         session = self._current_session()
-        sid = TodoTool._session_key(session)
-        store = TodoTool._strong_keys.get(sid)
+        bucket: Dict[str, Any] = {}
+        try:
+            sid = TodoTool._session_key(session)
+            bucket = TodoTool._strong_keys.get(sid) or {}
+        except Exception:
+            bucket = {}
 
-        # If the exact session-key lookup misses, fall back to the most
-        # recently used bucket. This handles the case where the panel is
-        # polling before the agent has attached its session, and prevents
-        # the "silent empty" mode.
-        if not store:
+        if not bucket:
+            # Fall back to the newest non-empty bucket.
+            candidates = []
             try:
-                candidates = [
-                    v for v in TodoTool._strong_keys.values() if v
-                ]
-                if len(candidates) == 1:
-                    store = candidates[0]
+                for k, v in (TodoTool._strong_keys or {}).items():
+                    if v:
+                        candidates.append(v)
             except Exception:
-                store = None
+                candidates = []
+            if candidates:
+                # Choose the bucket whose newest item is newest.
+                def _newest(b: Dict[str, Any]) -> float:
+                    return max(
+                        (getattr(i, "created_at", 0) or 0) for i in b.values()
+                    ) if b else 0.0
+                bucket = max(candidates, key=_newest)
 
-        self._store = store or {}
+        self._store = bucket or {}
         return self._store
 
     # ------------------------------------------------------------------
@@ -143,36 +169,38 @@ class TodoPanel(Vertical):
     def _refresh(self) -> None:
         if self._body is None:
             return
+
         try:
-            self._resolve_store()
-            items: List[Any] = sorted(
-                self._store.values(),
-                key=lambda i: (
-                    getattr(i, "status", "pending") != "in_progress",
-                    getattr(i, "priority", 3),
-                    getattr(i, "created_at", 0),
-                ),
-            )
+            items = self._gather_items()
         except Exception as exc:
-            # Surface the failure instead of dying silently inside the
-            # interval callback.
             self._paint(f"[{ERROR}]todo error: {_esc(exc)}[/]")
             return
 
         if not items:
-            self._paint(f"[{DIM}]no tasks yet[/]")
+            self._paint(f"[{DIM}]waiting for tasks…[/]")
             return
+
+        # Sort: in-progress first, then pending by priority, then done.
+        def _sort_key(i: Any) -> tuple:
+            status = self._get(i, "status", "pending")
+            rank = {"in_progress": 0, "pending": 1, "blocked": 2}.get(status, 3)
+            priority = self._priority(i)
+            created = self._get(i, "created_at", 0) or 0
+            return (rank, priority, created)
+
+        items.sort(key=_sort_key)
 
         done = sum(
             1 for i in items
-            if getattr(i, "status", "") in ("done", "completed")
+            if self._get(i, "status", "") in ("done", "completed")
         )
         total = len(items)
         lines = [f"[{MUTED}]{done}/{total} done[/]", ""]
+
         for it in items:
-            status = getattr(it, "status", "pending")
+            status = self._get(it, "status", "pending")
             glyph, color = _GLYPH.get(status, ("○", MUTED))
-            title = _esc(getattr(it, "title", "") or "")
+            title = _esc(self._get(it, "title", "") or "")
             if len(title) > 32:
                 title = title[:29] + "…"
             if status in ("done", "completed"):
@@ -185,6 +213,33 @@ class TodoPanel(Vertical):
                 lines.append(f"[{color}]{glyph}[/] [{TEXT}]{title}[/]")
 
         self._paint("\n".join(lines))
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    def _gather_items(self) -> List[Any]:
+        """Pushed items win; otherwise read the store."""
+        if self._pushed_items:
+            return list(self._pushed_items)
+        store = self._resolve_store()
+        return list(store.values()) if store else []
+
+    @staticmethod
+    def _get(item: Any, key: str, default: Any = None) -> Any:
+        if isinstance(item, dict):
+            return item.get(key, default)
+        return getattr(item, key, default)
+
+    @staticmethod
+    def _priority(item: Any) -> int:
+        p = TodoPanel._get(item, "priority", 3)
+        if hasattr(p, "value"):
+            p = p.value
+        try:
+            return int(p)
+        except Exception:
+            return 3
 
     def _paint(self, markup: str) -> None:
         # NOTE: must not be named `_render` — Textual's Widget._render()
