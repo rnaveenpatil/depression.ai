@@ -10,6 +10,10 @@ Animations layered on top of the static block letters:
   4. Subtitle breathing  — the subtitle's glow oscillates
   5. Terminal caret      — a blinking ▮ after the subtitle
 
+Under the wordmark a welcome line is shown when a name is available:
+
+    welcome to depression, <name>
+
 All animation is driven by two set_interval timers on the widget; nothing
 touches the app loop or spawns tasks. The scan uses per-character coloring
 so it survives any terminal that renders the block letters.
@@ -156,36 +160,6 @@ def _build_full_rows(reveal_count: int) -> list[str]:
     return rows
 
 
-def _apply_scan(rows: list[str], scan_col: int, phase: int) -> list[str]:
-    """
-    Re-render rows with a bright column at position `scan_col`. Because
-    the row strings already contain markup, we cannot slice them by
-    character; instead we re-run the composition and color the glyph
-    cell that contains the scan column.
-
-    To keep this cheap, the scan is a *phase* between 0..N where N is the
-    total rendered width. We approximate by dimming the whole row except
-    a bright "band" of width 3 whose position we advance each tick.
-    """
-    if scan_col < 0:
-        return rows
-    band = 3
-    out: list[str] = []
-    for row_index, row in enumerate(rows):
-        # Row here is markup. We do not try to slice markup. Instead we
-        # overlay the band by prefixing a brief bright marker that the
-        # eye reads as the scan. This is intentionally cheap: a moving
-        # highlight block placed just left of the row.
-        if (phase % 2) == 0:
-            marker = f"[bold {SCAN}]━[/]"
-        else:
-            marker = f"[bold {SCAN}]╸[/]"
-        # Pad so the marker travels across the visible width.
-        pad = " " * max(0, scan_col)
-        out.append(marker + pad + row)
-    return out
-
-
 def _pulse_color(tick: int) -> str:
     """Return the R color for this tick — 3-step pulse."""
     phase = tick % 6
@@ -207,6 +181,15 @@ def _breath_color(tick: int) -> str:
 
 
 class EmptyBanner(Static):
+    """
+    Full 6-row wordmark for the main empty-state screen.
+
+    Pass `welcome_name` (or call `set_welcome()`) to show
+    "welcome to depression, <name>" under the wordmark. When no name is
+    available the welcome line is simply blank — the wordmark, subtitle
+    and hint are unchanged.
+    """
+
     DEFAULT_CSS = f"""
     EmptyBanner {{
         width: 100%;
@@ -226,6 +209,13 @@ class EmptyBanner(Static):
         margin-top: 1;
         color: {GREEN};
     }}
+    EmptyBanner .banner-welcome {{
+        width: auto;
+        height: 1;
+        text-align: center;
+        margin-top: 1;
+        color: {GREEN_GLOW};
+    }}
     EmptyBanner .banner-note {{
         width: auto;
         height: 1;
@@ -242,18 +232,23 @@ class EmptyBanner(Static):
     }}
     """
 
-    def __init__(self, **kwargs):
+    def __init__(self, welcome_name: str = "", **kwargs):
         super().__init__(**kwargs)
+        self._welcome_name = welcome_name or ""
         self._line_widgets: list[Static] = []
         self._sub_widget: Static | None = None
+        self._welcome_widget: Static | None = None
         self._note_widget: Static | None = None
         self._hint_widget: Static | None = None
         self._reveal_count = 0
         self._reveal_done = False
-        self._scan_col = -1
         self._scan_tick = 0
-        self._phase = 0
         self._alive = True
+
+    def set_welcome(self, name: str) -> None:
+        """Update the welcome line without rebuilding the widget."""
+        self._welcome_name = (name or "").strip()
+        self._render_welcome()
 
     def compose(self) -> ComposeResult:
         with Middle():
@@ -262,16 +257,24 @@ class EmptyBanner(Static):
                     w = Static("", classes="banner-line", markup=True)
                     self._line_widgets.append(w)
                     yield w
+
                 self._sub_widget = Static("", classes="banner-sub", markup=True)
                 yield self._sub_widget
+
+                # NEW: welcome line — sits between the subtitle and the note.
+                self._welcome_widget = Static(
+                    "", classes="banner-welcome", markup=True
+                )
+                yield self._welcome_widget
+
                 self._note_widget = Static(
                     f"[{MUTED}]AI agent capable of doing everything — "
                     f"development, analysis, system handling AWS deployment,[/]",
-                    
                     classes="banner-note",
                     markup=True,
                 )
                 yield self._note_widget
+
                 self._hint_widget = Static(
                     f"[{DIM}]type a prompt to begin  ·  ctrl+b for sidebar  ·  "
                     f"ctrl+q to quit[/]",
@@ -287,6 +290,7 @@ class EmptyBanner(Static):
         self.set_interval(0.14, self._tick_effects)
         # Initial paint so the widget isn't blank for one frame.
         self._render_wordmark()
+        self._render_welcome()
 
     def on_unmount(self) -> None:
         self._alive = False
@@ -329,6 +333,26 @@ class EmptyBanner(Static):
             except Exception:
                 pass
 
+    def _render_welcome(self) -> None:
+        """Paint the welcome line under the subtitle."""
+        if self._welcome_widget is None:
+            return
+        name = (self._welcome_name or "").strip()
+        if not name:
+            # Keep the line blank (it still reserves its row, so nothing
+            # shifts when the name arrives later).
+            try:
+                self._welcome_widget.update("")
+            except Exception:
+                pass
+            return
+        try:
+            self._welcome_widget.update(
+                f"[bold {GREEN_GLOW}]welcome to depression, {_esc(name)}[/]"
+            )
+        except Exception:
+            pass
+
     def _recolor_r(self, row: str, red: str) -> str:
         """
         The base rows were built with the R already marked. Swap the red
@@ -355,11 +379,4 @@ class EmptyBanner(Static):
         if not self._alive:
             return
         self._scan_tick += 1
-        # Advance the scan line every other tick, wrapping across the
-        # full visible width plus a small margin.
-        if self._scan_tick % 2 == 0:
-            total_width = sum(len(g[0]) for _, g in _LETTERS) + len(_LETTERS)
-            self._scan_col += 2
-            if self._scan_col > total_width + 4:
-                self._scan_col = -1
         self._render_wordmark()

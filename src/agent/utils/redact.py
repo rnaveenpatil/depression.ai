@@ -85,6 +85,9 @@ _PATTERNS = [
     re.compile(r"\bgithub_pat_[A-Za-z0-9_]{40,}"),
     # Google / Firebase API keys
     re.compile(r"\bAIza[0-9A-Za-z_\-]{35}\b"),
+    # Google OAuth *client secret*. Distinct from the client id, which is a
+    # public identifier and is allowed through.
+    re.compile(r"\bGOCSPX-[A-Za-z0-9_\-]{10,}\b"),
     # Slack
     re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{10,}"),
     re.compile(r"\bhttps://hooks\.slack\.com/services/[A-Za-z0-9/]{20,}"),
@@ -189,7 +192,22 @@ def _redact_str(text: str) -> str:
     )
     for pat in _PATTERNS:
         text = pat.sub(REDACTED, text)
-    return text
+    return _mask_url_passwords(text)
+
+
+# A database URL echoed by a command, a stack trace, or a tool result is one of
+# the most common ways a live credential reaches a transcript. The password is
+# masked wherever the URL appears, not only when the field name looks
+# sensitive. Scheme, user and host survive so the line stays useful.
+_URL_PASSWORD_RE = re.compile(
+    r"\b([A-Za-z][A-Za-z0-9+.\-]{1,31})://([^\s:/@]*):([^\s@/]+)@"
+)
+
+
+def _mask_url_passwords(text: str) -> str:
+    return _URL_PASSWORD_RE.sub(
+        lambda m: f"{m.group(1)}://{m.group(2)}:{REDACTED}@", text
+    )
 
 
 __all__ = ["redact", "REDACTED"]

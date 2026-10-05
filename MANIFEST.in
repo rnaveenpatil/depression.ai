@@ -1,0 +1,35 @@
+# Keep the sdist as lean as the wheel.
+#
+# Without these, the sdist shipped tests/ (including test fixtures) and every
+# __pycache__ directory. That is how a Firebase API key ended up publicly
+# downloadable from PyPI in 1.0.4: the wheel was clean but the sdist was not,
+# and sdists are what people get when installing from source.
+
+# The shipped Firebase web config must stay in the sdist: it is a public
+# identifier set, and dropping it would break sign-in for pip --no-binary.
+include src/agent/tui/onboarding/firebase_default.json
+
+prune tests
+prune docs
+prune .github
+prune .githooks
+
+recursive-exclude * __pycache__
+recursive-exclude * *.py[cod]
+recursive-exclude * .DS_Store
+
+global-exclude .env
+global-exclude .env.*
+# A file literally named *firebase.json is machine-local config, never part of
+# the distribution. firebase_default.json is unaffected (it does not end in
+# "firebase.json") and is explicitly included above.
+global-exclude *firebase.json
+global-exclude *google-services.json
+global-exclude *service_account*.json
+global-exclude *client_secrets.json
+
+# Never ship local virtualenvs or credential material.
+prune deprssion
+prune src/agent/depression
+prune .venv
+prune venv

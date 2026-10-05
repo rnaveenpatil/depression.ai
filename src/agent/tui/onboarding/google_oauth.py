@@ -27,13 +27,15 @@ that gets stored and exported is identical.
 
 Two ways to supply the OAuth client
 -----------------------------------
-1. A `client_secrets.json` file (preferred): Google Cloud Console > APIs &
-   Services > Credentials > your **Desktop app** client > Download JSON. Point at
-   it with `FIREBASE_GOOGLE_CLIENT_SECRETS`, or drop it at
+1. A `client_secrets.json` file (preferred, and the only one that works with
+   `run_local_server`): Google Cloud Console > APIs & Services > Credentials >
+   your **Desktop app** client > Download JSON. Point at it with
+   `FIREBASE_GOOGLE_CLIENT_SECRETS`, or drop it at
    `~/.config/depression/client_secrets.json` or `./client_secrets.json`.
-   Desktop clients need no secret, so this just works.
+   Desktop clients accept any `http://localhost:*` redirect, which is what
+   `run_local_server` needs.
 
-2. A bare client id from `firebase.json`:
+2. A bare *Web* client id from `firebase.json`:
 
        {
          "project_id": "my-project",
@@ -44,11 +46,11 @@ Two ways to supply the OAuth client
          ]
        }
 
-   The `client_type: 3` entry (the "Web client" Firebase creates for Auth) is
-   used automatically; Android/iOS entries are skipped. Web clients normally
-   want a client secret at the token endpoint — set
-   `FIREBASE_OAUTH_CLIENT_SECRET` (or `oauth_client_secret` in the config) if
-   Google answers `invalid_client`.
+   The `client_type: 3` entry is Firebase's auto-created Web client. Web
+   clients require every redirect URI to be pre-registered, so `run_local_server`
+   with a random port is rejected by Google with `redirect_uri_mismatch`. For
+   that reason a bare Web client id alone does **not** make this flow
+   available — use the Firebase browser page instead.
 
 Nothing secret is stored by the CLI. Both `google_auth_oauthlib` and `requests`
 are imported lazily: when they are missing the app falls back to the
@@ -208,11 +210,11 @@ class GoogleOAuthSignIn:
         self.timeout = float(timeout)
         self.port = int(port)
         self.client_secrets = find_client_secrets(client_secrets, environ=env)
-        # A `client_secrets.json` always wins; otherwise build the config from
-        # the project's OAuth client id (no file needed).
-        self.client_id = "" if self.client_secrets else (
-            (client_id or "").strip() or str(env.get(ENV_CLIENT_ID) or "").strip()
-        )
+        # A `client_secrets.json` always wins. A bare Web client id is
+        # remembered only so `describe()` can explain why we're not using it.
+        self.client_id = (client_id or "").strip() or str(
+            env.get(ENV_CLIENT_ID) or ""
+        ).strip()
         self.client_secret = (client_secret or "").strip() or str(
             env.get(ENV_CLIENT_SECRET) or ""
         ).strip()
@@ -223,11 +225,23 @@ class GoogleOAuthSignIn:
 
     @property
     def is_available(self) -> bool:
-        return bool(self.api_key) and self.has_client and oauthlib_available()
+        """
+        True only when `run_local_server` can actually complete.
+
+        A Desktop client (`client_secrets.json`) accepts any
+        `http://localhost:*` redirect. A bare Web client id does not: Google
+        requires every redirect URI to be pre-registered, so a random
+        loopback port fails with `redirect_uri_mismatch`.
+        """
+        return (
+            bool(self.api_key)
+            and self.client_secrets is not None
+            and oauthlib_available()
+        )
 
     @property
     def has_client(self) -> bool:
-        """Either a client_secrets.json or a bare client id is enough."""
+        """True when either a client_secrets.json or a bare client id exists."""
         return self.client_secrets is not None or bool(self.client_id)
 
     def client_config(self) -> Dict[str, Any]:
@@ -245,16 +259,19 @@ class GoogleOAuthSignIn:
     def describe(self) -> str:
         if not self.api_key:
             return "FIREBASE_API_KEY is not set"
-        if not self.has_client:
-            return (
-                f"{CLIENT_SECRETS_FILENAME} not found and no OAuth client id "
-                f"(set ${ENV_CLIENT_SECRETS} or ${ENV_CLIENT_ID})"
-            )
-        if not oauthlib_available():
-            return "pip install google-auth-oauthlib requests"
         if self.client_secrets is not None:
+            if not oauthlib_available():
+                return "pip install google-auth-oauthlib requests"
             return f"Google OAuth via {self.client_secrets}"
-        return f"Google OAuth via client {self.client_id[:24]}…"
+        if self.client_id:
+            return (
+                "bare Web client id — needs a Desktop client "
+                f"({CLIENT_SECRETS_FILENAME}); using the browser flow instead"
+            )
+        return (
+            f"{CLIENT_SECRETS_FILENAME} not found and no OAuth client id "
+            f"(set ${ENV_CLIENT_SECRETS} or ${ENV_CLIENT_ID})"
+        )
 
     # -- steps ---------------------------------------------------------
 
@@ -265,28 +282,22 @@ class GoogleOAuthSignIn:
         `run_local_server(port=0)` picks a free port, opens the browser and
         blocks until the consent screen is done.
         """
-        if not self.has_client:
+        if self.client_secrets is None:
             raise GoogleOAuthError(
-                f"No OAuth client. Either download a Desktop client's "
-                f"{CLIENT_SECRETS_FILENAME} and set "
-                f"${ENV_CLIENT_SECRETS}=/path/to/{CLIENT_SECRETS_FILENAME}, or put "
-                f"the web client id in firebase.json / ${ENV_CLIENT_ID}."
+                f"The installed-app flow needs a Desktop OAuth client. "
+                f"Download a Desktop app's {CLIENT_SECRETS_FILENAME} and set "
+                f"${ENV_CLIENT_SECRETS}=/path/to/{CLIENT_SECRETS_FILENAME}, or use "
+                f"the Firebase browser page instead."
             )
 
         if self._run_flow is not None:
             credentials = self._run_flow(self.client_secrets, self.scopes, self.port)
         else:
             installed_app_flow = _import_installed_app_flow()
-            if self.client_secrets is not None:
-                flow = installed_app_flow.from_client_secrets_file(
-                    str(self.client_secrets),
-                    scopes=list(self.scopes),
-                )
-            else:
-                flow = installed_app_flow.from_client_config(
-                    self.client_config(),
-                    scopes=list(self.scopes),
-                )
+            flow = installed_app_flow.from_client_secrets_file(
+                str(self.client_secrets),
+                scopes=list(self.scopes),
+            )
             logger.info("Opening browser for Google OAuth: %s", self._client_label())
             credentials = flow.run_local_server(port=self.port)
 
