@@ -113,6 +113,126 @@ R Naveen Patil is the primary developer behind the `depression.ai` framework, re
 
 ---
 
+# 🚀 What Is depression.ai?
+
+**depression.ai** is an advanced **CLI-based agentic AI harness** developed by **Team Depression**.
+
+It is built for people who want an AI agent that can work with a real computer, real projects, real tools and real infrastructure — not just answer questions in a chat window.
+
+Think of `depression.ai` as an **agent runtime for a software engineer and technical operator**:
+
+```text
+                    USER
+                      │
+                      ▼
+              depression.ai
+              Agent Harness
+                      │
+          ┌───────────┼───────────┐
+          ▼           ▼           ▼
+       Reason       Plan        Context
+          │           │           │
+          └───────────┼───────────┘
+                      ▼
+                Tool Selection
+                      │
+        ┌─────────────┼─────────────┐
+        ▼             ▼             ▼
+    Filesystem     Terminal        Git
+        │             │             │
+        ├─────────────┼─────────────┤
+        ▼             ▼             ▼
+      Browser        MCP           AWS
+                      │
+                      ▼
+                 Verification
+                      │
+                      ▼
+                    RESULT
+```
+
+The framework is designed to handle many multi-step workflows that a software engineer or technical operator performs:
+
+- Understand an unfamiliar codebase
+- Analyze bugs and failures
+- Plan implementation changes
+- Create and modify files
+- Run commands and tests
+- Debug failures
+- Review Git changes
+- Use browser automation
+- Search and inspect information
+- Work with MCP tools
+- Inspect and operate supported AWS environments
+- Prepare applications for deployment
+- Verify the result of executed work
+
+The **LLM provides the reasoning capability**. `depression.ai` provides the environment around that model: context, tools, permissions, sessions, execution and recovery.
+
+> **Important:** The quality of an agentic task depends on both the framework and the connected model. A model with weak reasoning or unreliable tool/function calling can produce poor results even when the framework provides the required tools.
+
+---
+
+# 🧠 Agentic, Not Just Chat
+
+A normal chatbot primarily returns text.
+
+`depression.ai` is designed around an execution loop:
+
+```text
+Understand
+   ↓
+Inspect
+   ↓
+Plan
+   ↓
+Choose Tool
+   ↓
+Execute
+   ↓
+Observe Result
+   ↓
+Re-evaluate
+   ↓
+Continue / Correct
+   ↓
+Verify
+   ↓
+Report
+```
+
+This makes the framework suitable for tasks where the answer is not simply a paragraph of text, but a **change that has to be made and verified on a real system**.
+
+For example:
+
+```text
+"Find why my application is failing and fix it."
+
+            ↓
+
+Inspect project
+            ↓
+Read relevant files
+            ↓
+Understand configuration
+            ↓
+Run diagnostic commands
+            ↓
+Identify failure
+            ↓
+Modify required files
+            ↓
+Run tests / verification
+            ↓
+Inspect the result
+            ↓
+Report what changed
+```
+
+The exact behaviour depends on the model, available tools, permissions and environment.
+
+---
+
 # 🧠 About depression.ai
 
 **depression.ai** is an agentic AI framework developed and released by **Team Depression**.
@@ -872,51 +992,6 @@ This direction is intended for environments where sensitive engineering document
 
 ---
 
-# 🏭 Sovereign / On-Prem AI Workbench
-
-The architecture can be adapted for organizations such as:
-
-* Refineries
-* Public Sector Undertakings
-* Defence-linked manufacturing
-* Government offices
-* Industrial organizations
-* Enterprises with sensitive internal infrastructure
-
-Potential confidential workloads include:
-
-```text
-P&IDs
-Engineering Documents
-Source Code
-Financial Information
-Vendor Negotiations
-Internal Correspondence
-Design Documents
-Inspection Reports
-Operational Documentation
-```
-
-Instead of sending these workloads to a public cloud AI assistant, the target architecture is:
-
-```text
-Confidential Data
-       ↓
-Internal Environment
-       ↓
-depression.ai
-       ↓
-Local Agent
-       ↓
-Local LLM
-       ↓
-GPU Infrastructure
-```
-
-The objective is to provide agentic AI capabilities while keeping the execution environment under organizational control.
-
----
-
 # 🧠 Multiple Local Models
 
 A self-hosted deployment can potentially run multiple open-weight models for different workloads.
@@ -1189,7 +1264,7 @@ cd depression.ai
 Install the package:
 
 ```bash
-pip install depression.ai .
+pip install depression.ai
 ```
 
 For development:
@@ -1415,93 +1490,121 @@ Deployment
 
 ---
 
-# 🔒 Current Privacy Boundary
+# 🔒 Security, Privacy & Data Boundary
 
-The current architecture is designed so that the **agent framework, tool execution and project interaction run on the user's system**.
+`depression.ai` is designed with a **local-first, security-focused architecture**.
 
-The LLM can currently be supplied through an API endpoint.
-
-Conceptually:
+The core agent runtime and the operations performed by its tools run on the user's machine:
 
 ```text
-USER SYSTEM
-────────────────────────────
+USER MACHINE
+────────────────────────────────────
 depression.ai
 Agent Runtime
-Tools
-Files
+Project Context
+Filesystem
 Terminal
 Git
-AWS
 Sessions
 Permissions
-────────────────────────────
-             │
-             ▼
-       LLM API Endpoint
+Configured Tools
+AWS Integration
+────────────────────────────────────
 ```
 
-The next architecture change is to allow the LLM itself to run locally:
+### What stays local
+
+The framework is designed so that **Team Depression does not receive or remotely inspect your project files, terminal output, source code or local system data merely because you installed the package or signed in**.
+
+The agent's local components include:
+
+- Agent execution
+- Tool execution
+- Filesystem interaction
+- Terminal commands
+- Git operations
+- Session state
+- Permission handling
+- Local project context
+
+### Remote LLM providers
+
+If you configure a **remote LLM API**, information required to answer your request may leave your machine and be sent to that LLM provider.
+
+That can include, depending on the task and implementation:
+
+- Your prompt
+- Relevant conversation/context
+- Selected project content
+- Tool results
+- Code or configuration required for the model to reason about the task
+
+Therefore:
+
+> **Using a remote LLM does not mean the entire framework is remote. The agent runtime remains local, but model requests and the data included in those requests are subject to the configured LLM provider's policies.**
+
+Review the privacy, retention and data-handling policies of your selected provider before using sensitive information with a remote model.
+
+### Local LLM mode
+
+`depression.ai` can also be connected to a locally hosted, OpenAI-compatible model server through the **LLM Connection** panel.
+
+For example:
 
 ```text
-USER / ORGANIZATION
-────────────────────────────
+User Machine
+     ↓
 depression.ai
-Agent Runtime
-Tools
-Files
-Terminal
-Git
-AWS
-Sessions
-Permissions
-────────────────────────────
-             │
-             ▼
-       LOCAL LLM SERVER
-             │
-             ▼
-          GPU
+     ↓
+Local LLM Server
+     ↓
+Local GPU / CPU
 ```
 
-This is the direction toward self-hosted and air-gapped deployments.
+When the model itself is hosted locally, the model inference can remain inside your machine or controlled network instead of sending model requests to a public API.
 
----
+### Gmail / Google login
 
-# 🏭 Air-Gapped Deployment Direction
+The Gmail/Google login is **not the agent backend**.
 
-For highly controlled environments, the target deployment can operate entirely inside an organization's network.
+It is used for authentication and product-level usage identification by Team Depression, such as understanding authenticated usage and estimating how many people are using or installing the package.
+
+Signing in does **not** give Team Depression remote access to your terminal, project directory or local files.
+
+The login system should therefore be understood separately from the agent execution system:
 
 ```text
-                 AIR-GAPPED / INTERNAL NETWORK
+Google Login
+     │
+     └── Product authentication / usage identification
 
-┌──────────────────────────────────────────────────────┐
-│                                                      │
-│                    USER WORKSTATION                  │
-│                           │                          │
-│                           ▼                          │
-│                  ┌────────────────┐                  │
-│                  │ depression.ai  │                  │
-│                  │   TUI / Agent  │                  │
-│                  └───────┬────────┘                  │
-│                          │                           │
-│                          ▼                           │
-│                  ┌────────────────┐                  │
-│                  │ Local LLM API  │                  │
-│                  └───────┬────────┘                  │
-│                          │                           │
-│                          ▼                           │
-│                  ┌────────────────┐                  │
-│                  │   GPU Server   │                  │
-│                  └───────┬────────┘                  │
-│                          │                           │
-│                          ▼                           │
-│       Internal Documents / Code / Tools / Systems   │
-│                                                      │
-└──────────────────────────────────────────────────────┘
+depression.ai Agent
+     │
+     └── Local agent + tool execution
 ```
 
-The objective is to enable agentic AI workflows without requiring confidential organizational data to be processed by a public AI service.
+A Gmail/Google login does not make your project data automatically available to Team Depression.
+
+### Open source & auditability
+
+The project is developed as an open-source framework. The source code can be inspected and audited by users and developers.
+
+Security should still be evaluated realistically: **no software can honestly guarantee absolute security**. Users should review the source, permissions, connected tools, AWS policies and LLM-provider configuration before using the framework with sensitive environments.
+
+### Security principles
+
+`depression.ai` follows a security-focused approach around:
+
+- Local-first agent execution
+- Explicit permission handling for sensitive operations
+- Sensitive-file protection
+- Secret redaction / scanning mechanisms where implemented
+- Least-privilege AWS access
+- User-controlled LLM configuration
+- Separation between authentication and agent execution
+- Open-source code for inspection
+
+**Never commit API keys, AWS secrets, passwords, tokens, private keys or `.env` files to Git.**
 
 ---
 
@@ -1593,8 +1696,12 @@ The development direction includes:
 → Self-hosted deployment
 → Multiple local model support
 → Task-based model selection
-→ Air-gapped AI workflows
-→ Enterprise / industrial AI workbench
+→ Local and self-hosted LLM support
+→ GPU-based inference
+→ Multiple local model support
+→ Task-based model selection
+→ Controlled on-premise deployments
+→ Enterprise / industrial AI workflows
 ```
 
 ---
