@@ -2,20 +2,17 @@
 First-run welcome page with Gmail (Google) sign-in.
 
 `WelcomeScreen` is a `ModalScreen` pushed on top of the main TUI the first
-time an install starts without a stored profile. It offers exactly one way
-forward:
+time an install starts without a stored profile. It asks for an email
+login exactly once — on first install. After a successful sign-in the
+profile is written to disk, a completed-onboarding marker is stamped, and
+the screen is never shown again on this machine.
 
-    * SIGN IN WITH GOOGLE — opens the browser (or the installed-app OAuth
-      flow when available), completes Firebase Auth, stores the Gmail
-      profile on disk, and mirrors it into the global env file.
+There is no guest path and no skip: onboarding is a gate, not a
+suggestion. Sign-in can fail (offline, closed browser, wrong config) —
+the screen stays up and shows the error so the user can retry.
 
-There is no guest path and no skip: onboarding is a gate, not a suggestion.
-Sign-in can fail (offline, closed browser, wrong config) — the screen stays
-up and shows the error so the user can try again.
-
-Everything is fail-soft at the process level: no unhandled exception ever
-leaves this screen, so a broken onboarding config can never break the CLI
-in a way that prevents a retry.
+The paste-token input is a headless fallback only: it stays hidden until
+the user presses `T`, so the primary flow is unambiguous.
 """
 
 from __future__ import annotations
@@ -23,7 +20,6 @@ from __future__ import annotations
 import asyncio
 import os
 import sys
-import time
 from typing import Any, Mapping, Optional
 
 from textual.app import ComposeResult
@@ -32,6 +28,7 @@ from textual.binding import Binding
 from textual.containers import Center, Horizontal, Middle, Vertical
 from textual.widgets import Button, Input, Static
 
+from agent.tui.onboarding.empty_banner import CompactBanner
 from agent.tui.onboarding.firebase_auth import (
     DEFAULT_TIMEOUT,
     FirebaseGoogleAuth,
@@ -41,7 +38,7 @@ from agent.tui.onboarding.firebase_auth import (
 from agent.tui.onboarding.firebase_config import FirebaseConfig, load_firebase_config
 from agent.tui.onboarding.google_oauth import GoogleOAuthSignIn, oauthlib_available
 from agent.tui.onboarding.identity import apply_identity, export_identity
-from agent.tui.onboarding.profile import ProfileStore, UserProfile, guest_profile
+from agent.tui.onboarding.profile import ProfileStore, UserProfile
 from agent.tui.theme import (
     AMBER,
     BG,
@@ -61,6 +58,10 @@ logger = get_logger(__name__)
 
 APP_TITLE = "depression.ai"
 DEFAULT_COUNTDOWN = 0.0     # retained for API compat; no longer auto-skips
+
+# Stamped into the profile's metadata once onboarding succeeds. Used by
+# `should_onboard()` to make the gate truly one-shot for this install.
+ONBOARDED_KEY = "onboarding_complete"
 
 
 # ----------------------------------------------------------------------
@@ -82,7 +83,7 @@ def _one_line(text: Any, limit: int = 200) -> str:
 
 
 def user_to_profile(user: FirebaseUser, store: ProfileStore) -> UserProfile:
-    """Persist a Firebase identity as the local profile."""
+    """Persist a Firebase identity as the local profile, stamped as onboarded."""
     return store.save(
         UserProfile(
             uid=user.uid,
@@ -95,6 +96,7 @@ def user_to_profile(user: FirebaseUser, store: ProfileStore) -> UserProfile:
             metadata={
                 "firebase": True,
                 "gmail": user.email.lower().endswith("@gmail.com"),
+                ONBOARDED_KEY: True,
             },
         )
     )
@@ -139,45 +141,35 @@ class WelcomeScreen(ModalScreen[Optional[UserProfile]]):
         align: center middle;
     }}
     #welcome {{
-        width: 76;
+        width: 78;
         max-width: 94%;
         height: auto;
         border: round {GREEN_DIM};
         background: {PANEL};
-        padding: 1 2 1 2;
-    }}
-    #welcome-title {{
-        color: {GREEN_GLOW};
-        text-style: bold;
-        width: 100%;
-        content-align: center middle;
-    }}
-    #welcome-sub {{
-        color: {MUTED};
-        width: 100%;
-        content-align: center middle;
-        margin-bottom: 1;
+        padding: 2 3 2 3;
     }}
     #welcome-body {{
         height: auto;
         color: {TEXT};
-        margin: 0 0 1 0;
+        text-align: center;
+        margin: 1 0 1 0;
     }}
     #welcome-method {{
         height: auto;
         color: {DIM};
-        content-align: center middle;
-        margin-bottom: 1;
+        text-align: center;
+        margin: 0 0 1 0;
     }}
     #welcome-status {{
         height: auto;
+        min-height: 1;
         color: {AMBER};
+        text-align: center;
         margin: 0 0 1 0;
-        content-align: left middle;
     }}
     #welcome-buttons {{
         height: auto;
-        margin: 0 0 1 0;
+        margin: 1 0 1 0;
     }}
     #welcome-buttons Button {{
         width: 100%;
@@ -201,7 +193,6 @@ class WelcomeScreen(ModalScreen[Optional[UserProfile]]):
         height: auto;
         margin: 0 0 1 0;
     }}
-    #welcome-input-row.hidden {{ display: none; }}
     #welcome-input {{
         width: 1fr;
         height: 3;
@@ -213,7 +204,8 @@ class WelcomeScreen(ModalScreen[Optional[UserProfile]]):
     #welcome-hint {{
         height: 1;
         color: {DIM};
-        content-align: center middle;
+        text-align: center;
+        margin-top: 1;
     }}
     """
 
@@ -221,7 +213,6 @@ class WelcomeScreen(ModalScreen[Optional[UserProfile]]):
         Binding("enter", "sign_in", "Sign in", priority=True),
         Binding("g", "sign_in", "Sign in", priority=True),
         Binding("t", "manual", "Paste token", priority=True),
-        Binding("c", "guest", "Continue as guest", priority=True),
         Binding("escape", "clear_status", "Clear message", priority=True),
     ]
 
@@ -231,7 +222,7 @@ class WelcomeScreen(ModalScreen[Optional[UserProfile]]):
         config: Optional[FirebaseConfig] = None,
         store: Optional[ProfileStore] = None,
         auth: Optional[FirebaseGoogleAuth] = None,
-        countdown: float = DEFAULT_COUNTDOWN,     # unused, kept for compat
+        countdown: float = DEFAULT_COUNTDOWN,
         timeout: float = DEFAULT_TIMEOUT,
         env_path: Optional[Any] = None,
         oauth: Optional[GoogleOAuthSignIn] = None,
@@ -271,10 +262,7 @@ class WelcomeScreen(ModalScreen[Optional[UserProfile]]):
         with Center():
             with Middle():
                 with Vertical(id="welcome"):
-                    yield Static(f"▌ {APP_TITLE.upper()}", id="welcome-title",
-                                 markup=True)
-                    yield Static("first run — sign in to continue",
-                                 id="welcome-sub", markup=True)
+                    yield CompactBanner("first run · sign in to continue")
                     yield Static(self._intro_text(), id="welcome-body",
                                  markup=True)
                     yield Static(self._method_pill(), id="welcome-method",
@@ -288,9 +276,10 @@ class WelcomeScreen(ModalScreen[Optional[UserProfile]]):
                         )
                     with Horizontal(id="welcome-buttons"):
                         yield Button("SIGN IN WITH GOOGLE  (G)", id="btn-google")
-                        yield Button("PASTE TOKEN  (T)", id="btn-token")
-                    yield Static("G sign in · T paste token · enter confirm",
-                                 id="welcome-hint", markup=True)
+                    yield Static(
+                        "G sign in  ·  T paste token (fallback)  ·  Esc clear",
+                        id="welcome-hint", markup=True,
+                    )
 
     def _intro_text(self) -> str:
         if self.config.is_usable_for_google:
@@ -310,8 +299,6 @@ class WelcomeScreen(ModalScreen[Optional[UserProfile]]):
         oauth = self.oauth_sign_in
         if oauth is not None and oauth.is_available:
             return "Google OAuth (installed-app flow)"
-        if oauth is not None:
-            return f"browser ({oauth.describe()})"
         return "browser (Firebase popup)"
 
     # ------------------------------------------------------------------
@@ -319,6 +306,10 @@ class WelcomeScreen(ModalScreen[Optional[UserProfile]]):
     # ------------------------------------------------------------------
 
     def on_mount(self) -> None:
+        try:
+            self.query_one("#welcome-input-row", Horizontal).display = False
+        except Exception:
+            pass
         self._focus("#btn-google")
         if self.config.is_usable_for_google:
             self._status(
@@ -327,15 +318,13 @@ class WelcomeScreen(ModalScreen[Optional[UserProfile]]):
             )
         else:
             self._status(f"[{AMBER}]Google sign-in unavailable — see notes above.[/]")
-        # Keep focus cycling tidy.
         self.set_interval(0.25, self._ensure_focus)
 
     def _ensure_focus(self) -> None:
         if self._busy or self._done:
             return
         try:
-            focused = self.app.focused
-            if focused is None:
+            if self.app.focused is None:
                 self._focus("#btn-google")
         except Exception:
             pass
@@ -377,48 +366,21 @@ class WelcomeScreen(ModalScreen[Optional[UserProfile]]):
     # ------------------------------------------------------------------
 
     def action_clear_status(self) -> None:
-        """Escape only clears the status message — it cannot skip onboarding."""
         if self._busy:
             return
         self._status("")
 
     def action_manual(self) -> None:
+        """Reveal the paste-token fallback (hidden by default)."""
         if self._busy:
             return
         try:
             row = self.query_one("#welcome-input-row", Horizontal)
-            row.remove_class("hidden")
-            field = self.query_one("#welcome-input", Input)
-            field.focus()
+            row.display = True
+            self.query_one("#welcome-input", Input).focus()
         except Exception:
             return
-        self._status(f"[{AMBER}]Paste a Firebase ID token, then press enter.[/]")
-
-    def action_guest(self) -> None:
-        """
-        Continue without Google.
-
-        Saves a real, local-only guest identity (``uid == "local-guest"``,
-        ``signed_in == False``) so the first-run gate does not reappear and
-        no Gmail features are enabled for this install.
-        """
-        if self._busy or self._done:
-            return
-        self._set_busy(True, f"[{AMBER}]Setting up a local profile\u2026[/]")
-        try:
-            profile = guest_profile()
-            self.store.save(profile)
-            export_identity(profile, env_path=self._env_path)
-        except Exception as exc:
-            logger.error("Guest setup failed: %s", exc, exc_info=True)
-            self._set_busy(
-                False,
-                f"[{ERROR}]Could not continue as guest: {_esc(_one_line(exc))}[/]",
-            )
-            return
-        self._set_busy(False)
-        self._status(f"[{GREEN}]Continuing as {_esc(profile.display_name)}.[/]")
-        self._finish(profile)
+        self._status(f"[{AMBER}]Paste a Firebase ID token, then press Enter.[/]")
 
     async def action_sign_in(self) -> None:
         if self._busy:
@@ -429,7 +391,7 @@ class WelcomeScreen(ModalScreen[Optional[UserProfile]]):
             )
             return
 
-        # Preferred: google-auth-oauthlib installed-app flow.
+        # Preferred: installed-app OAuth, only when a Desktop client exists.
         if self.oauth_sign_in is not None and self.oauth_sign_in.is_available:
             if await self._run_sign_in(
                 self.auth.sign_in_with_google_oauth(
@@ -484,8 +446,6 @@ class WelcomeScreen(ModalScreen[Optional[UserProfile]]):
             if user.refresh_token:
                 self.store.save_tokens(user.tokens)
             profile = user_to_profile(user, self.store)
-            # Identity goes to the global env file, mirrored into os.environ,
-            # and broadcast to EnvManager subscribers.
             export_identity(profile, env_path=self._env_path)
         except Exception as exc:
             logger.error("Could not store profile: %s", exc, exc_info=True)
@@ -512,8 +472,6 @@ class WelcomeScreen(ModalScreen[Optional[UserProfile]]):
         event.stop()
         if event.button.id == "btn-google":
             await self.action_sign_in()
-        elif event.button.id == "btn-token":
-            self.action_manual()
 
     async def on_input_submitted(self, event: Input.Submitted) -> None:
         event.stop()
@@ -521,7 +479,7 @@ class WelcomeScreen(ModalScreen[Optional[UserProfile]]):
 
 
 # ======================================================================
-# FIRST-RUN GATE
+# FIRST-RUN GATE — exactly once per install
 # ======================================================================
 
 ENV_ENABLED = "DEPRESSION_ONBOARDING"
@@ -544,10 +502,12 @@ def should_onboard(
     environ: Optional[Mapping[str, str]] = None,
 ) -> bool:
     """
-    The first-run gate.
+    The first-run gate. True exactly once per install.
 
-    Shows the page only when: onboarding is not disabled, we are on a real
-    terminal, the app is not headless, and no profile exists yet.
+    A profile on disk is the source of truth: if `user.json` exists and
+    carries the onboarding marker, the welcome page is never shown again.
+    Deleting the profile (or setting DEPRESSION_ONBOARDING=force) is the
+    only way to see it a second time.
     """
     env = os.environ if environ is None else environ
     raw = (env.get(ENV_ENABLED) or "").strip().lower()
@@ -562,7 +522,21 @@ def should_onboard(
     if raw in FORCE_VALUES:
         return True
 
-    return profile_store.is_new_user()
+    profile = profile_store.load()
+    if profile is None:
+        # First run: no profile on disk at all.
+        return True
+    if profile.metadata.get(ONBOARDED_KEY):
+        # Explicitly marked complete — never ask again.
+        return False
+    # Legacy profile from before the marker existed: treat as onboarded
+    # and stamp it, so this only ever runs once.
+    try:
+        profile.metadata[ONBOARDED_KEY] = True
+        profile_store.save(profile)
+    except Exception:
+        pass
+    return False
 
 
 async def push_welcome_if_new_user(
@@ -570,7 +544,7 @@ async def push_welcome_if_new_user(
     *,
     store: Optional[ProfileStore] = None,
     config: Optional[FirebaseConfig] = None,
-    countdown: Optional[float] = None,      # unused, kept for compat
+    countdown: Optional[float] = None,
     timeout: Optional[float] = None,
     context_manager: Any = None,
     env_path: Optional[Any] = None,
@@ -619,6 +593,7 @@ __all__ = [
     "DEFAULT_COUNTDOWN",
     "ENV_ENABLED",
     "ENV_TIMEOUT",
+    "ONBOARDED_KEY",
     "WelcomeScreen",
     "can_show_tui",
     "first_run_instructions",

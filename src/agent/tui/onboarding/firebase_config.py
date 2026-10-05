@@ -76,6 +76,12 @@ FIREBASE_SDK_BASE = f"https://www.gstatic.com/firebasejs/{FIREBASE_SDK_VERSION}"
 
 CONFIG_FILENAME = "firebase.json"
 
+# Packaged, overridable default. A Firebase *web app* config is a public
+# identifier set (it ships inside every web app), so shipping one is
+# intentional and safe -- what must never ship is a service-account JSON.
+# Any user-supplied source below takes precedence over this file.
+PACKAGED_DEFAULT = "firebase_default.json"
+
 ENV_INLINE_JSON = (
     "DEPRESSION_FIREBASE_WEB_APP_CONFIG",
     "FIREBASE_WEB_APP_CONFIG",
@@ -333,17 +339,47 @@ def _read_json_file(path: Path) -> Optional[Dict[str, Any]]:
     return data if isinstance(data, dict) else None
 
 
+def _load_packaged_default() -> Optional[Dict[str, Any]]:
+    """
+    Read the bundled ``firebase_default.json``.
+
+    Uses ``importlib.resources`` so it also works from a zipped wheel, where
+    the file is not reachable as a real path on disk.
+    """
+    try:
+        from importlib.resources import files
+
+        raw = (files(__package__) / PACKAGED_DEFAULT).read_text(encoding="utf-8")
+        data = json.loads(raw)
+        return data if isinstance(data, dict) else None
+    except Exception as exc:
+        # A missing or unreadable default is not an error: it just means the
+        # user has to supply their own project (the offline path).
+        logger.debug("Packaged firebase default unavailable (%s): %s", PACKAGED_DEFAULT, exc)
+        return None
+
+
 def load_firebase_config(
     explicit: Optional[Mapping[str, Any]] = None,
     *,
     environ: Optional[Mapping[str, str]] = None,
     config_dir: Optional[Path] = None,
+    include_packaged_default: bool = True,
 ) -> FirebaseConfig:
     """
     Resolve the Firebase web config from the environment / disk.
 
     Never raises: a missing or broken config simply yields EMPTY_CONFIG so
     the caller can fall back to the offline path.
+
+    Resolution order (first hit wins):
+
+    1. an explicit mapping passed by the caller
+    2. ``FIREBASE_WEB_APP_CONFIG`` / ``DEPRESSION_FIREBASE_WEB_APP_CONFIG``
+    3. ``FIREBASE_CONFIG_FILE`` / ``DEPRESSION_FIREBASE_CONFIG_FILE``
+    4. individual ``FIREBASE_*`` env vars
+    5. ``<config_dir>/firebase.json`` (user-level, per machine)
+    6. the packaged ``firebase_default.json`` (shipped default)
     """
     env = os.environ if environ is None else environ
 
@@ -390,7 +426,17 @@ def load_firebase_config(
     directory = Path(config_dir) if config_dir is not None else get_config_dir(APP_NAME)
     data = _read_json_file(directory / CONFIG_FILENAME)
     if data:
-        return _config_from_mapping(data)
+        cfg = _config_from_mapping(data)
+        if cfg.is_configured:
+            return cfg
+
+    if include_packaged_default:
+        data = _load_packaged_default()
+        if data:
+            cfg = _config_from_mapping(data)
+            if cfg.is_configured:
+                logger.debug("Using the packaged firebase default project")
+                return cfg
 
     return EMPTY_CONFIG
 
@@ -402,5 +448,6 @@ __all__ = [
     "FIREBASE_SDK_BASE",
     "FIREBASE_SDK_VERSION",
     "FirebaseConfig",
+    "PACKAGED_DEFAULT",
     "load_firebase_config",
 ]

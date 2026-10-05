@@ -61,7 +61,6 @@ CALLBACK_PATH = "/callback"
 
 GOOGLE_PROVIDER = "google.com"
 
-# Firebase error codes worth a human sentence.
 _ERROR_HINTS = {
     "TOKEN_EXPIRED": "That token expired — sign in again.",
     "INVALID_ID_TOKEN": "Google did not return a valid Firebase token.",
@@ -151,10 +150,10 @@ _PAGE_TEMPLATE = """<!doctype html>
     font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   }}
   .card {{
-    width: min(420px, 92vw); border: 2px solid #00ff66; background: #031008;
+    width: min(440px, 92vw); border: 2px solid #00ff66; background: #031008;
     padding: 28px 24px; text-align: center; border-radius: 8px;
   }}
-  h1 {{ font-size: 18px; letter-spacing: 2px; margin: 0 0 6px; color: #88ffbb; }}
+  h1 {{ font-size: 16px; letter-spacing: 3px; margin: 0 0 6px; color: #88ffbb; }}
   p {{ font-size: 13px; color: #3d8c5c; margin: 0 0 18px; }}
   button {{
     width: 100%; padding: 12px 16px; font: inherit; font-weight: 700;
@@ -163,14 +162,15 @@ _PAGE_TEMPLATE = """<!doctype html>
   }}
   button:hover {{ background: #88ffbb; }}
   button[disabled] {{ opacity: .5; cursor: progress; }}
-  #msg {{ margin-top: 16px; font-size: 12px; min-height: 18px; color: #ffcc44; }}
+  #msg {{ margin-top: 16px; font-size: 12px; min-height: 18px; color: #ffcc44;
+          word-break: break-word; }}
   .ok {{ color: #00ff66; }}
   .err {{ color: #ff4466; }}
 </style>
 </head>
 <body>
   <div class="card">
-    <h1>{app_title}</h1>
+    <h1>{app_title_upper}</h1>
     <p>Google account &mdash; you can close this tab once you are back in the terminal.</p>
     <button id="go" onclick="signIn()">SIGN IN WITH GOOGLE</button>
     <div id="msg">starting&hellip;</div>
@@ -178,116 +178,148 @@ _PAGE_TEMPLATE = """<!doctype html>
 <script src="{sdk_base}/firebase-app-compat.js"></script>
 <script src="{sdk_base}/firebase-auth-compat.js"></script>
 <script>
-  const CONFIG = {config};
-  const STATE = {state};
+  const CONFIG   = {config};
+  const STATE    = {state};
   const CALLBACK = {callback};
   const msg = document.getElementById("msg");
   const btn = document.getElementById("go");
 
-  function say(text, cls) {{
-    msg.textContent = text;
-    msg.className = cls || "";
-  }}
+  function say(text, cls) {{ msg.textContent = text; msg.className = cls || ""; }}
 
-  firebase.initializeApp(CONFIG);
-  const auth = firebase.auth();
-  auth.setPersistence(firebase.auth.Auth.Persistence.LOCAL).catch(() => {{}});
-
-  async function post(payload) {{
-    payload.state = STATE;
-    const res = await fetch(CALLBACK, {{
+  // Fail fast if the CDN is blocked — otherwise nothing on this page works
+  // and the CLI just waits out its timeout.
+  if (typeof firebase === "undefined" || !firebase.initializeApp) {{
+    say("Firebase SDK failed to load — check your network / proxy.", "err");
+    fetch(CALLBACK, {{
       method: "POST",
       headers: {{ "Content-Type": "application/json" }},
-      body: JSON.stringify(payload),
-    }});
-    return res.ok;
+      body: JSON.stringify({{ state: STATE, error: "firebase-sdk-load-failed" }}),
+    }}).catch(function () {{}});
+  }} else {{
+    main();
   }}
 
-  async function deliver(result) {{
-    const user = result && result.user;
-    if (!user) {{
-      // getRedirectResult() hands back a result with no user when the
-      // redirect carried an error. Report it, or the CLI waits out its
-      // full timeout with nothing on screen.
-      const reason = (result && result.error && (result.error.message ||
-        result.error.code)) || "no user returned from Google";
-      await post({{ error: "auth/no-user: " + reason }});
-      say("sign-in failed: " + reason, "err");
-      btn.disabled = false;
-      return;
+  function main() {{
+    firebase.initializeApp(CONFIG);
+    const auth = firebase.auth();
+    auth.setPersistence(firebase.auth.Auth.Persistence.LOCAL).catch(function () {{}});
+
+    if (!CONFIG.authDomain) {{
+      say("authDomain missing — set FIREBASE_AUTH_DOMAIN.", "err");
     }}
-    say("verifying…", "ok");
-    const idToken = await user.getIdToken();
-    let refreshToken = "";
-    try {{
-      refreshToken = user.refreshToken ||
-        (user.stsTokenManager && user.stsTokenManager.refreshToken) || "";
-    }} catch (err) {{ refreshToken = ""; }}
-    await post({{
-      idToken: idToken,
-      refreshToken: refreshToken,
-      email: user.email || "",
-      displayName: user.displayName || "",
-      photoURL: user.photoURL || "",
-      providerId: (result.credential && result.credential.providerId) || "google.com",
-    }});
-    say("signed in — return to your terminal", "ok");
-    btn.disabled = true;
-  }}
 
-  // `report` decides whether the CLI hears about it. Redirect-resume runs
-  // without a user gesture, so a hard failure there must still be posted or
-  // the CLI blocks until its timeout.
-  async function fail(err, report) {{
-    const code = (err && err.code) || "auth/unknown";
-    const message = code + ": " + ((err && err.message) || "sign-in failed");
-    if (report !== false) {{
-      try {{ await post({{ error: message }}); }} catch (postErr) {{ /* page is going away */ }}
-    }}
-    say(message, "err");
-    btn.disabled = false;
-  }}
-
-  async function signIn() {{
-    btn.disabled = true;
-    say("waiting for Google…");
-    const provider = new firebase.auth.GoogleAuthProvider();
-    provider.setCustomParameters({{ prompt: "select_account" }});
-    try {{
-      await deliver(await auth.signInWithPopup(provider));
-    }} catch (err) {{
-      const code = (err && err.code) || "";
-      if (code === "auth/popup-blocked" ||
-          code === "auth/popup-closed-by-user" ||
-          code === "auth/operation-not-supported-in-this-environment") {{
-        say("redirecting…");
-        try {{
-          await auth.signInWithRedirect(provider);
-        }} catch (redirectErr) {{
-          // Otherwise the CLI blocks until its timeout with no explanation.
-          await fail(redirectErr);
-        }}
-      }} else {{
-        await fail(err);
+    async function post(payload) {{
+      payload.state = STATE;
+      try {{
+        const res = await fetch(CALLBACK, {{
+          method: "POST",
+          headers: {{ "Content-Type": "application/json" }},
+          body: JSON.stringify(payload),
+        }});
+        return res.ok;
+      }} catch (err) {{
+        say("could not reach the CLI: " + err, "err");
+        return false;
       }}
     }}
-  }}
 
-  // Redirect flow returns to this same page — hand the result over.
-  // Feature-detect the *public* method: the compat SDK exposes
-  // `getRedirectResult` only. The private `_getRedirectResult` is absent, so
-  // guarding on it made this block dead code and left the popup-blocked
-  // fallback with no way to resume.
-  (async function resumeRedirect() {{
-    if (typeof auth.getRedirectResult !== "function") return;
-    try {{
-      const result = await auth.getRedirectResult();
-      if (result) {{ btn.disabled = true; await deliver(result); }}
-      else {{ say("ready", "ok"); signIn(); }}
-    }} catch (err) {{
-      await fail(err);
+    async function deliver(result) {{
+      const user = result && result.user;
+      if (!user) {{
+        const reason = (result && result.error && (result.error.message ||
+          result.error.code)) || "no user returned from Google";
+        await post({{ error: "auth/no-user: " + reason }});
+        say("sign-in failed: " + reason, "err");
+        btn.disabled = false;
+        return;
+      }}
+      say("verifying\\u2026", "ok");
+      try {{
+        const idToken = await user.getIdToken();
+        const refreshToken =
+          user.refreshToken ||
+          (user.stsTokenManager && user.stsTokenManager.refreshToken) || "";
+        const ok = await post({{
+          idToken: idToken,
+          refreshToken: refreshToken,
+          email: user.email || "",
+          displayName: user.displayName || "",
+          photoURL: user.photoURL || "",
+          providerId: (result.credential && result.credential.providerId) || "google.com",
+        }});
+        if (ok) {{
+          say("signed in — return to your terminal", "ok");
+          btn.disabled = true;
+        }}
+      }} catch (err) {{
+        await post({{ error: "token-delivery-failed: " + err }});
+        say("could not deliver token: " + err, "err");
+        btn.disabled = false;
+      }}
     }}
-  }})();
+
+    async function fail(err, report) {{
+      const code = (err && err.code) || "auth/unknown";
+      const message = code + ": " + ((err && err.message) || "sign-in failed");
+      if (report !== false) {{
+        try {{ await post({{ error: message }}); }} catch (e) {{}}
+      }}
+      say(message, "err");
+      btn.disabled = false;
+    }}
+
+    async function signIn() {{
+      btn.disabled = true;
+      say("waiting for Google\\u2026");
+      const provider = new firebase.auth.GoogleAuthProvider();
+      provider.setCustomParameters({{ prompt: "select_account" }});
+      try {{
+        await deliver(await auth.signInWithPopup(provider));
+      }} catch (err) {{
+        const code = (err && err.code) || "";
+        // Popups blocked or unsupported → full-page redirect.
+        if (code === "auth/popup-blocked" ||
+            code === "auth/popup-closed-by-user" ||
+            code === "auth/operation-not-supported-in-this-environment" ||
+            code === "auth/web-storage-unsupported") {{
+          say("redirecting to Google\\u2026");
+          try {{
+            await auth.signInWithRedirect(provider);
+          }} catch (redirectErr) {{
+            await fail(redirectErr);
+          }}
+        }} else {{
+          await fail(err);
+        }}
+      }}
+    }}
+
+    // Resume after a redirect. Only auto-start the popup when we did NOT
+    // just come back from one — otherwise the page fires a popup before the
+    // user has clicked anything.
+    (async function resume() {{
+      if (typeof auth.getRedirectResult !== "function") {{
+        say("ready", "ok");
+        return;
+      }}
+      try {{
+        const result = await auth.getRedirectResult();
+        if (result && result.user) {{
+          btn.disabled = true;
+          await deliver(result);
+        }} else if (result && result.error) {{
+          await fail(result.error);
+        }} else {{
+          say("ready", "ok");
+        }}
+      }} catch (err) {{
+        await fail(err);
+      }}
+    }})();
+
+    // Expose for the button's onclick.
+    window.signIn = signIn;
+  }}
 </script>
 </body>
 </html>
@@ -315,6 +347,7 @@ def render_sign_in_page(
     """The HTML page served to the browser (exposed for tests)."""
     return _PAGE_TEMPLATE.format(
         app_title=app_title,
+        app_title_upper=app_title.upper(),
         sdk_base=FIREBASE_SDK_BASE,
         config=json.dumps(config.to_web_config()),
         state=json.dumps(state),
@@ -678,6 +711,7 @@ class FirebaseGoogleAuth:
         """
         Sign in with `google-auth-oauthlib`'s installed-app flow.
 
+        Only works with a Desktop OAuth client (`client_secrets.json`).
         `InstalledAppFlow.run_local_server()` owns its own loopback server, so
         the browser comes up on its own and nothing is copied out of it; the
         Google ID token is then exchanged for a Firebase session and verified

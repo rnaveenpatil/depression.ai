@@ -33,9 +33,11 @@ from agent.tui.theme import (
 )
 from agent.tui.widgets.aws_panel import AWSPanel
 from agent.tui.widgets.empty_banner import EmptyBanner
+from agent.tui.widgets.output_view import OutputView
+from agent.tui.widgets.plan_view import PlanView
+from agent.tui.widgets.profile_panel import ProfilePanel
 from agent.tui.widgets.sidebar import Sidebar
 from agent.tui.widgets.thinking import ThinkingIndicator
-from agent.tui.widgets.todo_panel import TodoPanel
 from agent.tui.widgets.tool_call import ToolCallWidget
 
 
@@ -46,7 +48,10 @@ MODE_ORDER = ["build", "plan"]
 DEFAULT_TURN_TIMEOUT = 900.0
 DEFAULT_AWS_REGION = "us-east-1"
 
-_PANEL_NAMES = ("llm", "aws", "context", "todo", "llmcost", "help")
+_PANEL_NAMES = ("llm", "aws", "profile", "context", "llmcost", "help")
+
+# Tools whose calls should be diff-aware in the transcript.
+_DIFF_TOOLS = {"write", "edit", "apply_patch", "filesystem", "patch"}
 
 
 def _esc(text: Any) -> str:
@@ -192,19 +197,6 @@ class ContextPanel(Vertical):
 # ======================================================================
 
 class LLMCostPanel(Vertical):
-    """
-    Live view of tokens, API calls, and cost.
-
-    Data sources (in priority order):
-      1. The active AgentLoop's LoopContext — per-query counters and the
-         live "duration" tick.
-      2. The coordinator's status dict — session totals (via
-         AgentCoordinator.get_status()).
-      3. The app's own reactives — last-resort fallback.
-
-    Polls once a second so duration updates while a query is running.
-    """
-
     DEFAULT_CSS = f"""
     LLMCostPanel {{
         width: 100%; height: auto;
@@ -226,19 +218,16 @@ class LLMCostPanel(Vertical):
 
     def compose(self) -> ComposeResult:
         yield Static(f"[bold {GREEN}]▌ LLM COST[/]", markup=True)
-
         yield Static("dir", classes="label")
         yield Static("", id="cost-dir", classes="value")
         yield Static("data", classes="label")
         yield Static("", id="cost-data", classes="value")
-
         yield Static("model", classes="label")
         yield Static("", id="cost-model", classes="value")
         yield Static("provider", classes="label")
         yield Static("", id="cost-provider", classes="value")
         yield Static("session", classes="label")
         yield Static("", id="cost-session", classes="value")
-
         yield Static("── this query ──", classes="head")
         yield Static("", id="cost-q-in",    classes="value")
         yield Static("", id="cost-q-out",   classes="value")
@@ -246,7 +235,6 @@ class LLMCostPanel(Vertical):
         yield Static("", id="cost-q-calls", classes="value")
         yield Static("", id="cost-q-tools", classes="value")
         yield Static("", id="cost-q-dur",   classes="value")
-
         yield Static("── session ──", classes="head")
         yield Static("", id="cost-s-in",    classes="value")
         yield Static("", id="cost-s-out",   classes="value")
@@ -258,12 +246,7 @@ class LLMCostPanel(Vertical):
 
     def on_mount(self) -> None:
         self.refresh_values()
-        # Poll once a second; the render is cheap and idempotent.
         self.set_interval(1.0, self.refresh_values)
-
-    # ------------------------------------------------------------------
-    # Data acquisition
-    # ------------------------------------------------------------------
 
     def _coordinator_status(self) -> dict:
         try:
@@ -280,11 +263,9 @@ class LLMCostPanel(Vertical):
         return {}
 
     def _loop_context(self) -> Any:
-        """Return the active loop's LoopContext if reachable, else None."""
         coord = getattr(self._app, "coordinator", None)
         if coord is None:
             return None
-
         agent = None
         try:
             fn = getattr(coord, "get_current_agent", None)
@@ -292,17 +273,14 @@ class LLMCostPanel(Vertical):
                 agent = fn()
         except Exception:
             agent = None
-
         if agent is None:
             for attr in ("build_agent", "plan_agent"):
                 candidate = getattr(coord, attr, None)
                 if candidate is not None:
                     agent = candidate
                     break
-
         if agent is None:
             return None
-
         loop = getattr(agent, "loop", None)
         if loop is None:
             return None
@@ -310,7 +288,6 @@ class LLMCostPanel(Vertical):
 
     @staticmethod
     def _num(obj: Any, *names: str) -> int:
-        """First present numeric attribute from `names`, else 0."""
         if obj is None:
             return 0
         for n in names:
@@ -347,10 +324,6 @@ class LLMCostPanel(Vertical):
                 return str(v)
         return default
 
-    # ------------------------------------------------------------------
-    # Query lifecycle
-    # ------------------------------------------------------------------
-
     def mark_query_start(self) -> None:
         self._query_start_ts = time.time()
         self._query_active = True
@@ -360,27 +333,15 @@ class LLMCostPanel(Vertical):
         self._query_active = False
         self.refresh_values()
 
-    # ------------------------------------------------------------------
-    # Render
-    # ------------------------------------------------------------------
-
     def refresh_values(self) -> None:
         status = self._coordinator_status()
         ctx = self._loop_context()
 
-        # ---------- environment ----------
-        project_dir = self._str(
-            status, "project_dir", "workspace_dir", "cwd", default=""
-        )
+        project_dir = self._str(status, "project_dir", "workspace_dir", "cwd", default="")
         data_dir = self._str(status, "data_dir", "home_dir", default="")
-        self._update(
-            "#cost-dir", f"[{TEXT}]{_esc(_shorten_path(project_dir))}[/]"
-        )
-        self._update(
-            "#cost-data", f"[{TEXT}]{_esc(_shorten_path(data_dir))}[/]"
-        )
+        self._update("#cost-dir", f"[{TEXT}]{_esc(_shorten_path(project_dir))}[/]")
+        self._update("#cost-data", f"[{TEXT}]{_esc(_shorten_path(data_dir))}[/]")
 
-        # ---------- model / provider / session ----------
         model = self._str(
             status, "model", "model_name",
             default=(
@@ -389,9 +350,8 @@ class LLMCostPanel(Vertical):
             ),
         )
         provider = self._str(status, "provider", "provider_name", default="—")
-        session_id = self._str(
-            status, "session_id", "session", "current_session_id", default="—"
-        )
+        session_id = self._str(status, "session_id", "session",
+                               "current_session_id", default="—")
         if len(model) > 30:
             model = model[:29] + "…"
         if len(session_id) > 16:
@@ -400,7 +360,6 @@ class LLMCostPanel(Vertical):
         self._update("#cost-provider", f"[{TEXT}]{_esc(provider)}[/]")
         self._update("#cost-session", f"[{TEXT}]{_esc(session_id)}[/]")
 
-        # ---------- this query ----------
         if ctx is not None:
             qi = self._num(ctx, "input_tokens", "prompt_tokens")
             qo = self._num(ctx, "output_tokens", "completion_tokens")
@@ -419,31 +378,17 @@ class LLMCostPanel(Vertical):
                 if self._query_active and self._query_start_ts else 0.0
             )
 
-        self._update(
-            "#cost-q-in", f"[{MUTED}]in[/]      [{TEXT}]{_fmt(qi)}[/]"
-        )
-        self._update(
-            "#cost-q-out", f"[{MUTED}]out[/]     [{TEXT}]{_fmt(qo)}[/]"
-        )
-        self._update(
-            "#cost-q-total", f"[{MUTED}]total[/]   [{GREEN}]{_fmt(qt)}[/]"
-        )
-        self._update(
-            "#cost-q-calls", f"[{MUTED}]api calls[/]  [{AMBER}]{_fmt(qc)}[/]"
-        )
-        self._update(
-            "#cost-q-tools", f"[{MUTED}]tool calls[/] [{TEXT}]{_fmt(qtools)}[/]"
-        )
-        self._update(
-            "#cost-q-dur", f"[{MUTED}]duration[/]  [{TEXT}]{qdur:.1f}s[/]"
-        )
+        self._update("#cost-q-in", f"[{MUTED}]in[/]      [{TEXT}]{_fmt(qi)}[/]")
+        self._update("#cost-q-out", f"[{MUTED}]out[/]     [{TEXT}]{_fmt(qo)}[/]")
+        self._update("#cost-q-total", f"[{MUTED}]total[/]   [{GREEN}]{_fmt(qt)}[/]")
+        self._update("#cost-q-calls", f"[{MUTED}]api calls[/]  [{AMBER}]{_fmt(qc)}[/]")
+        self._update("#cost-q-tools", f"[{MUTED}]tool calls[/] [{TEXT}]{_fmt(qtools)}[/]")
+        self._update("#cost-q-dur", f"[{MUTED}]duration[/]  [{TEXT}]{qdur:.1f}s[/]")
 
-        # ---------- session ----------
         si = self._num(status, "input_tokens", "prompt_tokens", "total_input_tokens")
         so = self._num(status, "output_tokens", "completion_tokens", "total_output_tokens")
         st = self._num(status, "tokens_used", "total_tokens") or (si + so)
         sc = self._num(status, "llm_calls", "api_calls", "total_llm_calls")
-
         tools_used = None
         if isinstance(status, dict):
             tools_used = status.get("tools_used") or status.get("tool_calls")
@@ -457,13 +402,9 @@ class LLMCostPanel(Vertical):
             stools = int(tools_used)
         if stools == 0:
             stools = self._num(status, "total_tool_calls", "tool_calls_total")
-
-        sturns = self._num(
-            status, "turn_count", "turns", "message_count", "messages"
-        )
+        sturns = self._num(status, "turn_count", "turns", "message_count", "messages")
         scost = self._flt(status, "cost", "total_cost", "cost_usd")
 
-        # Fall back to app reactives if status is empty.
         if st == 0:
             st = int(getattr(self._app, "tokens_used", 0) or 0)
         if scost == 0.0:
@@ -471,7 +412,6 @@ class LLMCostPanel(Vertical):
         if sturns == 0:
             sturns = int(getattr(self._app, "message_count", 0) or 0)
 
-        # Last resort: derive session from the live loop context.
         if st == 0 and ctx is not None:
             si = self._num(ctx, "input_tokens")
             so = self._num(ctx, "output_tokens")
@@ -479,24 +419,12 @@ class LLMCostPanel(Vertical):
             sc = self._num(ctx, "llm_calls")
             stools = stools or (len(getattr(ctx, "actions_taken", []) or []))
 
-        self._update(
-            "#cost-s-in", f"[{MUTED}]in[/]      [{TEXT}]{_fmt(si)}[/]"
-        )
-        self._update(
-            "#cost-s-out", f"[{MUTED}]out[/]     [{TEXT}]{_fmt(so)}[/]"
-        )
-        self._update(
-            "#cost-s-total", f"[{MUTED}]total[/]   [{GREEN}]{_fmt(st)}[/]"
-        )
-        self._update(
-            "#cost-s-calls", f"[{MUTED}]api calls[/]  [{AMBER}]{_fmt(sc)}[/]"
-        )
-        self._update(
-            "#cost-s-tools", f"[{MUTED}]tool calls[/] [{TEXT}]{_fmt(stools)}[/]"
-        )
-        self._update(
-            "#cost-s-turns", f"[{MUTED}]turns[/]     [{TEXT}]{_fmt(sturns)}[/]"
-        )
+        self._update("#cost-s-in", f"[{MUTED}]in[/]      [{TEXT}]{_fmt(si)}[/]")
+        self._update("#cost-s-out", f"[{MUTED}]out[/]     [{TEXT}]{_fmt(so)}[/]")
+        self._update("#cost-s-total", f"[{MUTED}]total[/]   [{GREEN}]{_fmt(st)}[/]")
+        self._update("#cost-s-calls", f"[{MUTED}]api calls[/]  [{AMBER}]{_fmt(sc)}[/]")
+        self._update("#cost-s-tools", f"[{MUTED}]tool calls[/] [{TEXT}]{_fmt(stools)}[/]")
+        self._update("#cost-s-turns", f"[{MUTED}]turns[/]     [{TEXT}]{_fmt(sturns)}[/]")
         self._update(
             "#cost-s-cost",
             f"[{MUTED}]cost[/]      [{GREEN_GLOW}]{_fmt_cost(scost)}[/]",
@@ -531,15 +459,15 @@ class HelpPanel(Vertical):
         yield Static("/model     open LLM panel + discover models", classes="help-row")
         yield Static("/models    discover models", classes="help-row")
         yield Static("/aws       open AWS panel", classes="help-row")
+        yield Static("/profile   open profile panel (signed-in user)", classes="help-row")
         yield Static("/context   open context panel", classes="help-row")
-        yield Static("/todo      open todo panel", classes="help-row")
         yield Static("/llmcost   open token + api cost panel", classes="help-row")
         yield Static("/plan      switch mode → plan", classes="help-row")
         yield Static("/build     switch mode → build", classes="help-row")
         yield Static("/clear     clear transcript", classes="help-row")
         yield Static("/quit      exit", classes="help-row")
         yield Static("Keys", classes="help-section")
-        yield Static("Tab        cycle mode (build ↔ plan)", classes="help-row")
+        yield Static("Tab        focus prompt / cycle mode", classes="help-row")
         yield Static("Ctrl+B     show / hide the sidebar", classes="help-row")
         yield Static("Esc        interrupt running agent (also denies modal)", classes="help-row")
         yield Static("e          expand / collapse the last tool block", classes="help-row")
@@ -721,13 +649,7 @@ class DepressionApp(App):
     #prompt.busy {{ color: {AMBER}; }}
     #mode-chip {{ height: 1; padding: 0 0 0 2; color: {MUTED}; background: {BG}; }}
     #hint {{ height: 1; padding: 0 0 0 2; color: {DIM}; background: {BG}; }}
-
-    #token-bar {{
-        height: 1;
-        padding: 0 0 0 2;
-        background: {BG};
-    }}
-
+    #token-bar {{ height: 1; padding: 0 0 0 2; background: {BG}; }}
     #thinking-bar {{ height: 1; background: {BG}; }}
     """
 
@@ -738,7 +660,9 @@ class DepressionApp(App):
         Binding("escape", "interrupt", "Interrupt", priority=False),
         Binding("ctrl+l", "clear", "Clear", priority=True),
         Binding("ctrl+b", "toggle_sidebar", "Sidebar", priority=True),
-        Binding("tab", "cycle_mode", "Mode", priority=True),
+        # Tab is context-aware: if the prompt lost focus, it returns focus
+        # to the prompt instead of switching mode. See action_tab_or_mode.
+        Binding("tab", "tab_or_mode", "Mode", priority=True),
         Binding("e", "toggle_expand_tool", "Expand", priority=False),
     ]
 
@@ -763,7 +687,6 @@ class DepressionApp(App):
         self.cfg = load_runtime_config()
         self.aws = get_aws_credentials()
 
-        # Signed-in user (for the banner).
         self._user_name: str = ""
 
         self.busy = False
@@ -773,6 +696,9 @@ class DepressionApp(App):
         self._draining = False
         self._is_shutting_down = False
         self._has_messages = False
+
+        # One PlanView per conversation; re-rendered in place.
+        self._plan_view: Optional[PlanView] = None
 
         try:
             self.turn_timeout = float(
@@ -784,6 +710,9 @@ class DepressionApp(App):
         self._events = EventBridge()
         self._event_handlers_registered = False
         self._active_tool_widget: Optional[ToolCallWidget] = None
+
+        # Guard so the on_key focus-reclaim doesn't fire during compose.
+        self._mounted = False
 
     # ------------------------------------------------------------------
     # COMPOSE
@@ -801,8 +730,8 @@ class DepressionApp(App):
                 panels=[
                     ("llm", LLMPanel(self, id="panel-llm")),
                     ("aws", AWSPanel(self, id="panel-aws")),
+                    ("profile", ProfilePanel(id="panel-profile")),
                     ("context", ContextPanel(self, id="panel-context")),
-                    ("todo", TodoPanel(app_ref=self, id="panel-todo")),
                     ("llmcost", LLMCostPanel(self, id="panel-llmcost")),
                     ("help", HelpPanel(id="panel-help")),
                 ],
@@ -815,7 +744,7 @@ class DepressionApp(App):
                 yield Input(placeholder="ask the agent…", id="prompt")
             yield Static(self._mode_chip(), id="mode-chip", markup=True)
             yield Static(
-                f"[{DIM}]tab mode  ·  ctrl+b sidebar  ·  esc interrupt  ·  "
+                f"[{DIM}]tab focus/mode  ·  ctrl+b sidebar  ·  esc interrupt  ·  "
                 f"e expand  ·  ctrl+q quit[/]",
                 id="hint", markup=True,
             )
@@ -855,8 +784,6 @@ class DepressionApp(App):
 
         self._wire_events()
 
-        # Show the signed-in user from the env immediately, so the banner
-        # is correct on every launch (not just the first one).
         self._load_identity_from_env()
 
         self.query_one("#prompt", Input).focus()
@@ -864,11 +791,12 @@ class DepressionApp(App):
         self._refresh_token_bar()
         self._refresh_llmcost_panel()
 
-        # First run on this install: welcome page + Gmail sign-in.
+        # Mark mounted; from here on, the on_key safety net is live.
+        self._mounted = True
+
         self.call_later(self._maybe_onboard)
 
     def _load_identity_from_env(self) -> None:
-        """Read the stored identity from the env (global file, live copy)."""
         try:
             name = (
                 _os.environ.get("DEPRESSION_USER_NAME")
@@ -884,16 +812,18 @@ class DepressionApp(App):
             except Exception:
                 pass
             self._refresh_mode_chip()
+            self._refresh_banner_welcome()
+
+    def _refresh_banner_welcome(self) -> None:
+        try:
+            banner = self.query_one("#empty-banner", EmptyBanner)
+            banner.set_welcome(self._user_name)
+        except Exception:
+            pass
 
     async def _maybe_onboard(self) -> None:
-        """
-        First run: show the welcome/login page (blocks until signed in).
-        Later runs: silently re-expose the stored identity.
-        """
         from agent.tui.onboarding.welcome import push_welcome_if_new_user
 
-        # Disable the prompt while the gate is up so keystrokes can't
-        # race past onboarding.
         prompt = None
         try:
             prompt = self.query_one("#prompt", Input)
@@ -913,9 +843,12 @@ class DepressionApp(App):
                 try:
                     prompt.disabled = False
                     prompt.placeholder = "ask the agent…"
-                    prompt.focus()
                 except Exception:
                     pass
+            # Robust refocus: the first attempt runs before Textual finishes
+            # recomposing after the modal dismisses; the delayed one catches
+            # the case where the first landed mid-rebuild.
+            self._refocus_prompt()
 
     def _context_manager(self) -> Any:
         try:
@@ -930,7 +863,6 @@ class DepressionApp(App):
         return None
 
     def _sync_identity(self, profile: Any) -> None:
-        """Reflect the signed-in user in the UI and refresh dependent panels."""
         name = ""
         try:
             name = getattr(profile, "display_name", "") or ""
@@ -961,6 +893,11 @@ class DepressionApp(App):
             self._refresh_mode_chip()
         except Exception:
             pass
+        self._refresh_banner_welcome()
+        try:
+            self.query_one("#panel-profile", ProfilePanel).refresh_profile()
+        except Exception:
+            pass
 
     def _wire_events(self) -> None:
         if self._event_handlers_registered:
@@ -976,6 +913,76 @@ class DepressionApp(App):
         except Exception as exc:
             self._error(f"event wiring failed: {exc}")
 
+    # ------------------------------------------------------------------
+    # CHAT BAR FOCUS SAFETY
+    # ------------------------------------------------------------------
+
+    def _refocus_prompt(self) -> None:
+        """
+        Bring focus back to the prompt. Textual can silently drop a focus()
+        call that lands mid-recompose, so we schedule it for after the next
+        refresh and try again shortly afterwards.
+        """
+        def _do() -> None:
+            try:
+                prompt = self.query_one("#prompt", Input)
+                if not prompt.disabled and not prompt.has_focus:
+                    prompt.focus()
+            except Exception:
+                pass
+
+        try:
+            self.call_after_refresh(_do)
+            self.set_timer(0.05, _do)
+        except Exception:
+            _do()
+
+    def on_key(self, event) -> None:
+        """
+        Safety net: if the user types a printable character while focus is
+        not on the prompt (and no modal is up), send it to the prompt
+        instead of dropping it — matches terminal behaviour.
+        """
+        if not self._mounted:
+            return
+        try:
+            if isinstance(self.screen, PermissionModal):
+                return
+            if self._is_shutting_down:
+                return
+            prompt = self.query_one("#prompt", Input)
+            if prompt.disabled or prompt.has_focus:
+                return
+
+            key = event.key
+            if key is None:
+                return
+
+            # Single printable character.
+            if len(key) == 1 and key.isprintable() and key != " ":
+                prompt.focus()
+                prompt.insert_text_at_cursor(key)
+                event.stop()
+                return
+            # Space is a named key.
+            if key == "space":
+                prompt.focus()
+                prompt.insert_text_at_cursor(" ")
+                event.stop()
+                return
+            # Navigation / editing keys: just focus and let the next event
+            # reach the now-focused input.
+            if key in ("backspace", "delete", "left", "right", "home", "end"):
+                prompt.focus()
+                event.stop()
+                return
+        except Exception:
+            pass
+
+    # ------------------------------------------------------------------
+    # AGENT EVENTS
+    # ------------------------------------------------------------------
+
     async def _on_tool_event(self, event: AgentEvent) -> None:
         if self._is_shutting_down:
             return
@@ -989,6 +996,10 @@ class DepressionApp(App):
         cached = bool(data.get("cached"))
         duration = data.get("execution_time")
 
+        # Snapshot the file before the tool ran, in case the tool doesn't
+        # return a `before` — lets the tool card render a real diff.
+        before_snapshot = self._snapshot_before(tool, params)
+
         try:
             transcript = self.query_one("#transcript", VerticalScroll)
         except Exception:
@@ -999,6 +1010,36 @@ class DepressionApp(App):
         widget = ToolCallWidget(tool=tool, params=params)
         await transcript.mount(widget)
         widget.set_running(execution_time=duration)
+
+        # Inject before/after into the result so _render_diff fires.
+        if isinstance(result, dict) and tool in _DIFF_TOOLS:
+            r = dict(result)
+            if not (r.get("before") or r.get("content_before")):
+                if before_snapshot:
+                    r["before"] = before_snapshot
+            if not (r.get("after") or r.get("content_after") or r.get("new_content")):
+                for key in ("content", "new_content", "text", "output"):
+                    v = r.get(key)
+                    if isinstance(v, str) and v:
+                        r["after"] = v
+                        break
+                if not r.get("after"):
+                    try:
+                        from pathlib import Path
+                        path = (
+                            params.get("path") or params.get("filePath")
+                            or params.get("file") or params.get("filename")
+                        )
+                        if path:
+                            p = Path(str(path)).expanduser()
+                            if p.is_file():
+                                r["after"] = p.read_text(
+                                    encoding="utf-8", errors="replace"
+                                )
+                    except Exception:
+                        pass
+            result = r
+
         widget.set_result(
             result if isinstance(result, dict) else {"success": True, "result": result},
             execution_time=duration,
@@ -1021,6 +1062,30 @@ class DepressionApp(App):
         except Exception:
             pass
 
+    @staticmethod
+    def _snapshot_before(tool: str, params: dict) -> str:
+        """Read the file the tool is about to write, so we can show a diff."""
+        try:
+            if tool not in _DIFF_TOOLS:
+                return ""
+            path = (
+                params.get("path") or params.get("filePath")
+                or params.get("file") or params.get("filename")
+            )
+            if not path:
+                return ""
+            from pathlib import Path
+            p = Path(str(path)).expanduser()
+            if not p.is_file():
+                return ""
+            return p.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            return ""
+
+    # ------------------------------------------------------------------
+    # PLAN
+    # ------------------------------------------------------------------
+
     async def _on_plan_updated(self, event: AgentEvent) -> None:
         if self._is_shutting_down:
             return
@@ -1029,76 +1094,59 @@ class DepressionApp(App):
         render_inline = bool(data.get("render", True))
         if not entries:
             return
-
-        # 1. Push items directly into the panel so it renders even if the
-        #    session-key lookup would miss.
-        pushed = []
-        prio_map = {"high": 1, "medium": 3, "low": 5}
-        for e in entries:
-            status = str(e.get("status") or "pending").lower()
-            if status in ("completed", "done"):
-                status = "done"
-            elif status in ("in_progress", "running"):
-                status = "in_progress"
-            pushed.append({
-                "title": str(e.get("content") or "")[:120],
-                "status": status,
-                "priority": prio_map.get(str(e.get("priority") or "medium"), 3),
-            })
-        try:
-            self.query_one("#panel-todo", TodoPanel).set_items(pushed)
-        except Exception:
-            pass
-
-        # 2. Also seed the TodoTool store so other readers see it.
-        try:
-            from agent.tools.todo import TodoTool, TodoItem
-            session = self._session()
-            sid = TodoTool._session_key(session)
-            store = TodoTool._strong_keys.setdefault(sid, {})
-            store.clear()
-            for i, item in enumerate(pushed):
-                tid = f"plan_{i}"
-                store[tid] = TodoItem(
-                    id=tid,
-                    title=item["title"],
-                    status=item["status"],
-                    priority=item["priority"],
-                )
-        except Exception:
-            pass
-
         if not render_inline:
             return
 
-        self._show_transcript()
-        self._write(self._render_plan_block(entries), "agent", markup=True)
+        normalised = self._normalise_plan_entries(entries)
+        if not normalised:
+            return
 
-    def _render_plan_block(self, entries: list) -> str:
-        glyph_map = {
-            "pending":     ("○", MUTED),
-            "in_progress": ("▶", AMBER),
-            "completed":   ("●", GREEN),
-            "done":        ("●", GREEN),
-            "blocked":     ("◼", ERROR),
-            "cancelled":   ("✕", DIM),
-        }
-        lines = [f"[bold {GREEN}]▌ plan[/]"]
+        self._show_transcript()
+        await self._upsert_plan(normalised)
+
+    @staticmethod
+    def _normalise_plan_entries(entries: list) -> list:
+        out = []
         for e in entries:
             status = str(e.get("status") or "pending").lower()
             if status == "done":
                 status = "completed"
-            glyph, color = glyph_map.get(status, ("○", MUTED))
-            content = _esc(str(e.get("content") or ""))
-            if status in ("completed", "done"):
-                lines.append(
-                    f"[{color}]{glyph}[/] [{DIM}][strike]{content}[/strike][/]"
-                )
-            elif status == "in_progress":
-                lines.append(f"[{color}]{glyph}[/] [{GREEN_GLOW}]{content}[/]")
-            else:
-                lines.append(f"[{color}]{glyph}[/] [{TEXT}]{content}[/]")
-        return "\n".join(lines)
+            out.append({
+                "content": str(e.get("content") or "")[:160],
+                "status": status,
+                "priority": e.get("priority"),
+            })
+        return out
+
+    async def _upsert_plan(self, normalised: list) -> None:
+        try:
+            transcript = self.query_one("#transcript", VerticalScroll)
+        except Exception:
+            return
+        if self._plan_view is None:
+            self._plan_view = PlanView(entries=normalised)
+            await transcript.mount(self._plan_view)
+        else:
+            try:
+                self._plan_view.set_entries(normalised)
+            except Exception:
+                pass
+        self.call_after_refresh(lambda: transcript.scroll_end(animate=False))
+
+    def _plan_from_text(self, text: str) -> list:
+        """Extract a checklist from the assistant's reply, if any."""
+        try:
+            from agent.tui.onboarding.plan_parser import (
+                parse_plan_from_text, looks_like_plan,
+            )
+        except Exception:
+            return []
+        if not looks_like_plan(text):
+            return []
+        plan = parse_plan_from_text(text)
+        if plan is None or not plan.is_valid:
+            return []
+        return plan.to_list()
 
     # ------------------------------------------------------------------
     # TOKEN COUNTER
@@ -1190,7 +1238,7 @@ class DepressionApp(App):
                     pass
 
     # ------------------------------------------------------------------
-    # MODE CHIP  (with welcome <name>)
+    # MODE CHIP
     # ------------------------------------------------------------------
 
     def _mode_chip(self) -> str:
@@ -1212,7 +1260,6 @@ class DepressionApp(App):
         if self.queue_depth > 0:
             queue = f"  [{DIM}]·[/]  [{AMBER}]⧗ {self.queue_depth} queued[/]"
 
-        # The signed-in user, shown under the banner line.
         welcome = ""
         if self._user_name:
             short = self._user_name
@@ -1290,9 +1337,9 @@ class DepressionApp(App):
             self._refresh_aws_status()
         if which == "llmcost":
             self._refresh_llmcost_panel()
-        if which == "todo":
+        if which == "profile":
             try:
-                self.query_one("#panel-todo", TodoPanel)._refresh()
+                self.query_one("#panel-profile", ProfilePanel).refresh_profile()
             except Exception:
                 pass
 
@@ -1321,19 +1368,9 @@ class DepressionApp(App):
         return clean.replace("[", r"\[")
 
     def _strip_ctrl(self, text: str) -> str:
-        """Drop control characters but leave markup brackets intact."""
         return self._CTRL_RE.sub("", str(text))
 
     def _write(self, text: str, cls: str = "agent", markup: bool = False) -> None:
-        """Mount a line into the transcript.
-
-        By default ``text`` is treated as raw output: control characters are
-        stripped and ``[`` is escaped so tool/LLM output such as ``[INFO]``
-        or JSON ``[0]`` renders literally. Pass ``markup=True`` when the
-        caller has already built a Textual markup string (escaping its own
-        dynamic parts) -- brackets are then preserved so the styles show
-        instead of the raw tags leaking into the transcript.
-        """
         if self._is_shutting_down:
             return
         self._show_transcript()
@@ -1346,9 +1383,7 @@ class DepressionApp(App):
             transcript.mount(Static(safe, classes=cls, markup=True))
         except Exception:
             transcript.mount(Static(str(text), classes=cls, markup=False))
-        self.call_after_refresh(
-            lambda: transcript.scroll_end(animate=False)
-        )
+        self.call_after_refresh(lambda: transcript.scroll_end(animate=False))
 
     def _system(self, text: str) -> None:
         self._write(f"· {text}", "system")
@@ -1378,18 +1413,7 @@ class DepressionApp(App):
         except Exception:
             transcript.mount(Static(f"› {text}", classes="user", markup=False))
         self.message_count = self.message_count + 1
-        self.call_after_refresh(
-            lambda: transcript.scroll_end(animate=False)
-        )
-
-    def _agent_head(self) -> None:
-        self._write(f"[bold {GREEN}]◆ depression.ai[/]", "agent-head", markup=True)
-
-    def _refocus_prompt(self) -> None:
-        try:
-            self.query_one("#prompt", Input).focus()
-        except Exception:
-            pass
+        self.call_after_refresh(lambda: transcript.scroll_end(animate=False))
 
     # ------------------------------------------------------------------
     # INPUT / COMMANDS
@@ -1411,9 +1435,7 @@ class DepressionApp(App):
             self.queue_depth = len(self._prompt_queue)
             self._refresh_mode_chip()
             preview = text if len(text) <= 60 else text[:60] + "…"
-            self._queued(
-                f"queued ({len(self._prompt_queue)} ahead): {preview}"
-            )
+            self._queued(f"queued ({len(self._prompt_queue)} ahead): {preview}")
             return
 
         self.live_input_tokens = 0
@@ -1445,10 +1467,10 @@ class DepressionApp(App):
         elif command in ("/models", "/model"):
             self._show_panel("llm")
             self._discover_models()
+        elif command == "/profile":
+            self._show_panel("profile")
         elif command == "/context":
             self._show_panel("context")
-        elif command == "/todo":
-            self._show_panel("todo")
         elif command == "/llmcost":
             self._show_panel("llmcost")
         elif command == "/help":
@@ -1458,6 +1480,7 @@ class DepressionApp(App):
                 self.query_one("#transcript", VerticalScroll).remove_children()
             except Exception:
                 pass
+            self._plan_view = None
             self._has_messages = False
             try:
                 self.query_one("#empty-banner", EmptyBanner).display = True
@@ -1512,6 +1535,7 @@ class DepressionApp(App):
             self._schedule_drain()
             return
 
+        started = time.time()
         try:
             result = await asyncio.wait_for(
                 self.coordinator.process_query(
@@ -1530,15 +1554,22 @@ class DepressionApp(App):
                     or result.get("response")
                     or "task completed."
                 )
-                self._agent_head()
-                self._write(str(output), "agent")
+                await self._render_output(str(output), started)
+
+                # If the reply itself contained a checklist, mirror it into
+                # the same inline PlanView so the block grows instead of
+                # duplicating.
+                try:
+                    text_plan = self._plan_from_text(str(output))
+                    if text_plan:
+                        normalised = self._normalise_plan_entries(text_plan)
+                        if normalised:
+                            await self._upsert_plan(normalised)
+                except Exception:
+                    pass
 
                 ctx = result.get("context") or {}
-                tokens = (
-                    ctx.get("tokens_used")
-                    or result.get("tokens_used")
-                    or 0
-                )
+                tokens = ctx.get("tokens_used") or result.get("tokens_used") or 0
                 if tokens:
                     self.tokens_used = int(tokens)
                 cost = ctx.get("cost") or 0.0
@@ -1572,6 +1603,24 @@ class DepressionApp(App):
             except Exception:
                 pass
             self._schedule_drain()
+
+    async def _render_output(self, text: str, started: float) -> None:
+        if self._is_shutting_down:
+            return
+        self._show_transcript()
+        try:
+            transcript = self.query_one("#transcript", VerticalScroll)
+        except Exception:
+            return
+
+        elapsed = time.time() - started
+        meta = f"{elapsed:.2f}s"
+        try:
+            view = OutputView(text=text, header="◆ depression.ai", meta=meta)
+            await transcript.mount(view)
+        except Exception:
+            self._write(text, "agent")
+        self.call_after_refresh(lambda: transcript.scroll_end(animate=False))
 
     def _schedule_drain(self) -> None:
         if self._is_shutting_down:
@@ -1650,18 +1699,14 @@ class DepressionApp(App):
             return
         try:
             async with httpx.AsyncClient(timeout=20) as client:
-                headers = (
-                    {"Authorization": f"Bearer {key}"} if key else {}
-                )
+                headers = ({"Authorization": f"Bearer {key}"} if key else {})
                 response = await client.get(f"{url}/models", headers=headers)
                 response.raise_for_status()
                 models = response.json().get("data", [])
             ids = [str(m.get("id")) for m in models if m.get("id")]
             if ids:
                 self.query_one("#model-id", Input).value = ids[0]
-                status.update(
-                    f"discovered {len(ids)} model(s); selected {_esc(ids[0])}"
-                )
+                status.update(f"discovered {len(ids)} model(s); selected {_esc(ids[0])}")
                 self._system("models: " + ", ".join(ids[:12]))
             else:
                 status.update("/models returned no model IDs")
@@ -1681,21 +1726,13 @@ class DepressionApp(App):
 
     @on(Button.Pressed, "#aws-save")
     def save_aws(self) -> None:
-        """
-        Delegate to the panel's save_credentials(), which is the one path
-        that writes through EnvManager (updates os.environ + notifies
-        subscribers), then refresh local state and MCP config.
-        """
         panel = self.query_one("#panel-aws", AWSPanel)
         panel.start_radar()
-
         result = panel.save_credentials()
         if not result.get("ok"):
             panel.set_status(f"error: {_esc(result.get('error') or 'save failed')}")
             panel.start_trace(ok=False)
             return
-
-        # Reflect the new creds in the app.
         self.aws = get_aws_credentials()
         panel.refresh_values()
         panel.set_status(
@@ -1703,8 +1740,6 @@ class DepressionApp(App):
         )
         panel.start_scan(passes=2)
         panel.start_trace(ok=True)
-
-        # Best-effort MCP config refresh.
         note = ""
         try:
             from agent.mcp.aws_config import install_aws_preset_into_config
@@ -1727,23 +1762,13 @@ class DepressionApp(App):
                     note = " · MCP config updated (restart to apply)"
         except Exception as exc:
             note = f" · MCP config refresh skipped: {_esc(exc)}"
-
         panel.refresh_mcp_status()
         self._system(
             f"AWS credentials saved to ~/.agent/env "
             f"({self.aws.get('region') or DEFAULT_AWS_REGION}){note}"
         )
 
-    # ------------------------------------------------------------------
-    # AWS CHANGE HOOK
-    # ------------------------------------------------------------------
-
     def on_aws_changed(self) -> None:
-        """
-        Called by the AWS panel after creds change. Invalidates the loop's
-        system-prompt cache and reloads MCP with the new env.
-        """
-        # Invalidate the system prompt cache on both agents.
         if self.coordinator is not None:
             for attr in ("plan_agent", "build_agent"):
                 agent = getattr(self.coordinator, attr, None)
@@ -1758,8 +1783,6 @@ class DepressionApp(App):
                         loop._project_ctx_ts = 0.0
                     except Exception:
                         pass
-
-        # Best-effort MCP reload (async; fire and forget).
         try:
             if self.coordinator is not None:
                 for attr in ("plan_agent", "build_agent"):
@@ -1775,12 +1798,26 @@ class DepressionApp(App):
                     break
         except Exception:
             pass
-
         self._refresh_aws_status()
 
     # ------------------------------------------------------------------
     # KEYS
     # ------------------------------------------------------------------
+
+    def action_tab_or_mode(self) -> None:
+        """
+        Tab returns focus to the prompt if it lost it; otherwise it cycles
+        the mode. This keeps Tab usable for getting back to the chat bar
+        even when the prompt isn't focused.
+        """
+        try:
+            prompt = self.query_one("#prompt", Input)
+            if not prompt.disabled and not prompt.has_focus:
+                prompt.focus()
+                return
+        except Exception:
+            pass
+        self.action_cycle_mode()
 
     def action_interrupt(self) -> None:
         if isinstance(self.screen, PermissionModal):
@@ -1805,6 +1842,7 @@ class DepressionApp(App):
             self.query_one("#panel-llmcost", LLMCostPanel).mark_query_end()
         except Exception:
             pass
+        self._refocus_prompt()
 
     def action_cancel(self) -> None:
         if isinstance(self.screen, PermissionModal):
@@ -1832,6 +1870,7 @@ class DepressionApp(App):
             self.query_one("#transcript", VerticalScroll).remove_children()
         except Exception:
             pass
+        self._plan_view = None
         self._has_messages = False
         try:
             self.query_one("#empty-banner", EmptyBanner).display = True

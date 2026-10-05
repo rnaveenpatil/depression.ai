@@ -12,7 +12,10 @@
 [extend]
 useDefault = true
 
-[allowlist]
+# NOTE: gitleaks v8.19+ deprecated the singular `[allowlist]` table; it cannot be
+# combined with `[[allowlists]]`. Every exception below is therefore expressed
+# in the new plural form.
+[[allowlists]]
 description = "Fixtures, examples, and vendored trees that only contain non-secret placeholders."
 paths = [
   '''(^|/)(\.venv|venv|node_modules|site-packages|dist|build|egg-info)/''',
@@ -79,3 +82,68 @@ description = "PEM private key committed to the repository"
 regex = '''-----BEGIN (?:RSA |EC |OPENSSH |PGP )?PRIVATE KEY-----'''
 keywords = ["PRIVATE KEY"]
 secretGroup = 0
+
+[[rules]]
+id = "firebase-service-account"
+description = "Firebase/Google service-account JSON — bypasses Security Rules entirely. Must never be committed or shipped."
+regex = '''"type"\s*:\s*"service_account"'''
+keywords = ["service_account"]
+secretGroup = 0
+path = '''\.(json|py|ya?ml|toml|env)$'''
+
+[[rules]]
+id = "google-oauth-client-secret"
+description = "Google OAuth client secret (GOCSPX-…)"
+regex = '''\bGOCSPX-[A-Za-z0-9_-]{10,}'''
+keywords = ["GOCSPX-"]
+secretGroup = 0
+entropy = 3.0
+
+[[rules]]
+id = "llm-provider-api-key"
+description = "LLM provider API key by prefix (OpenAI/Anthropic/Perplexity/xAI/HuggingFace)"
+regex = '''\b(?:sk-ant-[A-Za-z0-9_-]{20,}|sk-(?:proj|svcacct|admin)-[A-Za-z0-9_-]{20,}|sk-[A-Za-z0-9]{40,}|pplx-[A-Za-z0-9]{40,}|xai-[A-Za-z0-9]{40,}|hf_[A-Za-z0-9]{30,})\b'''
+keywords = ["sk-ant-", "sk-proj-", "sk-svcacct-", "sk-", "pplx-", "xai-", "hf_"]
+secretGroup = 0
+entropy = 3.0
+
+# ---------------------------------------------------------------------------
+# The one intentional exception.
+#
+# src/agent/tui/onboarding/firebase_default.json ships a real Firebase *Web
+# app* config so a plain `pip install` has a working project. That config is a
+# public identifier set -- it is embedded in every web app that uses Firebase,
+# and Google documents it as an identifier rather than a secret. Actual
+# protection comes from Firebase Security Rules, the authorized-domain list,
+# and restricting which APIs the key may call.
+#
+# The exemption is pinned to that ONE path and that ONE value. A second key, a
+# service account, or a token added to this file is still reported, as is the
+# shipped key appearing in any other file.
+# ---------------------------------------------------------------------------
+[[allowlists]]
+description = "Shipped Firebase Web app config: public identifiers, one pinned path and one pinned value."
+path = '''^src/agent/tui/onboarding/firebase_default\.json$'''
+regexTarget = "secret"
+regexes = [
+  '''\bAIzaSyBITGCHjn2f_S1S5ExiwRa9DXSnbz_P9qQ\b''',
+]
+
+# Two narrow, self-referential exclusions. Each is pinned to one file AND one
+# exact literal, so any other credential in those files is still reported.
+[[allowlists]]
+description = "redact.py holds the PEM header as a DETECTION PATTERN, not as a key."
+path = '''^src/agent/utils/redact\.py$'''
+regexTarget = "match"
+regexes = [
+  '''-----BEGIN[A-Z ]*PRIVATE KEY-----''',
+]
+
+[[allowlists]]
+description = "google_oauth.py assigns an env-var NAME to a constant; the literal is not a secret."
+path = '''^src/agent/tui/onboarding/google_oauth\.py$'''
+regexTarget = "match"
+regexes = [
+  # matches the tail of `ENV_CLIENT_SECRET = "FIREBASE_OAUTH_CLIENT_SECRET"`
+  '''SECRET\s*=\s*"FIREBASE_OAUTH_CLIENT_SECRET"''',
+]

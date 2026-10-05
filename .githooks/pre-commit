@@ -18,29 +18,102 @@ STAGED=$(git diff --cached --name-only --diff-filter=ACM \
 [ -z "$STAGED" ] && exit 0
 
 fail=0
-# Obviously-synthetic markers permitted in fixtures/docs. Deliberately narrow:
-# a loose allowlist is what let the first leak through.
-FAKE_MARKERS='FAKE-NOT-A-REAL-KEY|REPLACE_?ME|YOUR_.*KEY|EXAMPLE|xxxxx|placeholder'
+# Obvious synthetic values. These are matched against the credential TOKEN
+# itself, never against the surrounding line -- a line-level exemption is
+# trivially defeated by writing the word "EXAMPLE" in a comment next to a real
+# key, which is how the previous version of this hook could be walked around.
+FAKE_VALUE_MARKERS='EXAMPLE|DUMMY|FAKE|REPLACE_?ME|xxxxx|placeholder|YOUR_|^<|\.\.\.$'
+
+# The one file that legitimately carries a real Firebase Web API key.
+#
+# A Firebase *web app* config is a public identifier set -- it is embedded in
+# every web app that uses Firebase and Google documents it as an identifier,
+# not a secret. Real protection comes from Security Rules, the authorized
+# domain list, and restricting which APIs the key may call.
+#
+# This is allowlisted by EXACT VALUE and EXACT PATH, never by broad directory:
+# a wildcard here would reopen the hole the original scan closed. The check
+# below still fails if this file contains ANY other credential shape, so a
+# service-account key or a second key cannot hide behind this exemption.
+SHIPPED_FIREBASE_FILE='src/agent/tui/onboarding/firebase_default.json'
+# The expected key is pinned by SHA-256, NOT read from the file being scanned.
+# Reading the worktree value would let a commit swap the key and approve itself:
+# the swapped value would simply become the "allowed" value. The digest is a
+# constant in this file, so changing the shipped key fails here and has to be a
+# deliberate, reviewed change in both this file and .gitleaks.toml.
+SHIPPED_FIREBASE_SHA256='3ae4293e9a5db24f3a891f08249449b84826d5287237ffd0f889cca5850b215c'
+pin_rc=0
+SHIPPED_FIREBASE_KEY=$(SHIPPED_FILE="$SHIPPED_FIREBASE_FILE" \
+  SHIPPED_SHA="$SHIPPED_FIREBASE_SHA256" python3 -c '
+import hashlib, json, os, sys
+path = os.environ["SHIPPED_FILE"]
+want = os.environ["SHIPPED_SHA"]
+try:
+    key = json.load(open(path))["apiKey"]
+except Exception:
+    sys.exit(0)  # no shipped key staged at all; nothing to allow
+if hashlib.sha256(key.encode()).hexdigest() != want:
+    print(
+        "BLOCKED: the shipped Firebase key in %s does not match the pinned\n"
+        "digest. Changing the shipped key is allowed, but it must be a\n"
+        "deliberate, reviewed change: update SHIPPED_FIREBASE_SHA256 here and\n"
+        "the allowlist in .gitleaks.toml in the same commit." % path,
+        file=sys.stderr,
+    )
+    sys.exit(2)
+print(key)
+') || pin_rc=$?
+if [ "$pin_rc" -eq 2 ]; then
+  exit 1
+fi
+# An empty value simply means the shipped key is absent, which leaves the
+# pattern un-exempted and therefore still enforced.
+SHIPPED_FIREBASE_KEY=${SHIPPED_FIREBASE_KEY:-}
 
 check() {
-  local name="$1" pattern="$2"
+  local name="$1" pattern="$2" allow_file="${3:-}" allow_value="${4:-}"
   # Read each staged blob as it will be committed, not the worktree version.
   while IFS= read -r file; do
-    if git show ":$file" 2>/dev/null | grep -nEI "$pattern" | grep -vEI "$FAKE_MARKERS" >/dev/null; then
+    local blob
+    # Scope the exemption to one exact file AND one exact value: the shipped
+    # Firebase Web API key is a public identifier, so only that literal is
+    # dropped from consideration -- and only for that one path. The removal is
+    # a literal string replace (not a regex), so no key can smuggle in regex
+    # metacharacters.
+    if [ -n "$allow_file" ] && [ "$file" = "$allow_file" ] && [ -n "$allow_value" ]; then
+      blob=$(git show ":$file" 2>/dev/null | ALLOW_VALUE="$allow_value" python3 -c '
+import os, sys
+allowed = os.environ.get("ALLOW_VALUE", "")
+sys.stdout.write(sys.stdin.read().replace(allowed, ""))
+' || true)
+    else
+      blob=$(git show ":$file" 2>/dev/null || true)
+    fi
+    # Extract the matching credential tokens, then drop only those tokens that
+    # are themselves obviously synthetic. Anything left is a real credential.
+    if [ -n "$(printf '%s' "$blob" | grep -oEI "$pattern" | grep -vEI "$FAKE_VALUE_MARKERS")" ]; then
       echo "BLOCKED: $name detected in staged $file"
-      git show ":$file" | grep -nEI "$pattern" | grep -vEI "$FAKE_MARKERS" | head -5
+      printf '%s' "$blob" | grep -nEI "$pattern" \
+        | grep -vEI "$(printf '%s' "$FAKE_VALUE_MARKERS" | sed 's/|/"/; s/$/"/')" \
+        | sed 's/\(.\{0,12\}\)[0-9A-Za-z_-]\{16,\}/\1...<redacted>/g' | head -5
       fail=1
     fi
   done <<< "$STAGED"
 }
 
-check "Google/Firebase API key" '\bAIza[0-9A-Za-z_-]{30,50}\b'
+check "Google/Firebase API key" '\bAIza[0-9A-Za-z_-]{30,50}\b' \
+      "$SHIPPED_FIREBASE_FILE" "$SHIPPED_FIREBASE_KEY"
+# Every other pattern still scans the shipped-config file: the exemption above
+# applies to the pinned apiKey literal only, never to a private key, an AWS
+# key, a token, or a second Firebase key.
 check "Groq API key"            '\bgsk_[0-9A-Za-z]{48,}\b'
 check "AWS access key id"       '\b(AKIA|ASIA)[0-9A-Z]{16}\b'
 check "GitHub token"            '\b(ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{30,}\b'
 check "GitHub fine-grained PAT" '\bgithub_pat_[A-Za-z0-9_]{40,}\b'
 check "Slack token"             '\bxox[baprs]-[A-Za-z0-9-]{10,}'
 check "Private key block"       'BEGIN (RSA |EC |OPENSSH )?PRIVATE KEY'
+check "Service account JSON"    '"type"[[:space:]]*:[[:space:]]*"service_account"'
+check "Google OAuth client secret" '\bGOCSPX-[A-Za-z0-9_-]{10,}'
 
 if [ "$fail" -ne 0 ]; then
   cat <<'EOF'

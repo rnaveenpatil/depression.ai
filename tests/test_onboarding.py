@@ -27,6 +27,7 @@ from agent.tui.onboarding.firebase_auth import (
 from agent.tui.onboarding.firebase_config import (
     FirebaseConfig,
     _config_from_mapping,
+    _load_packaged_default,
     load_firebase_config,
 )
 from agent.tui.onboarding.google_oauth import (
@@ -162,10 +163,78 @@ def test_config_accepts_snake_case_keys(tmp_path):
 
 
 def test_missing_config_is_empty_and_safe(tmp_path):
-    config = load_firebase_config(environ={}, config_dir=tmp_path)
+    # include_packaged_default=False isolates the "nothing configured" path:
+    # with no env var, no config file and no shipped default there is genuinely
+    # nothing to talk to, and the caller must fall back to the offline path.
+    config = load_firebase_config(
+        environ={}, config_dir=tmp_path, include_packaged_default=False
+    )
     assert not config.is_configured
     assert config.to_web_config() == {}
     assert "not configured" in config.describe()
+
+
+def test_packaged_default_is_used_when_nothing_else_is_set(tmp_path):
+    # The shipped default is the last resort, so a plain install has a working
+    # project without the user configuring one.
+    packaged = _load_packaged_default()
+    assert packaged, "firebase_default.json must ship with the package"
+    config = load_firebase_config(environ={}, config_dir=tmp_path)
+    assert config.is_configured
+    assert config.is_usable_for_google
+    assert config.api_key == packaged["apiKey"]
+    assert config.project_id == packaged["projectId"]
+
+
+def test_packaged_default_carries_no_secret_shaped_field():
+    # A Firebase *web app* config is public by design. What must never ship is
+    # a service-account key or an OAuth client secret, so assert on the shape
+    # rather than trusting the file by review alone.
+    packaged = _load_packaged_default()
+    assert packaged is not None
+    assert set(packaged) <= {
+        "apiKey", "authDomain", "projectId", "appId", "measurementId",
+    }
+    blob = json.dumps(packaged).lower()
+    for banned in (
+        "private_key", "service_account", "client_secret", "oauth_client_secret",
+        "refresh_token", "id_token", "-----begin",
+    ):
+        assert banned not in blob, f"packaged default must not contain {banned}"
+
+
+def test_env_overrides_packaged_default(tmp_path):
+    # The shipped default must never win over an explicit user configuration.
+    config = load_firebase_config(
+        environ={"FIREBASE_API_KEY": "user-supplied-key", "FIREBASE_PROJECT_ID": "mine"},
+        config_dir=tmp_path,
+    )
+    assert config.api_key == "user-supplied-key"
+    assert config.project_id == "mine"
+
+
+def test_user_config_file_overrides_packaged_default(tmp_path):
+    (tmp_path / "firebase.json").write_text(
+        json.dumps({"apiKey": "from-user-file", "authDomain": "u.firebaseapp.com"})
+    )
+    config = load_firebase_config(environ={}, config_dir=tmp_path)
+    assert config.api_key == "from-user-file"
+
+
+def test_broken_config_file_does_not_raise(tmp_path):
+    (tmp_path / "firebase.json").write_text("{not json")
+    assert (
+        load_firebase_config(
+            environ={}, config_dir=tmp_path, include_packaged_default=False
+        ).is_configured
+        is False
+    )
+
+
+def test_broken_config_file_falls_back_to_packaged_default(tmp_path):
+    (tmp_path / "firebase.json").write_text("{not json")
+    config = load_firebase_config(environ={}, config_dir=tmp_path)
+    assert config.is_configured is True
 
 
 def test_describe_masks_api_key(tmp_path):
@@ -178,11 +247,6 @@ def test_describe_masks_api_key(tmp_path):
     ).describe()
     assert WEB_CONFIG["api_key"] not in text
     assert "demo-project" in text
-
-
-def test_broken_config_file_does_not_raise(tmp_path):
-    (tmp_path / "firebase.json").write_text("{not json")
-    assert load_firebase_config(environ={}, config_dir=tmp_path).is_configured is False
 
 
 # ======================================================================
@@ -480,17 +544,23 @@ async def test_push_is_skipped_when_disabled(store, monkeypatch):
 # WELCOME SCREEN
 # ======================================================================
 
-async def test_welcome_screen_guest_saves_profile(store):
+async def test_welcome_screen_has_no_guest_bypass(store):
+    """Onboarding is a gate, not a suggestion (see welcome.py's docstring).
+
+    No keypress may persist a profile. In particular there must be no
+    "continue as guest" shortcut, because a saved profile is what later code
+    treats as proof that sign-in happened.
+    """
     app = _HostApp()
     async with app.run_test() as pilot:
         app.push_screen(WelcomeScreen(config=CONFIG, store=store, countdown=0))
         await pilot.pause()
-        await pilot.press("c")
-        await pilot.pause()
+        for key in ("c", "q", "x", "n", "escape", "t"):
+            await pilot.press(key)
+            await pilot.pause()
 
-    profile = store.load()
-    assert profile is not None
-    assert profile.signed_in is False
+    assert store.load() is None, "a keypress must not create a profile"
+    assert not store.profile_path.exists(), "no profile file may be written"
 
 
 async def test_welcome_screen_escape_skips(store):
@@ -1148,8 +1218,16 @@ def test_has_web_app_detects_the_web_app_id():
     assert cfg.has_web_app is True
 
 
-def test_oauth_flow_runs_from_a_bare_client_id(tmp_path, monkeypatch):
-    """No client_secrets.json anywhere — just the console's web client id."""
+def test_bare_web_client_id_alone_cannot_run_the_installed_app_flow(
+    tmp_path, monkeypatch
+):
+    """A Web client id must NOT be treated as usable for run_local_server().
+
+    Google requires every redirect URI to be pre-registered. The installed-app
+    flow calls ``run_local_server(port=0)``, which picks a random loopback
+    port, so a Web client id can only fail with ``redirect_uri_mismatch``.
+    The browser popup path (Firebase web config) is what handles Web clients.
+    """
     monkeypatch.delenv(ENV_CLIENT_SECRETS, raising=False)
     monkeypatch.delenv(ENV_CLIENT_SECRETS_ALT, raising=False)
     monkeypatch.chdir(tmp_path)
@@ -1157,36 +1235,19 @@ def test_oauth_flow_runs_from_a_bare_client_id(tmp_path, monkeypatch):
 
     cfg = _config_from_mapping(CONSOLE_EXPORT)
     oauth = GoogleOAuthSignIn(cfg.api_key, client_id=cfg.oauth_client_id)
-    assert oauth.is_available is True
+
     assert oauth.client_secrets is None
+    assert oauth.is_available is False, (
+        "a bare Web client id must not advertise the installed-app flow"
+    )
+    assert oauth.has_client is True, "the id is still known for diagnostics"
 
-    seen = {}
-
-    class _StubFlow:
-        @classmethod
-        def from_client_config(cls, client_config, scopes):
-            seen["client_id"] = client_config["installed"]["client_id"]
-            seen["redirect_uris"] = client_config["installed"]["redirect_uris"]
-            seen["scopes"] = list(scopes)
-            return cls()
-
-        def run_local_server(self, port=0, **kwargs):
-            seen["port"] = port
-            return _StubCredentials("google-token-2")
-
-    import agent.tui.onboarding.google_oauth as go
-
-    original = go._import_installed_app_flow
-    go._import_installed_app_flow = lambda: _StubFlow
-    try:
-        assert oauth.google_id_token() == "google-token-2"
-    finally:
-        go._import_installed_app_flow = original
-
-    assert seen["client_id"] == cfg.oauth_client_id
-    assert seen["redirect_uris"] == ["http://localhost"]
-    assert seen["port"] == 0
-    assert seen["scopes"][0] == "openid"
+    # The failure must be actionable, not a bare AttributeError later on.
+    with pytest.raises(Exception) as excinfo:
+        oauth.google_id_token()
+    message = str(excinfo.value)
+    assert "client_secrets.json" in message
+    assert "browser" in message.lower()
 
 
 def test_client_secrets_file_wins_over_the_bare_client_id(tmp_path):
@@ -1198,7 +1259,36 @@ def test_client_secrets_file_wins_over_the_bare_client_id(tmp_path):
         environ={},
     )
     assert oauth.client_secrets == secrets_file
-    assert oauth.client_id == ""
+    # The file is authoritative: the installed-app flow reads the client id
+    # from it via from_client_secrets_file, never from the passed-in value.
+    assert oauth.client_id == "ignored.apps.googleusercontent.com"
+
+    seen = {}
+
+    class _StubFlow:
+        @classmethod
+        def from_client_secrets_file(cls, path, scopes):
+            seen["path"] = path
+            seen["scopes"] = list(scopes)
+            return cls()
+
+        def run_local_server(self, port=0, **kwargs):
+            seen["port"] = port
+            return _StubCredentials("google-token-3")
+
+    import agent.tui.onboarding.google_oauth as go
+
+    original = go._import_installed_app_flow
+    go._import_installed_app_flow = lambda: _StubFlow
+    try:
+        assert oauth.google_id_token() == "google-token-3"
+    finally:
+        go._import_installed_app_flow = original
+
+    assert seen["path"] == str(secrets_file)
+    assert seen["scopes"][0] == "openid"
+    assert seen["port"] == 0
+
 
 
 def test_describe_mentions_both_ways_to_configure(tmp_path, monkeypatch):

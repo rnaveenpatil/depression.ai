@@ -39,7 +39,7 @@ from agent.utils.redact import redact
 from agent.agent.loop import AgentLoop
 from agent.agent.planner import Planner
 from agent.tools.registry import ToolRegistry, BaseTool
-from agent.agent.subagent import SubAgentManager
+from agent.agent.subagent import SubAgentManager, SubAgentRole
 from agent.plugins.loader import get_plugin_loader
 
 logger = get_logger(__name__)
