@@ -58,6 +58,10 @@ def _spawn():
     env = dict(os.environ)
     env["TERM"] = "xterm-256color"
     env["PYTHONUNBUFFERED"] = "1"
+    # Isolate from the developer's own login state: without this, a missing
+    # user.json makes the onboarding welcome screen swallow the modal this
+    # test drives, and the suite fails on any fresh machine or CI checkout.
+    env["DEPRESSION_ONBOARDING"] = "off"
     proc = subprocess.Popen(
         [sys.executable, "-u", "-c", DRIVER],
         stdin=slave,

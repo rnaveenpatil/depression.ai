@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "depression.ai"
-version = "1.0.3"
+version = "1.0.4"
 description = "AI agent for everything — development, deployment, and analysis"
 readme = "README.md"
 license = "MIT"

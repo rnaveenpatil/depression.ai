@@ -160,10 +160,14 @@ page below. `WelcomeScreen(enable_oauth=False)` disables the OAuth path.
 3. `WelcomeScreen` is pushed. Keys: `enter`/`g` sign in, `t` paste an ID token,
    `c` continue as guest, `esc` skip. A countdown (default 90s) auto-continues
    so a first launch can never hang.
-4. **Sign in with Google** starts a one-shot HTTP server on `127.0.0.1:<random>`
-   and opens your browser. Google shows the normal consent screen; the page
-   posts the Firebase `idToken` back to the loopback URL; the CLI verifies it
-   with `identitytoolkit/v1/accounts:lookup` and saves the profile.
+4. **Sign in with Google** starts a one-shot HTTP server on `localhost:<random>`
+   and opens your browser. The host must be the name `localhost` rather than
+   `127.0.0.1`, because Firebase matches the page origin against the project's
+   authorized-domain list and that list does not alias the literal IP — with
+   `127.0.0.1` the popup stalls on `__/auth/handler` and never reaches Google's
+   login page. Google shows the normal consent screen; the page posts the
+   Firebase `idToken` back to the loopback URL; the CLI verifies it with
+   `identitytoolkit/v1/accounts:lookup` and saves the profile.
 5. Stored files (both `0600`, next to `agent.db`):
 
    | file | contents |

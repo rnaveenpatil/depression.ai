@@ -286,7 +286,7 @@ async def test_callback_server_receives_token():
     auth = _auth()
     server, state_token, url = auth.start_callback_server()
     try:
-        assert url.startswith("http://127.0.0.1:")
+        assert url.startswith("http://localhost:")
         async with httpx.AsyncClient() as client:
             page = await client.get(url)
             response = await client.post(
@@ -1209,3 +1209,137 @@ def test_describe_mentions_both_ways_to_configure(tmp_path, monkeypatch):
     text = GoogleOAuthSignIn("API-KEY", environ={}).describe()
     assert "client_secrets.json" in text
     assert "FIREBASE_OAUTH_CLIENT_ID" in text
+
+
+# ======================================================================
+# REGRESSIONS: the three bugs that broke real browser sign-in
+# ======================================================================
+#
+# 1. The loopback server bound `127.0.0.1`. Firebase matches the page origin
+#    against the project's authorized-domain list, which names `localhost`
+#    and does *not* alias the literal IP. The popup therefore stalled on
+#    `__/auth/handler` and never reached Google's login page.
+# 2. `_OK_PAGE` / `_ERROR_PAGE` embed raw CSS braces, so `.format(message=…)`
+#    raised `KeyError: 'background'` — on the *success* path too — leaving the
+#    browser's fetch() hanging forever.
+# 3. The redirect-resume block guarded on `auth._getRedirectResult`, a private
+#    method the compat SDK does not expose, so the whole block was dead code
+#    and the popup-blocked fallback could never resume.
+
+from agent.tui.onboarding.firebase_auth import (  # noqa: E402
+    CALLBACK_PATH,
+    _CallbackServer,
+    _ERROR_PAGE,
+    _OK_PAGE,
+)
+
+
+def test_callback_server_binds_localhost_not_the_literal_ip():
+    """Firebase's authorized domains name `localhost`, never `127.0.0.1`."""
+    server = _CallbackServer("<html></html>", "tok")
+    try:
+        assert server._host == "localhost"
+        assert server._host != "127.0.0.1"
+        # `localhost` must still resolve to a loopback-only socket.
+        server.start()
+        host = server._server.server_address[0]
+        assert host in ("127.0.0.1", "::1"), host
+    finally:
+        server.stop()
+
+
+def test_served_urls_use_localhost_so_firebase_accepts_the_origin():
+    client = FirebaseGoogleAuth(_web_config(), opener=lambda url: None)
+    server, _token, url = client.start_callback_server()
+    try:
+        assert url.startswith("http://localhost:")
+        assert "127.0.0.1" not in url
+        assert "127.0.0.1" not in server.callback_url
+        assert server.callback_url.startswith("http://localhost:")
+        assert server.callback_url.endswith(CALLBACK_PATH)
+    finally:
+        server.stop()
+
+
+def test_result_pages_format_without_raising():
+    """Regression: raw CSS braces used to raise KeyError on both templates."""
+    assert "Signed in" in _OK_PAGE.format()
+    out = _ERROR_PAGE.format(message="popup blocked")
+    assert "popup blocked" in out
+    # The doubled braces must collapse back to real CSS, not leak "{{".
+    assert "{{" not in out and "}}" not in out
+    assert "background:#000" in out
+
+
+def test_success_page_is_served_verbatim(tmp_path):
+    """The POST that carries a valid token must get a complete 200 response."""
+    import httpx as _httpx
+
+    client = FirebaseGoogleAuth(_web_config(), opener=lambda url: None)
+    server, token, url = client.start_callback_server()
+    try:
+        response = _httpx.post(
+            url.rstrip("/") + CALLBACK_PATH,
+            json={"state": token, "idToken": "tok"},
+            timeout=10,
+        )
+        assert response.status_code == 200
+        assert "Signed in" in response.text
+        assert server.wait_for_payload(5)["idToken"] == "tok"
+    finally:
+        server.stop()
+
+
+def test_error_page_is_served_verbatim(tmp_path):
+    import httpx as _httpx
+
+    client = FirebaseGoogleAuth(_web_config(), opener=lambda url: None)
+    server, token, url = client.start_callback_server()
+    try:
+        response = _httpx.post(
+            url.rstrip("/") + CALLBACK_PATH,
+            json={"state": token, "error": "auth/popup-blocked"},
+            timeout=10,
+        )
+        assert response.status_code == 200
+        assert "auth/popup-blocked" in response.text
+        payload = server.wait_for_payload(5)
+        assert payload.get("error") == "auth/popup-blocked"
+    finally:
+        server.stop()
+
+
+def test_sign_in_page_does_not_depend_on_a_private_sdk_method():
+    """Regression: `auth._getRedirectResult` is absent in the compat SDK."""
+    html = render_sign_in_page(_web_config(), "http://localhost:1234/callback", "S")
+    # No *call* to the private method may survive (prose mentioning it is fine).
+    assert "auth._getRedirectResult" not in html
+    assert 'typeof auth.getRedirectResult !== "function"' in html
+    assert "auth.getRedirectResult()" in html
+
+
+def test_sign_in_page_reports_a_failed_redirect_instead_of_hanging():
+    """A throwing signInWithRedirect / failing resume must post an error."""
+    html = render_sign_in_page(_web_config(), "http://localhost:1234/callback", "S")
+    assert "catch (redirectErr)" in html
+    assert "await fail(redirectErr)" in html
+    # fail() itself posts, so the CLI is told rather than left waiting.
+    assert "async function fail(err, report)" in html
+    assert "await post({ error: message })" in html
+
+
+def test_sign_in_page_handles_a_redirect_result_with_no_user():
+    """getRedirectResult() can return a null user; that must not hang the CLI."""
+    html = render_sign_in_page(_web_config(), "http://localhost:1234/callback", "S")
+    assert "const user = result && result.user;" in html
+    assert "if (!user) {" in html
+    assert "auth/no-user" in html
+
+
+def _web_config() -> FirebaseConfig:
+    return FirebaseConfig(
+        api_key="AIzaTest",
+        auth_domain="depression-571e0.firebaseapp.com",
+        project_id="depression-571e0",
+        app_id="1:952406227868:web:44b56e6f1dbdec4d20e659",
+    )
