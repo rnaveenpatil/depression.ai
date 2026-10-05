@@ -1085,26 +1085,26 @@ async def test_welcome_screen_ignores_oauth_when_disabled(store, tmp_path, monke
 # ======================================================================
 
 CONSOLE_EXPORT = {
-    "project_number": "605436333256",
-    "project_id": "cloudsever-526fb",
-    "storage_bucket": "cloudsever-526fb.firebasestorage.app",
+    "project_number": "123456789012",
+    "project_id": "demo-project-000000",
+    "storage_bucket": "demo-project-000000.firebasestorage.app",
     "client": [
         {
-            "mobilesdk_app_id": "1:605436333256:android:845660f7f0469d382ce9fd",
-            "android_client_info": {"package_name": "com.cloud_saver"},
+            "mobilesdk_app_id": "1:123456789012:android:845660f7f0469d382ce9fd",
+            "android_client_info": {"package_name": "com.example.demoapp"},
             "oauth_client": [
                 {
-                    "client_id": "605436333256-mlsjpd19kcf4t3sattpkn2qi8r2f7b43"
+                    "client_id": "123456789012-mlsjpd19kcf4t3sattpkn2qi8r2f7b43"
                     ".apps.googleusercontent.com",
                     "client_type": 1,
                 },
                 {
-                    "client_id": "605436333256-vb1c874ngo36nrr2vp90hkcaihte4dh1"
+                    "client_id": "123456789012-vb1c874ngo36nrr2vp90hkcaihte4dh1"
                     ".apps.googleusercontent.com",
                     "client_type": 3,
                 },
             ],
-            "api_key": [{"current_key": "AIzaSyAZxE0wLjUSrZQR1Hou4qK5b_0qbE7QXmk"}],
+            "api_key": [{"current_key": "AIzaFAKE-NOT-A-REAL-KEY"}],
         }
     ],
 }
@@ -1114,13 +1114,13 @@ def test_console_export_yields_api_key_and_web_oauth_client(tmp_path):
     (tmp_path / "firebase.json").write_text(json.dumps(CONSOLE_EXPORT))
     cfg = load_firebase_config(environ={}, config_dir=tmp_path)
 
-    assert cfg.api_key == "AIzaSyAZxE0wLjUSrZQR1Hou4qK5b_0qbE7QXmk"
-    assert cfg.project_id == "cloudsever-526fb"
-    assert cfg.project_number == "605436333256"
-    assert cfg.storage_bucket == "cloudsever-526fb.firebasestorage.app"
+    assert cfg.api_key == "AIzaFAKE-NOT-A-REAL-KEY"
+    assert cfg.project_id == "demo-project-000000"
+    assert cfg.project_number == "123456789012"
+    assert cfg.storage_bucket == "demo-project-000000.firebasestorage.app"
     # The web client (client_type 3), never the Android one.
     assert cfg.oauth_client_id == (
-        "605436333256-vb1c874ngo36nrr2vp90hkcaihte4dh1.apps.googleusercontent.com"
+        "123456789012-vb1c874ngo36nrr2vp90hkcaihte4dh1.apps.googleusercontent.com"
     )
     assert cfg.is_usable_for_oauth is True
     # No Web app registered -> the browser page cannot be used yet.
@@ -1144,7 +1144,7 @@ def test_oauth_client_id_from_env_alone():
 
 
 def test_has_web_app_detects_the_web_app_id():
-    cfg = FirebaseConfig(api_key="k", app_id="1:605436333256:web:abc123")
+    cfg = FirebaseConfig(api_key="k", app_id="1:123456789012:web:abc123")
     assert cfg.has_web_app is True
 
 

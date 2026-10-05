@@ -1,0 +1,60 @@
+#!/usr/bin/env bash
+# Local pre-commit secret guard.
+#
+# Install once:
+#     git config core.hooksPath .githooks
+#
+# Kept dependency-free (no gitleaks required) so it always runs. It only
+# inspects staged content, so pre-existing history is not blocked.
+set -euo pipefail
+
+# Scanner/config files legitimately contain credential *patterns*. Skipping
+# them keeps the guard from blocking on its own detection regexes.
+STAGED=$(git diff --cached --name-only --diff-filter=ACM \
+  | grep -vE '^(docs/|\.github/|\.gitleaks\.toml|\.env\.example)$' \
+  | grep -vE '\.githooks/' \
+  | grep -vE 'src/agent/utils/redact\.py$' \
+  || true)
+[ -z "$STAGED" ] && exit 0
+
+fail=0
+# Obviously-synthetic markers permitted in fixtures/docs. Deliberately narrow:
+# a loose allowlist is what let the first leak through.
+FAKE_MARKERS='FAKE-NOT-A-REAL-KEY|REPLACE_?ME|YOUR_.*KEY|EXAMPLE|xxxxx|placeholder'
+
+check() {
+  local name="$1" pattern="$2"
+  # Read each staged blob as it will be committed, not the worktree version.
+  while IFS= read -r file; do
+    if git show ":$file" 2>/dev/null | grep -nEI "$pattern" | grep -vEI "$FAKE_MARKERS" >/dev/null; then
+      echo "BLOCKED: $name detected in staged $file"
+      git show ":$file" | grep -nEI "$pattern" | grep -vEI "$FAKE_MARKERS" | head -5
+      fail=1
+    fi
+  done <<< "$STAGED"
+}
+
+check "Google/Firebase API key" '\bAIza[0-9A-Za-z_-]{30,50}\b'
+check "Groq API key"            '\bgsk_[0-9A-Za-z]{48,}\b'
+check "AWS access key id"       '\b(AKIA|ASIA)[0-9A-Z]{16}\b'
+check "GitHub token"            '\b(ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{30,}\b'
+check "GitHub fine-grained PAT" '\bgithub_pat_[A-Za-z0-9_]{40,}\b'
+check "Slack token"             '\bxox[baprs]-[A-Za-z0-9-]{10,}'
+check "Private key block"       'BEGIN (RSA |EC |OPENSSH )?PRIVATE KEY'
+
+if [ "$fail" -ne 0 ]; then
+  cat <<'EOF'
+
+A credential is staged for commit. This repository is public, so a committed
+secret is a published secret.
+
+  - If the value is real: revoke/rotate it first, then commit a placeholder.
+  - If it is a test fixture: use an obviously fake value and make sure the
+    surrounding test does not assert on a live credential.
+
+To bypass deliberately (only for a known fake): git commit --no-verify
+EOF
+  exit 1
+fi
+
+exit 0

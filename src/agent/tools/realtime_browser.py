@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from agent.tools.registry import BaseTool
+from agent.tools.path_guard import OutputPathError, resolve_output_path
 from agent.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -119,6 +120,7 @@ class RealtimeBrowserTool(BaseTool):
         self.console_buffer: int = int(cfg.get("console_buffer", 500))
         self.network_buffer: int = int(cfg.get("network_buffer", 500))
         self.user_agent: Optional[str] = cfg.get("user_agent")
+        self.sandbox_root: Optional[str] = cfg.get("sandbox_root")
         self.viewport: Dict[str, int] = cfg.get(
             "viewport", {"width": 1280, "height": 800}
         )
@@ -484,7 +486,20 @@ class RealtimeBrowserTool(BaseTool):
             url = params.get("url", "")
             if not url:
                 return {"success": False, "error": "navigate requires 'url'"}
-            if not url.startswith(("http://", "https://", "file://", "about:")):
+            if url.startswith("file://"):
+                # file:// lets the model render arbitrary local files and read
+                # their contents back out of the resulting page.
+                try:
+                    target = Path(url[len("file://"):].split("?")[0]).resolve(
+                        strict=False
+                    )
+                except (OSError, ValueError) as e:
+                    return {"success": False, "error": f"invalid file URL: {e}"}
+                try:
+                    resolve_output_path(str(target), self.sandbox_root)
+                except OutputPathError as e:
+                    return {"success": False, "error": str(e)}
+            elif not url.startswith(("http://", "https://", "about:")):
                 url = "https://" + url
             await page.goto(
                 url, timeout=timeout, wait_until=params.get("wait_until", "domcontentloaded")
@@ -558,9 +573,13 @@ class RealtimeBrowserTool(BaseTool):
             }
 
         if action == "screenshot":
-            path = params.get("path") or f"screenshot_{int(time.time())}.png"
-            await page.screenshot(path=path, full_page=True)
-            return {"success": True, "path": os.path.abspath(path)}
+            raw = params.get("path") or f"screenshot_{int(time.time())}.png"
+            try:
+                path = resolve_output_path(raw, self.sandbox_root)
+            except OutputPathError as e:
+                return {"success": False, "error": str(e)}
+            await page.screenshot(path=str(path), full_page=True)
+            return {"success": True, "path": str(path)}
 
         if action == "eval":
             script = params.get("script", "")

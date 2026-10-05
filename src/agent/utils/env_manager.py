@@ -15,6 +15,7 @@ Public API:
 from __future__ import annotations
 
 import os
+import tempfile
 import threading
 from pathlib import Path
 from typing import Callable, Dict, List, Optional
@@ -112,6 +113,38 @@ def load_env_file(env_path: Optional[Path] = None) -> Dict[str, str]:
     return result
 
 
+def write_private_file(path: Path, content: str, mode: int = 0o600) -> None:
+    """Write ``content`` to ``path`` so it is never briefly world-readable.
+
+    ``write_text()`` then ``chmod()`` creates the file under the process
+    umask first, so a credential file is observable as ``0644`` for a window.
+    Writing to a ``0600`` temp file in the same directory and renaming it into
+    place makes the secret unreadable to other users for its whole lifetime.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(
+        dir=str(path.parent), prefix=f".{path.name}.", suffix=".tmp"
+    )
+    tmp = Path(tmp_name)
+    try:
+        os.fchmod(fd, mode)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(content)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise
+
+
 def write_env_file(
     env_vars: Dict[str, str],
     env_path: Optional[Path] = None,
@@ -137,13 +170,7 @@ def write_env_file(
         lines.append(f"{key}={value}")
 
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-        try:
-            path.chmod(0o600)
-        except OSError:
-            if strict:
-                raise
+        write_private_file(path, "\n".join(lines) + "\n", mode=0o600)
     except OSError:
         if strict:
             raise

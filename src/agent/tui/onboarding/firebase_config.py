@@ -20,7 +20,7 @@ shapes:
 
     {
       "project_id": "my-project",
-      "project_number": "605436333256",
+      "project_number": "123456789012",
       "storage_bucket": "my-project.firebasestorage.app",
       "api_key": [{ "current_key": "AIza…" }],
       "oauth_client": [

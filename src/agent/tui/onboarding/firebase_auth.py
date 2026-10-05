@@ -44,6 +44,7 @@ from agent.tui.onboarding.firebase_config import (
 )
 from agent.utils.errors import AgentError
 from agent.utils.logging import get_logger
+from agent.utils.redact import redact
 
 logger = get_logger(__name__)
 
@@ -424,7 +425,9 @@ def _make_handler(state: _CallbackState):
         # -- helpers -------------------------------------------------
 
         def log_message(self, fmt: str, *args: Any) -> None:  # noqa: A003
-            logger.debug("signin-http %s", fmt % args)
+            # The request line can carry idToken/refreshToken as query
+            # params, so it must never reach the log verbatim.
+            logger.debug("signin-http %s", redact(fmt % args))
 
         def _send(self, status: int, body: str, content_type: str = "text/html; charset=utf-8") -> None:
             payload = body.encode("utf-8")
@@ -635,7 +638,7 @@ class FirebaseGoogleAuth:
         self._require_config()
         server, _token, url = self.start_callback_server()
         try:
-            logger.info("Opening browser for Google sign-in: %s", url)
+            logger.info("Opening browser for Google sign-in: %s", redact(url))
             try:
                 self._open(url)
             except Exception as exc:
@@ -748,7 +751,7 @@ class FirebaseGoogleAuth:
                 {"idToken": id_token},
             )
         except OnboardingError as exc:
-            logger.debug("Remote sign-out failed (ignored): %s", exc)
+            logger.debug("Remote sign-out failed (ignored): %s", redact(str(exc)))
 
 
 __all__ = [

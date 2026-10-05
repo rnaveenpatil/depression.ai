@@ -72,10 +72,10 @@ uses:
 
 ```json
 {
-  "project_id": "cloudsever-526fb",
-  "project_number": "605436333256",
-  "storage_bucket": "cloudsever-526fb.firebasestorage.app",
-  "authDomain": "cloudsever-526fb.firebaseapp.com",
+  "project_id": "my-project",
+  "project_number": "123456789012",
+  "storage_bucket": "my-project.firebasestorage.app",
+  "authDomain": "my-project.firebaseapp.com",
   "api_key": [{ "current_key": "AIza…" }],
   "oauth_client": [
     { "client_id": "…android….apps.googleusercontent.com", "client_type": 1 },

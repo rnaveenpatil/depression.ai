@@ -2,12 +2,16 @@
 Permission Manager - Central authorization gate.
 
 Default policy (this build):
-    - ALLOW everything.
-    - ASK only when the action looks like a delete/destroy/removal.
-    - DENY .env file reads (hard-coded safety).
+    - DENY reads of secret files (.env and friends), resolved through symlinks.
+    - DENY writes/deletes under blocked system and credential directories.
+    - ASK only when the action looks like a delete/destroy/removal, or when a
+      configured policy says so.
+    - ALLOW everything else.
+    - Configured rules (``permissions``, ``filesystem`` blocks) are enforced by
+      real policy objects, not by a decorative no-op.
 
 Flow:
-    LLM  →  Tool/Command  →  PermissionManager  →  { Allow | Ask-if-delete | Deny-.env }
+    LLM  →  Tool/Command  →  PermissionManager  →  { Allow | Ask | Deny }
 """
 
 from __future__ import annotations
@@ -164,6 +168,72 @@ def _looks_destructive(tool: str, action: str, params: Dict[str, Any]) -> Tuple[
 
 
 # ======================================================================
+# SECRET-FILE DETECTION
+# ======================================================================
+
+# Filenames that never contain user secrets and stay readable.
+_ENV_ALWAYS_ALLOWED = {".env.example", ".env.sample", ".env.template"}
+
+# Command-ish params that can reach a secret file without a filesystem tool.
+_COMMAND_PARAMS = ("command", "cmd", "shell", "script", "input", "args")
+
+# Matches a secret filename used inside a shell command, e.g. ``cat .env``,
+# ``cat prod.env``, ``cat .env.production``, ``grep -r x .env.local``.
+_ENV_IN_COMMAND = re.compile(
+    r"(?<![A-Za-z0-9_.-])"
+    r"(\.env(?:\.[A-Za-z0-9_.-]+)?|[A-Za-z0-9_-]+\.env)"
+)
+
+
+def _basenames_are_secret(*names: str) -> bool:
+    """True when any candidate basename refers to a secrets file."""
+    for name in names:
+        if not name:
+            continue
+        low = name.lower()
+        if low in _ENV_ALWAYS_ALLOWED:
+            continue
+        if low == ".env" or low.startswith(".env.") or low.endswith(".env"):
+            return True
+    return False
+
+
+def _path_is_secret(path_str: str) -> bool:
+    """True when the path *or its symlink target* names a secrets file.
+
+    Checking only ``os.path.basename`` of the raw argument let a symlink
+    alias (``notes.txt -> .env``) walk straight past the guard, because the
+    read tool follows the link while the guard never resolved it.
+    """
+    if not path_str:
+        return False
+    try:
+        expanded = Path(os.path.expanduser(str(path_str)))
+    except (OSError, ValueError):
+        return False
+
+    names = [expanded.name]
+    try:
+        names.append(Path(os.path.realpath(expanded)).name)
+    except (OSError, ValueError):
+        pass
+    return _basenames_are_secret(*names)
+
+
+def _command_touches_secret(params: Dict[str, Any]) -> Optional[str]:
+    """Return the secret filename referenced by a command-ish param, if any."""
+    for key in _COMMAND_PARAMS:
+        val = params.get(key)
+        if not isinstance(val, str) or not val:
+            continue
+        for match in _ENV_IN_COMMAND.finditer(val):
+            candidate = match.group(1)
+            if _basenames_are_secret(candidate):
+                return candidate
+    return None
+
+
+# ======================================================================
 # POLICY BASE
 # ======================================================================
 
@@ -212,8 +282,8 @@ class PermissionManager:
         self._rules: Dict[str, str] = {}
         self._load_rules(cfg)
 
-        # No policy list is used — the manager decides directly.
         self.policies: List[Policy] = []
+        self._register_policies(cfg)
 
         # Session memory for "always allow this exact delete this session"
         self._session_allows: Dict[str, float] = {}
@@ -292,8 +362,22 @@ class PermissionManager:
         return best[1] if best else None
 
     def _register_policies(self, cfg: Dict[str, Any]) -> None:
-        # No policies. The manager handles everything directly.
-        return
+        """Instantiate the real policy objects.
+
+        Previously this returned immediately, so ``FilesystemPolicy`` and
+        ``RulesPolicy`` were never constructed and every configured rule was
+        silently ignored. Policies are imported lazily because they import
+        this module for the shared ``Policy``/``PermissionVerdict`` types.
+        """
+        from agent.permissions.filesystem import FilesystemPolicy
+        from agent.permissions.rules import RulesPolicy
+
+        if cfg.get("filesystem_enabled", True):
+            self.policies.append(
+                FilesystemPolicy(cfg.get("filesystem") or {})
+            )
+        self.policies.append(RulesPolicy(cfg))
+        logger.info("Registered %d permission policies", len(self.policies))
 
     def set_confirm_callback(
         self,
@@ -363,46 +447,43 @@ class PermissionManager:
     # ------------------------------------------------------------------
 
     async def evaluate(self, request: PermissionRequest) -> PermissionVerdict:
-        """
-        Default allow. The only overrides:
-          1. .env / *.env read → DENY
-          2. destructive action → ASK
+        """Resolve a permission request.
+
+        Precedence, strongest first:
+            1. Secret-file guard (DENY, symlink-resolved, not overridable)
+            2. Policy DENY verdicts
+            3. Session cache (previous user decision for this exact call)
+            4. Destructive-action guard (ASK)
+            5. Policy ASK / ALLOW verdicts
+            6. Flat config rules
+            7. Configured default
         """
 
         if not self.enabled:
             return PermissionVerdict.allow("permissions disabled")
 
-        # Session cache — a previous "always allow this delete" wins.
+        tool_l = (request.tool or "").lower()
+        action_l = (request.action or "").lower()
+
+        # --- 1. secret-file guard (hard deny, symlink-resolved) --------
+        secret = self._secret_verdict(request, tool_l, action_l)
+        if secret is not None:
+            return secret
+
+        # --- 2. policy DENY verdicts -----------------------------------
+        policy_verdicts = await self._collect_policy_verdicts(request)
+        denied = next(
+            (v for v in policy_verdicts if v.decision == Decision.DENY), None
+        )
+        if denied is not None:
+            return denied
+
+        # --- 3. session cache ------------------------------------------
         cached = self._check_session_cache(request)
         if cached is not None:
             return cached
 
-        tool_l = (request.tool or "").lower()
-        action_l = (request.action or "").lower()
-
-        # --- .env protection (hard deny) -----------------------------
-        if tool_l in ("read", "filesystem", "file") or action_l == "read":
-            target = (
-                request.params.get("path")
-                or request.params.get("filePath")
-                or request.params.get("file")
-                or ""
-            )
-            base = os.path.basename(str(target))
-            if base == ".env" or (base.startswith(".env.") and base != ".env.example"):
-                return PermissionVerdict.deny(
-                    f"default deny for .env: {target}",
-                    risk=RiskLevel.HIGH,
-                    policy="env_guard",
-                )
-            if base.endswith(".env") and base != ".env.example":
-                return PermissionVerdict.deny(
-                    f"default deny for {base}",
-                    risk=RiskLevel.HIGH,
-                    policy="env_guard",
-                )
-
-        # --- destructive action guard --------------------------------
+        # --- 4. destructive action guard --------------------------------
         destructive, why = _looks_destructive(
             request.tool, request.action, request.params
         )
@@ -413,7 +494,21 @@ class PermissionManager:
                 policy="delete_guard",
             )
 
-        # --- config rules (tool / tool.action / glob) ----------------
+        # --- 5. policy ASK / ALLOW verdicts -----------------------------
+        asked = next(
+            (v for v in policy_verdicts if v.decision == Decision.ASK), None
+        )
+        if asked is not None:
+            return asked
+
+        allowed = next(
+            (v for v in policy_verdicts if v.decision == Decision.ALLOW), None
+        )
+        if allowed is not None:
+            self.stats["auto_approved"] += 1
+            return allowed
+
+        # --- 6. config rules (tool / tool.action / glob) ----------------
         rule = self._rule_for(request)
         if rule == "deny":
             return PermissionVerdict.deny(
@@ -435,7 +530,7 @@ class PermissionManager:
                 policy="config",
             )
 
-        # --- default decision ----------------------------------------
+        # --- 7. default decision ----------------------------------------
         if self.default_decision == Decision.ASK:
             return PermissionVerdict.ask(
                 "default policy asks for confirmation",
@@ -456,6 +551,62 @@ class PermissionManager:
             risk=RiskLevel.SAFE,
             policy="default_allow",
         )
+
+    async def _collect_policy_verdicts(
+        self, request: PermissionRequest
+    ) -> List[PermissionVerdict]:
+        """Run every registered policy, keeping the ones that decided."""
+        verdicts: List[PermissionVerdict] = []
+        for policy in self.policies:
+            try:
+                verdict = await policy.evaluate(request)
+            except Exception as e:  # a broken policy must not fail open
+                logger.warning(
+                    "Permission policy %s raised %s — ignoring its verdict",
+                    getattr(policy, "name", policy), e,
+                )
+                continue
+            if verdict is not None:
+                verdicts.append(verdict)
+        return verdicts
+
+    @staticmethod
+    def _secret_verdict(
+        request: PermissionRequest,
+        tool_l: str,
+        action_l: str,
+    ) -> Optional[PermissionVerdict]:
+        """Deny any request that reads a secrets file.
+
+        Covers direct filesystem reads, symlink aliases pointing at a secrets
+        file, and shell commands that reference one (``cat .env``), which the
+        old basename-only check let through untouched.
+        """
+        is_read = (
+            action_l == "read"
+            or tool_l in ("read", "filesystem", "file", "fs")
+        )
+        if is_read:
+            for key in ("path", "filePath", "filepath", "file"):
+                target = request.params.get(key)
+                if target and _path_is_secret(str(target)):
+                    return PermissionVerdict.deny(
+                        f"denied read of secrets file: {target}",
+                        risk=RiskLevel.HIGH,
+                        policy="env_guard",
+                    )
+
+        leaked = _command_touches_secret(request.params)
+        if leaked is not None and (
+            is_read or tool_l in ("terminal", "bash", "shell", "execute") or
+            action_l in ("execute", "run", "shell")
+        ):
+            return PermissionVerdict.deny(
+                f"denied command referencing secrets file: {leaked}",
+                risk=RiskLevel.HIGH,
+                policy="env_guard",
+            )
+        return None
 
     # ------------------------------------------------------------------
     # USER CONFIRMATION (only reached for destructive ASK verdicts)
@@ -600,7 +751,7 @@ class PermissionManager:
             "auto_approve": self.auto_approve,
             "allow_dangerous": self.allow_dangerous,
             "default": self.default_decision.value,
-            "policies": [],
+            "policies": [getattr(p, "name", type(p).__name__) for p in self.policies],
             "session_allows": len(self._session_allows),
             "session_denies": len(self._session_denies),
             "stats": dict(self.stats),

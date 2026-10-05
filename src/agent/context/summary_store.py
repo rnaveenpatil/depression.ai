@@ -75,12 +75,22 @@ class SummaryStore:
         }
         path = self._path(session_id)
         try:
-            with open(path, "a", encoding="utf-8") as f:
+            # Create with the restrictive mode up front. Appending to an
+            # existing file and chmod-ing afterwards left it 0644 between the
+            # write and the chmod, and summaries can quote tool output.
+            existed = path.exists()
+            fd = os.open(
+                path,
+                os.O_WRONLY | os.O_CREAT | os.O_APPEND,
+                FILE_MODE,
+            )
+            with os.fdopen(fd, "a", encoding="utf-8") as f:
                 f.write(json.dumps(entry, default=str) + "\n")
-            try:
-                os.chmod(path, FILE_MODE)
-            except OSError:
-                pass
+            if not existed:
+                try:
+                    os.chmod(path, FILE_MODE)
+                except OSError:
+                    pass
         except Exception as exc:
             logger.warning("Failed to append summary for %s: %s", session_id, exc)
 

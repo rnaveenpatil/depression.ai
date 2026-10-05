@@ -79,6 +79,13 @@ class Database:
     def __init__(self, path: str | Path = "~/.agent/agent.db"):
         self.path = Path(os.path.expanduser(str(path)))
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        # The DB stores every tool call's params and results, which includes
+        # file contents and command output. Lock the directory down before
+        # sqlite creates the file so it is never born world-readable.
+        try:
+            os.chmod(self.path.parent, 0o700)
+        except OSError:
+            pass
         self._conn: Optional[sqlite3.Connection] = None
         self._lock = asyncio.Lock()
         self._initialized = False
@@ -92,8 +99,23 @@ class Database:
             return
         await asyncio.to_thread(self._open)
         await asyncio.to_thread(self._migrate)
+        self._harden_permissions()
         self._initialized = True
         logger.info(f"Database ready: {self.path}")
+
+    def _harden_permissions(self) -> None:
+        """Restrict the DB file (and WAL sidecars) to the owner.
+
+        sqlite creates ``agent.db`` under the process umask, which on a default
+        desktop is 0644 — world-readable conversation history and tool output.
+        """
+        for suffix in ("", "-wal", "-shm", "-journal"):
+            target = Path(str(self.path) + suffix)
+            if target.exists():
+                try:
+                    os.chmod(target, 0o600)
+                except OSError:
+                    pass
 
     def _open(self) -> None:
         self._conn = sqlite3.connect(
