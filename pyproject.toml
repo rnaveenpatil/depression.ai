@@ -4,9 +4,9 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "depression.ai"
-version = "1.0.4"
+version = "1.0.5"
 description = "AI agent for everything — development, deployment, and analysis"
-readme = "README.md"
+readme = "README.md"source deprssion/bin/activate
 license = "MIT"
 license-files = ["LICENSE"]
 authors = [{name = "rnaveenpatil", email = "rnaveenpatil@example.com"}]
@@ -63,12 +63,6 @@ Issues = "https://github.com/rnaveenpatil/depression.ai/issues"
 [tool.setuptools.packages.find]
 where = ["src"]
 exclude = ["tests*", "*.depression*"]
-
-# firebase_default.json is the shipped Firebase *web app* config (public
-# identifiers, not a secret). It must be included in the wheel, otherwise a
-# pip-installed package silently loses its default project.
-[tool.setuptools.package-data]
-"agent.tui.onboarding" = ["firebase_default.json"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
