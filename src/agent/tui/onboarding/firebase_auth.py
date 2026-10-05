@@ -3,9 +3,12 @@ Gmail (Google) sign-in for the terminal, on top of Firebase Auth.
 
 How it works
 ------------
-1. The CLI opens a short-lived HTTP server bound to `127.0.0.1` on a random
+1. The CLI opens a short-lived HTTP server bound to `localhost` on a random
    port and serves one page: a Firebase compat-SDK bootstrap using the
    project's *web* config (apiKey / authDomain / projectId / appId).
+   It must be the *name* `localhost`, not `127.0.0.1`: Firebase matches the
+   page origin against the project's authorized-domain list, which carries
+   `localhost` and does not alias `127.0.0.1` to it.
 2. The user's browser completes the normal Google consent screen, so Google
    sees an OAuth request from the authorized domain, never from the CLI.
 3. The page posts the resulting Firebase `idToken` (+ `refreshToken`) back to
@@ -200,8 +203,19 @@ _PAGE_TEMPLATE = """<!doctype html>
   }}
 
   async function deliver(result) {{
+    const user = result && result.user;
+    if (!user) {{
+      // getRedirectResult() hands back a result with no user when the
+      // redirect carried an error. Report it, or the CLI waits out its
+      // full timeout with nothing on screen.
+      const reason = (result && result.error && (result.error.message ||
+        result.error.code)) || "no user returned from Google";
+      await post({{ error: "auth/no-user: " + reason }});
+      say("sign-in failed: " + reason, "err");
+      btn.disabled = false;
+      return;
+    }}
     say("verifying…", "ok");
-    const user = result.user;
     const idToken = await user.getIdToken();
     let refreshToken = "";
     try {{
@@ -220,9 +234,16 @@ _PAGE_TEMPLATE = """<!doctype html>
     btn.disabled = true;
   }}
 
-  async function fail(err) {{
+  // `report` decides whether the CLI hears about it. Redirect-resume runs
+  // without a user gesture, so a hard failure there must still be posted or
+  // the CLI blocks until its timeout.
+  async function fail(err, report) {{
     const code = (err && err.code) || "auth/unknown";
-    say(code + ": " + ((err && err.message) || "sign-in failed"), "err");
+    const message = code + ": " + ((err && err.message) || "sign-in failed");
+    if (report !== false) {{
+      try {{ await post({{ error: message }}); }} catch (postErr) {{ /* page is going away */ }}
+    }}
+    say(message, "err");
     btn.disabled = false;
   }}
 
@@ -239,17 +260,25 @@ _PAGE_TEMPLATE = """<!doctype html>
           code === "auth/popup-closed-by-user" ||
           code === "auth/operation-not-supported-in-this-environment") {{
         say("redirecting…");
-        await auth.signInWithRedirect(provider);
+        try {{
+          await auth.signInWithRedirect(provider);
+        }} catch (redirectErr) {{
+          // Otherwise the CLI blocks until its timeout with no explanation.
+          await fail(redirectErr);
+        }}
       }} else {{
-        await post({{ error: code + ": " + ((err && err.message) || "sign-in failed") }});
         await fail(err);
       }}
     }}
   }}
 
   // Redirect flow returns to this same page — hand the result over.
+  // Feature-detect the *public* method: the compat SDK exposes
+  // `getRedirectResult` only. The private `_getRedirectResult` is absent, so
+  // guarding on it made this block dead code and left the popup-blocked
+  // fallback with no way to resume.
   (async function resumeRedirect() {{
-    if (!auth._getRedirectResult) return;
+    if (typeof auth.getRedirectResult !== "function") return;
     try {{
       const result = await auth.getRedirectResult();
       if (result) {{ btn.disabled = true; await deliver(result); }}
@@ -264,15 +293,15 @@ _PAGE_TEMPLATE = """<!doctype html>
 """
 
 _OK_PAGE = """<!doctype html><html><head><meta charset="utf-8">
-<style>body{background:#000;color:#00ff66;font-family:ui-monospace,Menlo,monospace;
+<style>body{{background:#000;color:#00ff66;font-family:ui-monospace,Menlo,monospace;
 display:flex;align-items:center;justify-content:center;height:100vh;margin:0;
-font-size:15px;letter-spacing:1px}</style></head>
+font-size:15px;letter-spacing:1px}}</style></head>
 <body>Signed in. You can close this tab and return to your terminal.</body></html>"""
 
 _ERROR_PAGE = """<!doctype html><html><head><meta charset="utf-8">
-<style>body{background:#000;color:#ff4466;font-family:ui-monospace,Menlo,monospace;
+<style>body{{background:#000;color:#ff4466;font-family:ui-monospace,Menlo,monospace;
 display:flex;align-items:center;justify-content:center;height:100vh;margin:0;
-font-size:15px;letter-spacing:1px;text-align:center;padding:24px}</style></head>
+font-size:15px;letter-spacing:1px;text-align:center;padding:24px}}</style></head>
 <body>{message}</body></html>"""
 
 
@@ -311,10 +340,15 @@ class _CallbackState:
 class _CallbackServer:
     """
     One-shot loopback HTTP server: serves the sign-in page, then captures the
-    token the browser posts back. Bound to 127.0.0.1 on an ephemeral port.
+    token the browser posts back. Bound to `localhost` on an ephemeral port.
+
+    `localhost` rather than `127.0.0.1` on purpose: Firebase validates the
+    page origin against the project's authorized domains, and that list names
+    `localhost` without aliasing the literal IP. Resolving `localhost` still
+    yields a loopback-only socket.
     """
 
-    def __init__(self, html: str, state_token: str, host: str = "127.0.0.1", port: int = 0):
+    def __init__(self, html: str, state_token: str, host: str = "localhost", port: int = 0):
         self.state = _CallbackState(state_token, html)
         self._server: Optional[ThreadingHTTPServer] = None
         self._thread: Optional[threading.Thread] = None
