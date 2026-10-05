@@ -9,6 +9,7 @@ from __future__ import annotations
 from typing import Any, Dict, List, Optional
 
 from agent.tools.registry import BaseTool
+from agent.tools.path_guard import OutputPathError, resolve_output_path
 from agent.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -39,6 +40,7 @@ class BrowserTool(BaseTool):
         cfg = config or {}
         self.headless: bool = cfg.get("headless", True)
         self.allow_network: bool = cfg.get("allow_network", True)
+        self.sandbox_root: Optional[str] = cfg.get("sandbox_root")
         self._browser = None
         self._page = None
 
@@ -89,9 +91,13 @@ class BrowserTool(BaseTool):
                 html = await self._page.content()
                 return {"success": True, "html": html[:10000]}
             if action == "screenshot":
-                path = params.get("path", "screenshot.png")
-                await self._page.screenshot(path=path)
-                return {"success": True, "path": path}
+                raw = params.get("path") or "screenshot.png"
+                try:
+                    path = resolve_output_path(raw, self.sandbox_root)
+                except OutputPathError as e:
+                    return {"success": False, "error": str(e)}
+                await self._page.screenshot(path=str(path))
+                return {"success": True, "path": str(path)}
             if action == "eval":
                 result = await self._page.evaluate(params.get("script", ""))
                 return {"success": True, "result": result}

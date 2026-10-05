@@ -1,0 +1,81 @@
+# gitleaks configuration for depression.ai
+#
+# Context: this repository leaked a live Firebase API key and a Groq key into
+# git history on a public remote. These rules exist so a real credential can
+# never reach a commit again.
+#
+#   gitleaks detect --redact            # scan working tree
+#   gitleaks detect --redact --log-opts="--all"   # scan full history
+#
+# CI also runs this (see .github/workflows/secret-scan.yml).
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Fixtures, examples, and vendored trees that only contain non-secret placeholders."
+paths = [
+  '''(^|/)(\.venv|venv|node_modules|site-packages|dist|build|egg-info)/''',
+  '''(^|/)src/agent/depression/''',
+  '''(^|/)deprssion/''',
+  '''(^|/)\.agents/''',
+  '''(^|/)\.opencode/''',
+  '''(^|/)assets/.*_files/''',
+]
+# Only allow these when they are obviously synthetic. Kept narrow on purpose:
+# an overly broad allowlist is what let the first leak through.
+regexes = [
+  # .env.example / documentation placeholders
+  '''DEPRESSION_API_KEY=''',
+  '''AIzaSyTESTKEY''',
+  '''AIzaTest''',
+  '''example\.com''',
+  '''dummy''',
+]
+
+[[rules]]
+id = "firebase-google-api-key"
+description = "Google/Firebase API key (AIza…) — this exact class leaked to GitHub"
+regex = '''\bAIza[0-9A-Za-z_\-]{30,50}\b'''
+keywords = ["AIza"]
+secretGroup = 0
+entropy = 3.5
+
+[[rules]]
+id = "groq-api-key"
+description = "Groq API key (gsk_…)"
+regex = '''\bgsk_[0-9A-Za-z]{48,}\b'''
+keywords = ["gsk_"]
+secretGroup = 0
+entropy = 3.0
+
+[[rules]]
+id = "openai-chatgpt-jwt"
+description = "OpenAI/ChatGPT account access token (JWT) found in a debug dump"
+regex = '''\beyJhbGciOi[A-Za-z0-9_\-]{10,}\.eyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}'''
+keywords = ["eyJhbGciOi"]
+secretGroup = 0
+
+[[rules]]
+id = "aws-access-key-id"
+description = "AWS access key ID"
+regex = '''\b(?:AKIA|ASIA)[0-9A-Z]{16}\b'''
+keywords = ["AKIA", "ASIA"]
+secretGroup = 0
+entropy = 3.0
+
+[[rules]]
+id = "hardcoded-llm-api-key-assignment"
+description = "API key assigned from a string literal in source"
+regex = '''(?i)(?:api[_-]?key|secret|password|token)\s*[:=]\s*["'][A-Za-z0-9_\-]{20,}["']'''
+keywords = ["api_key", "apikey", "secret", "password", "token"]
+secretGroup = 0
+entropy = 3.5
+path = '''\.(py|js|ts|json|ya?ml|toml)$'''
+
+[[rules]]
+id = "private-key-block"
+description = "PEM private key committed to the repository"
+regex = '''-----BEGIN (?:RSA |EC |OPENSSH |PGP )?PRIVATE KEY-----'''
+keywords = ["PRIVATE KEY"]
+secretGroup = 0

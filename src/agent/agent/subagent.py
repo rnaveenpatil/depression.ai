@@ -413,16 +413,58 @@ class SubAgentManager:
                 break
 
             for tc in tool_calls:
-                try:
-                    result = await registry.execute(tc.name, tc.arguments)
-                    payload = json.dumps(result, default=str)[:5000]
-                except Exception as e:
-                    payload = f"Error: {e}"
+                params = tc.arguments if isinstance(tc.arguments, dict) else {}
+                if not await self._tool_allowed(tc.name, params):
+                    payload = json.dumps(
+                        {
+                            "success": False,
+                            "error": (
+                                f"Permission denied: {tc.name} was blocked by "
+                                f"the permission policy."
+                            ),
+                            "permission_denied": True,
+                            "tool": tc.name,
+                        },
+                        default=str,
+                    )
+                else:
+                    try:
+                        result = await registry.execute(tc.name, tc.arguments)
+                        payload = json.dumps(result, default=str)[:5000]
+                    except Exception as e:
+                        payload = f"Error: {e}"
                 messages.append(
                     Message(role="tool", content=payload, tool_call_id=tc.id)
                 )
 
         return final_response
+
+    async def _tool_allowed(self, tool_name: str, params: Dict[str, Any]) -> bool:
+        """Run subagent tool calls through the same permission gate as the parent.
+
+        Subagents reach ``registry.execute()`` directly, so without this the
+        parent's authorization was skipped entirely: a subagent could read
+        ``.env`` or run ``rm -rf`` even though the main loop forbids both.
+        """
+        pm = getattr(self.agent, "permission_manager", None)
+        if pm is None:
+            return True
+        try:
+            allowed, reason = await pm.check_permission(
+                tool_name, params, context={"source": "subagent"}
+            )
+        except Exception as e:
+            logger.warning(
+                "Permission check failed for subagent tool %s: %s — denying",
+                tool_name, e,
+            )
+            return False
+        if not allowed:
+            logger.info(
+                "Subagent tool %s denied by permission policy: %s",
+                tool_name, reason,
+            )
+        return bool(allowed)
 
     async def shutdown(self) -> None:
         self.subagents.clear()

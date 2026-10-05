@@ -14,6 +14,8 @@ from collections import deque
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from agent.utils.redact import redact
+
 # ======================================================================
 # CONFIG
 # ======================================================================
@@ -90,6 +92,37 @@ class _RingBufferHandler(logging.Handler):
             pass
 
 
+class SecretRedactingFilter(logging.Filter):
+    """Mask credentials in every log record before it reaches a handler.
+
+    Tool output already goes through ``agent.utils.redact``, but call sites
+    that log directly (OAuth callbacks, HTTP request lines, exception text)
+    did not, so ``idToken``/``refreshToken``/API keys could land in the log
+    file and the ``/logs`` ring buffer verbatim. Filtering centrally means no
+    new call site can reintroduce the leak.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            if isinstance(record.msg, str):
+                record.msg = redact(record.msg)
+            if record.args:
+                if isinstance(record.args, dict):
+                    record.args = {
+                        k: redact(v) for k, v in record.args.items()
+                    }
+                elif isinstance(record.args, tuple):
+                    record.args = tuple(redact(a) for a in record.args)
+        except Exception:
+            # Never let redaction failures suppress a log record.
+            pass
+        return True
+
+
+def _secret_filter() -> logging.Filter:
+    return SecretRedactingFilter()
+
+
 # ======================================================================
 # SETUP
 # ======================================================================
@@ -126,6 +159,7 @@ def setup_logging(
         ch = logging.StreamHandler(stream=sys.stderr)
         ch.setFormatter(_ColorFormatter(fmt, date_format, color=color))
         ch.setLevel(logging.NOTSET)
+        ch.addFilter(_secret_filter())
         root.addHandler(ch)
         _console_handler = ch
 
@@ -141,12 +175,14 @@ def setup_logging(
         )
         fh.setFormatter(logging.Formatter(fmt, date_format))
         fh.setLevel(logging.NOTSET)
+        fh.addFilter(_secret_filter())
         root.addHandler(fh)
         _file_handler = fh
 
     # Ring buffer for /logs
     rb = _RingBufferHandler()
     rb.setLevel(logging.NOTSET)
+    rb.addFilter(_secret_filter())
     root.addHandler(rb)
 
     # Quiet noisy libraries
@@ -208,4 +244,5 @@ __all__ = [
     "get_recent_logs",
     "set_log_level",
     "clear_log_buffer",
+    "SecretRedactingFilter",
 ]

@@ -36,6 +36,7 @@ Features:
 from __future__ import annotations
 
 import os
+import re
 import sys
 import json
 import asyncio
@@ -100,6 +101,11 @@ class MCPServerConfig:
     max_reconnect_attempts: int = 5
     enabled: bool = True
     capabilities: Dict[str, Any] = field(default_factory=dict)
+    # Opt-in: overlay AWS credentials into the child environment. Off by
+    # default because the previous heuristic (substring "aws" anywhere in the
+    # name/args/env/command) handed live cloud credentials to any server whose
+    # name happened to contain the substring.
+    aws_credentials: bool = False
 
 
 @dataclass
@@ -236,6 +242,33 @@ class MCPTransportBase(ABC):
 # STDIO TRANSPORT
 # ======================================================================
 
+def _has_aws_token(text: str) -> bool:
+    """True when ``aws`` appears as its own token (or an ``aws*`` identifier).
+
+    Prevents "flaws" / "myawsproxy" / "draws" from matching.
+    """
+    return bool(re.search(r"(?<![a-z0-9])aws(?![a-z])", text))
+
+
+def _wants_aws_credentials(config: "MCPServerConfig") -> bool:
+    """Whether the operator opted this server into receiving AWS credentials.
+
+    Credentials are only ever overlaid when the server is declared as AWS:
+    either ``aws_credentials=True`` explicitly, or the server already carries
+    AWS config of its own (``AWS_*`` env keys, or an explicit credential
+    key). Everything else leaves the environment alone.
+    """
+    if getattr(config, "aws_credentials", False):
+        return True
+    if getattr(config, "api_key", None) and "aws" in str(config.api_key).lower():
+        return False  # unrelated key; not an AWS grant
+    if any(str(k).upper().startswith("AWS_") for k in (config.env or {})):
+        return True
+    return _has_aws_token((config.name or "").lower()) or _has_aws_token(
+        (config.command or "").lower()
+    )
+
+
 class StdioTransport(MCPTransportBase):
     """Local MCP server over stdio (child process)"""
 
@@ -257,16 +290,20 @@ class StdioTransport(MCPTransportBase):
         """
         env = {**os.environ, **self.config.env}
 
+        if not _wants_aws_credentials(self.config):
+            return env
+
         name_l = (self.config.name or "").lower()
         args_str = " ".join(str(a) for a in (self.config.args or [])).lower()
         env_keys = " ".join(str(k) for k in (self.config.env or {}).keys()).lower()
         cmd_str = (self.config.command or "").lower()
 
-        is_aws = (
-            "aws" in name_l
-            or "aws" in args_str
-            or "aws" in env_keys
-            or "aws" in cmd_str
+        # Exact-token matching only. Substring matching handed credentials to
+        # unrelated packages: a server named "flaws-notes", an arg of
+        # "myawsproxy", or an env key like "AWS_HINT" all matched "aws".
+        is_aws = _has_aws_token(name_l) or _has_aws_token(args_str) or _has_aws_token(cmd_str)
+        is_aws = is_aws or any(
+            key.upper().startswith("AWS_") for key in (self.config.env or {})
         )
 
         if is_aws:
@@ -734,8 +771,11 @@ class MCPPresets:
             args=[
                 "-y",
                 "@modelcontextprotocol/server-postgres",
-                connection_string,
             ],
+            # The connection string carries the database password. Passing it
+            # as argv exposed it to every local user via ``ps``; the server
+            # also honours DATABASE_URL, which stays out of the process table.
+            env={"DATABASE_URL": connection_string},
             timeout=60.0,
             auto_reconnect=True,
         )

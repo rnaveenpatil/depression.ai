@@ -58,7 +58,7 @@ class FilesystemPolicy(Policy):
         self.blocked_paths: List[str] = [
             self._expand(p) for p in cfg.get("blocked_paths", [])
         ]
-        self.confirm_writes: bool = cfg.get("confirm_file_writes", True)
+        self.confirm_writes: bool = cfg.get("confirm_file_writes", False)
         self.confirm_deletes: bool = cfg.get("confirm_deletes", True)
 
         # Combine built-in + user rules
@@ -126,11 +126,15 @@ class FilesystemPolicy(Policy):
                     risk=RiskLevel.MEDIUM,
                     policy=self.name,
                 )
-            return PermissionVerdict.allow(
-                "write inside project",
-                risk=RiskLevel.SAFE,
-                policy=self.name,
-            )
+            if self._is_inside_project(path):
+                return PermissionVerdict.allow(
+                    "write inside project",
+                    risk=RiskLevel.SAFE,
+                    policy=self.name,
+                )
+            # Outside the project but not blocked and not confirm-worthy:
+            # abstain so the manager applies its own default.
+            return None
 
         # Deletes: always ask, deny sensitive
         if action in ("delete", "remove", "unlink", "rmdir", "rm"):
