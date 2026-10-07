@@ -38,8 +38,8 @@ from enum import Enum
 from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 from agent.agent.planner import Plan, Planner, TaskStatus
-from agent.llm.provider import LLMProvider, Message, ToolCall
-from agent.llm.runtime import MODEL_METADATA
+from agent.llm.provider import Message, ToolCall
+from agent.llm.runtime import MODEL_METADATA, LLMProviderRegistry
 from agent.tools.registry import ToolRegistry, INTENT_CATEGORIES
 from agent.utils.errors import TimeoutError
 from agent.utils.logging import get_logger
@@ -214,7 +214,7 @@ class AgentLoop:
     def __init__(
         self,
         agent: Any,
-        llm: LLMProvider,
+        llm: LLMProviderRegistry,
         tool_registry: ToolRegistry,
         planner: Planner,
         config: Dict[str, Any],

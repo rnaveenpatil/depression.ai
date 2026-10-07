@@ -3,7 +3,7 @@ Configuration Module - Schema, Defaults, Validation, and Dynamic LLM Resolution
 
 KEY FEATURES:
 - LLM models are NOT hardcoded — they are pulled dynamically from the
-  LLM provider registry (src/agent/llm/provider.py).
+  LLM provider registry (src/agent/llm/runtime.py).
 - Temperature is resolved dynamically based on prompt complexity/task type.
 - Full schema validation, environment variable interpolation, and layered
   merging of config sources.
@@ -386,7 +386,7 @@ class LLMConfig:
 
     IMPORTANT: `provider` and `model` are placeholders.
     The real list of available models is fetched dynamically from the
-    LLM registry (src/agent/llm/provider.py) at runtime.
+    LLM registry (src/agent/llm/runtime.py) at runtime.
     """
     provider: str = ""     # empty → resolver picks default from registry
     model: str = ""        # empty → resolver picks default from registry
@@ -712,7 +712,7 @@ class Config:
             )
 
     # ------------------------------------------------------------------
-    # DYNAMIC LLM RESOLUTION (all models come from llm/provider.py)
+    # DYNAMIC LLM RESOLUTION (all models come from llm/runtime.py)
     # ------------------------------------------------------------------
 
     def resolve_llm(
@@ -723,7 +723,7 @@ class Config:
         """
         Resolve (provider, model) using the LLM registry.
 
-        The registry lives in `src/agent/llm/provider.py` and is the single
+        The registry lives in `src/agent/llm/runtime.py` and is the single
         source of truth for available models. NOTHING is hardcoded here.
 
         Behavior:
@@ -769,7 +769,7 @@ class Config:
         if registry is None:
             raise ConfigError(
                 "No LLM registry available. Implement "
-                "agent.llm.provider.get_llm_registry() to provide models."
+                "agent.llm.runtime.get_llm_registry() to provide models."
             )
 
         raise ConfigError(

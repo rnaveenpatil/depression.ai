@@ -3,7 +3,7 @@ Config Module - Schema, Defaults, Validation, and Dynamic LLM Resolution
 
 KEY FEATURES:
 - LLM models are NOT hardcoded — they are pulled dynamically from the
-  LLM provider registry (src/agent/llm/provider.py).
+  LLM provider registry (src/agent/llm/runtime.py).
 - Temperature is resolved dynamically based on prompt complexity/task type.
 - Full schema validation, environment variable interpolation, and layered
   merging of config sources.

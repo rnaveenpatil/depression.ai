@@ -13,7 +13,9 @@ def test_tool_call_and_result_are_atomic():
     ])
     messages = get_model_messages(ctx, limit=3)
     assert [m.role for m in messages] == ["system", "assistant", "tool", "assistant"]
-    assert messages[1].tool_calls[0]["id"] == "call-1"
+    # Stored as JSON dicts, handed to adapters as ToolCall objects.
+    assert messages[1].tool_calls[0].id == "call-1"
+    assert messages[1].tool_calls[0].name == "read"
     assert messages[2].tool_call_id == "call-1"
 
 

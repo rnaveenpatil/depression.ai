@@ -23,7 +23,8 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from agent.utils.logging import get_logger
 from agent.utils.errors import SubAgentError
-from agent.llm.provider import LLMProvider, Message
+from agent.llm.provider import Message
+from agent.llm.runtime import LLMProviderRegistry
 from agent.tools.registry import ToolRegistry
 
 logger = get_logger(__name__)
@@ -96,7 +97,7 @@ class SubAgent:
     created_at: float = field(default_factory=time.time)
     status: str = "idle"
     context: Dict[str, Any] = field(default_factory=dict)
-    llm: Optional[LLMProvider] = None
+    llm: Optional[LLMProviderRegistry] = None
     tool_registry: Optional[ToolRegistry] = None
 
 
@@ -130,7 +131,7 @@ class SubAgentManager:
                 cfg.allowed_tools = list(user_cfg["allowed_tools"])
 
         self._model_lock = asyncio.Lock()
-        self.llm_registry = None
+        self.llm_registry: Optional[LLMProviderRegistry] = None
 
         logger.info("SubAgentManager initialized with roles: %s", list(self.subagent_configs.keys()))
 

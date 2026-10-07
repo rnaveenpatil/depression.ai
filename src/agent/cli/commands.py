@@ -62,7 +62,7 @@ class CommandProcessor:
     Advanced command processor.
 
     All model information is retrieved dynamically from the LLM provider
-    registry (agent.llm.provider). This file contains NO hardcoded models.
+    registry (agent.llm.runtime). This file contains NO hardcoded models.
     """
 
     def __init__(
@@ -79,7 +79,7 @@ class CommandProcessor:
         self.config = config
 
         # LLM registry provides dynamic model listing/switching
-        # (see src/agent/llm/provider.py -> LLMProviderRegistry)
+        # (see src/agent/llm/runtime.py -> LLMProviderRegistry)
         self.llm_registry = llm_registry or self._resolve_llm_registry()
 
         # Command registry
