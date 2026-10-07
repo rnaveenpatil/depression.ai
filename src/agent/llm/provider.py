@@ -1,52 +1,116 @@
 """
-LLM Provider Registry - User-Driven Model Management
+LLM Provider — the common contract every model backend must satisfy.
 
-This module is the SINGLE SOURCE OF TRUTH for the currently active model.
+Purpose
+-------
+This module defines the *interface* between the agent and any LLM. Every
+concrete backend (OpenAI-compatible, Anthropic, Ollama, a local model, a
+test double, ...) subclasses `LLMProvider` and implements `chat()`.
 
-Design:
-    The registry starts empty. The user connects a model through the TUI
-    (base URL + API key + model ID), which installs a runtime provider via
-    agent.llm.runtime.configure_runtime_provider(). Until that happens,
-    the registry has no providers and no models.
+What lives here
+---------------
+    * Message          — a single chat turn (role, content, tool calls)
+    * ToolCall         — a tool invocation requested by the model
+    * ToolSpec         — a tool the model is allowed to call
+    * ModelInfo        — static metadata for a model
+    * ProviderConfig   — the settings a provider needs to run
+    * ProviderError    — the standard exception type for provider failures
+    * LLMProvider      — the abstract base class
 
-    Every query before the first /connect returns a clean "no model
-    selected" error. That is deliberate: no hardcoded providers, no
-    catalog of models the user cannot reach, no accidental fallback.
+What does NOT live here
+-----------------------
+    * Any provider-specific HTTP logic (OpenAI, Anthropic, Ollama, ...)
+    * The registry / current-model selection (agent.llm.runtime)
+    * Model catalogs, pricing tables, cost computation
+    * Fallback chains, health checks across providers
+    * The empty-at-boot policy — that belongs to the registry
 
-Provides:
-    - Registry lifecycle (empty at boot; populated by runtime.install)
-    - Model info lookup against the live catalog
-    - Runtime model selection
-    - API key management
-    - Fallback chain execution on provider failure
-    - Health checking
+Design notes
+------------
+    * One async method, `chat()`, is the entire request surface. Streaming
+      is expressed as an optional keyword (`stream=True`) that yields
+      `chat()` results, not as a second abstract method — this keeps the
+      contract small.
+    * Every provider reports its own capabilities via `capabilities()`.
+      Callers must consult that instead of assuming tool support.
+    * Errors are raised as `ProviderError` with a stable `code` field so
+      callers can react without string matching.
+    * Lifecycle is explicit: `start()` / `close()` are awaited, both are
+      idempotent, and neither is required to do anything.
 """
 
 from __future__ import annotations
 
-import asyncio
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
-
-from agent.utils.logging import get_logger
-from agent.utils.errors import LLMError
-
-logger = get_logger(__name__)
+from enum import Enum
+from typing import Any, AsyncIterator, Dict, List, Optional, Sequence, Union
 
 
 # ======================================================================
-# BASE INTERFACES
+# ENUMS
+# ======================================================================
+
+class Role(str, Enum):
+    """Chat roles understood by every provider."""
+    SYSTEM = "system"
+    USER = "user"
+    ASSISTANT = "assistant"
+    TOOL = "tool"
+
+
+class FinishReason(str, Enum):
+    """Why a completion stopped."""
+    STOP = "stop"
+    LENGTH = "length"
+    TOOL_CALLS = "tool_calls"
+    CONTENT_FILTER = "content_filter"
+    ERROR = "error"
+
+
+class ProviderErrorCode(str, Enum):
+    """Stable error codes for cross-provider handling."""
+    AUTH = "auth"                   # bad/missing API key
+    RATE_LIMIT = "rate_limit"       # 429 or equivalent
+    TIMEOUT = "timeout"             # network / read timeout
+    CONNECTION = "connection"       # DNS, TCP, TLS failure
+    BAD_REQUEST = "bad_request"     # 4xx other than auth/rate limit
+    SERVER = "server"               # 5xx from the provider
+    MODEL_NOT_FOUND = "model_not_found"
+    CONTEXT_LENGTH = "context_length"
+    UNSUPPORTED = "unsupported"     # provider can't do what was asked
+    CANCELLED = "cancelled"
+    UNKNOWN = "unknown"
+
+
+# ======================================================================
+# MESSAGES AND TOOLS
 # ======================================================================
 
 @dataclass
+class ToolCall:
+    """A tool invocation the model asked for."""
+    id: str
+    name: str
+    arguments: Dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {"id": self.id, "name": self.name, "arguments": dict(self.arguments)}
+
+
+@dataclass
 class Message:
-    """A chat message"""
-    role: str  # "system" | "user" | "assistant" | "tool"
-    content: Optional[str]
-    name: Optional[str] = None
-    tool_call_id: Optional[str] = None
-    tool_calls: Optional[List[Dict[str, Any]]] = None
+    """
+    One chat turn.
+
+    `content` is `Optional[str]` because a tool-calling assistant turn may
+    carry no text at all — only `tool_calls`.
+    """
+    role: str
+    content: Optional[str] = None
+    name: Optional[str] = None                # tool/function name (for role=tool)
+    tool_call_id: Optional[str] = None        # for role=tool
+    tool_calls: Optional[List[ToolCall]] = None
 
     def to_dict(self) -> Dict[str, Any]:
         d: Dict[str, Any] = {"role": self.role, "content": self.content}
@@ -55,457 +119,410 @@ class Message:
         if self.tool_call_id:
             d["tool_call_id"] = self.tool_call_id
         if self.tool_calls:
-            d["tool_calls"] = self.tool_calls
+            d["tool_calls"] = [
+                {
+                    "id": tc.id,
+                    "type": "function",
+                    "function": {
+                        "name": tc.name,
+                        "arguments": _stringify_args(tc.arguments),
+                    },
+                }
+                for tc in self.tool_calls
+            ]
         return d
+
+    @classmethod
+    def system(cls, content: str) -> "Message":
+        return cls(role=Role.SYSTEM.value, content=content)
+
+    @classmethod
+    def user(cls, content: str) -> "Message":
+        return cls(role=Role.USER.value, content=content)
+
+    @classmethod
+    def assistant(
+        cls,
+        content: Optional[str] = None,
+        tool_calls: Optional[List[ToolCall]] = None,
+    ) -> "Message":
+        return cls(role=Role.ASSISTANT.value, content=content, tool_calls=tool_calls)
+
+    @classmethod
+    def tool(cls, content: str, tool_call_id: str, name: Optional[str] = None) -> "Message":
+        return cls(role=Role.TOOL.value, content=content,
+                   tool_call_id=tool_call_id, name=name)
 
 
 @dataclass
-class ToolCall:
-    """A tool call requested by the model"""
-    id: str
-    name: str
-    arguments: Dict[str, Any]
+class ToolSpec:
+    """
+    A tool the model is allowed to call.
 
+    `parameters` is a JSON-schema object describing the arguments. It is
+    provider-agnostic; concrete providers convert it to their own shape.
+    """
+    name: str
+    description: str = ""
+    parameters: Dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "type": "function",
+            "function": {
+                "name": self.name,
+                "description": self.description,
+                "parameters": self.parameters or {"type": "object", "properties": {}},
+            },
+        }
+
+
+def _stringify_args(args: Any) -> str:
+    """Providers want tool arguments as a JSON string, not a dict."""
+    import json
+    if isinstance(args, str):
+        return args
+    try:
+        return json.dumps(args or {})
+    except Exception:
+        return "{}"
+
+
+# ======================================================================
+# MODEL / CAPABILITY / CONFIG
+# ======================================================================
+
+@dataclass
+class ModelInfo:
+    """Static metadata a provider reports for a model it serves."""
+    id: str
+    provider: str
+    name: str = ""
+    description: str = ""
+    context_window: int = 0
+    max_output: int = 0
+    supports_tools: bool = False
+    supports_streaming: bool = False
+    supports_vision: bool = False
+    supports_json_mode: bool = False
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "id": self.id,
+            "provider": self.provider,
+            "name": self.name or self.id,
+            "description": self.description,
+            "context_window": self.context_window,
+            "max_output": self.max_output,
+            "supports_tools": self.supports_tools,
+            "supports_streaming": self.supports_streaming,
+            "supports_vision": self.supports_vision,
+            "supports_json_mode": self.supports_json_mode,
+        }
+
+
+@dataclass
+class ProviderConfig:
+    """
+    Everything a provider needs to run. Deliberately flat and JSON-safe.
+
+    `extra` is the escape hatch for provider-specific settings (region,
+    project, deployment name, ...) without polluting this contract.
+    """
+    api_key: Optional[str] = None
+    base_url: Optional[str] = None
+    organization: Optional[str] = None
+    timeout: float = 120.0
+    max_retries: int = 2
+    default_model: Optional[str] = None
+    extra: Dict[str, Any] = field(default_factory=dict)
+
+    @classmethod
+    def from_dict(cls, data: Optional[Dict[str, Any]]) -> "ProviderConfig":
+        data = data or {}
+        known = {
+            "api_key", "base_url", "organization", "timeout",
+            "max_retries", "default_model",
+        }
+        kwargs = {k: v for k, v in data.items() if k in known}
+        extra = {k: v for k, v in data.items() if k not in known}
+        cfg = cls(**kwargs)
+        cfg.extra.update(extra)
+        return cfg
+
+
+# ======================================================================
+# ERRORS
+# ======================================================================
+
+class ProviderError(Exception):
+    """
+    The single exception type every provider raises.
+
+    `code` is one of ProviderErrorCode; `retryable` says whether the
+    caller should try the same request again (rate limit, timeout, 5xx)
+    versus fail fast (auth, bad request, model not found).
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        code: Union[str, ProviderErrorCode] = ProviderErrorCode.UNKNOWN,
+        provider: Optional[str] = None,
+        model: Optional[str] = None,
+        retryable: bool = False,
+        status: Optional[int] = None,
+        cause: Optional[BaseException] = None,
+    ):
+        super().__init__(message)
+        self.code = code.value if isinstance(code, ProviderErrorCode) else str(code)
+        self.provider = provider
+        self.model = model
+        self.retryable = retryable
+        self.status = status
+        if cause is not None:
+            self.__cause__ = cause
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "error": str(self),
+            "code": self.code,
+            "provider": self.provider,
+            "model": self.model,
+            "retryable": self.retryable,
+            "status": self.status,
+        }
+
+    def __repr__(self) -> str:
+        parts = [f"code={self.code!r}"]
+        if self.provider:
+            parts.append(f"provider={self.provider!r}")
+        if self.model:
+            parts.append(f"model={self.model!r}")
+        if self.status:
+            parts.append(f"status={self.status}")
+        return f"ProviderError({str(self)!r}, {', '.join(parts)})"
+
+
+# ======================================================================
+# RESPONSE
+# ======================================================================
 
 @dataclass
 class LLMResponse:
-    """Response from an LLM"""
-    content: str
-    model: str
-    provider: str
-    usage: Dict[str, int] = field(default_factory=dict)
+    """A single completion result."""
+    content: str = ""
+    model: str = ""
+    provider: str = ""
+    finish_reason: str = FinishReason.STOP.value
     tool_calls: List[ToolCall] = field(default_factory=list)
-    finish_reason: str = "stop"
+    usage: Dict[str, int] = field(default_factory=dict)
     raw: Optional[Dict[str, Any]] = None
 
+    @property
+    def has_tool_calls(self) -> bool:
+        return bool(self.tool_calls)
+
+    def to_message(self) -> Message:
+        """Turn this response into an assistant message for the next turn."""
+        return Message.assistant(
+            content=self.content or None,
+            tool_calls=self.tool_calls or None,
+        )
+
+
+# ======================================================================
+# THE PROVIDER CONTRACT
+# ======================================================================
 
 class LLMProvider(ABC):
-    """Abstract base class for LLM providers"""
+    """
+    Abstract base every model backend implements.
 
+    Minimum contract
+    ----------------
+        name           — short identifier, e.g. "openai", "anthropic"
+        chat()         — the one request method
+        list_models()  — what this provider can serve (may be static)
+        model_info()   — metadata for one model (optional override)
+
+    Lifecycle
+    ---------
+        `start()` is awaited once before the first request; `close()` is
+        awaited at shutdown. Both are idempotent and default to no-ops.
+
+    Capabilities
+    ------------
+        `capabilities()` returns a dict describing what this provider can
+        do as a whole; per-model flags live on `ModelInfo`.
+    """
+
+    #: Short provider identifier, lowercase. Subclasses must set this.
     name: str = "base"
 
-    def __init__(self, config: Dict[str, Any]):
-        self.config = config
-        self.api_key = config.get("api_key")
-        self.base_url = config.get("base_url")
-        self.timeout = config.get("timeout", 120.0)
-        self.max_retries = config.get("max_retries", 3)
+    def __init__(self, config: Optional[Union[ProviderConfig, Dict[str, Any]]] = None):
+        if isinstance(config, ProviderConfig):
+            self.config = config
+        else:
+            self.config = ProviderConfig.from_dict(config)
+        self._started = False
+
+    # ------------------------------------------------------------------
+    # REQUIRED
+    # ------------------------------------------------------------------
 
     @abstractmethod
-    async def complete(
+    async def chat(
         self,
-        messages: List[Any],
+        messages: Sequence[Message],
+        *,
         model: Optional[str] = None,
         temperature: float = 0.1,
         max_tokens: int = 4096,
-        tools: Optional[List[Dict[str, Any]]] = None,
-        **kwargs,
+        tools: Optional[Sequence[ToolSpec]] = None,
+        tool_choice: Optional[str] = None,
+        stop: Optional[Sequence[str]] = None,
+        **kwargs: Any,
     ) -> LLMResponse:
-        """Send a completion request"""
+        """
+        Send one chat request and return the response.
+
+        Must raise `ProviderError` (never a raw HTTP/JSON exception) so
+        callers have a single failure type to handle.
+
+        `tool_choice` values are provider-agnostic hints:
+            None         — provider default
+            "auto"       — model decides
+            "none"       — no tools
+            "required"   — must call at least one tool
+        """
         ...
 
     @abstractmethod
-    def list_models(self) -> List[Dict[str, Any]]:
-        """Return a list of available models"""
+    def list_models(self) -> List[ModelInfo]:
+        """Return the models this provider serves. May be static."""
         ...
 
-    def is_available(self) -> bool:
-        """Check if this provider is properly configured"""
-        return bool(self.api_key) or self._is_local()
-
-    def is_healthy(self) -> bool:
-        """Check if the provider is responsive"""
-        return self.is_available()
-
-    async def reconnect(self) -> bool:
-        """Attempt to reconnect (for providers that need it)"""
-        return True
-
-    async def shutdown(self) -> None:
-        """Clean up resources"""
-        pass
-
-    def _is_local(self) -> bool:
-        return False
-
-
-# ======================================================================
-# MODEL CATALOG
-# ======================================================================
-#
-# Starts empty. agent.llm.runtime fills it in when the user connects.
-# Reading code (loop._compute_cost, provider.get_model_info, ...) still
-# works — it just returns empty/zero values until a model is connected.
-
-MODEL_METADATA: Dict[str, Dict[str, Any]] = {}
-
-
-# ======================================================================
-# PROVIDER REGISTRY
-# ======================================================================
-
-class LLMProviderRegistry:
-    """
-    Central registry for the active provider and model.
-
-    Begins empty. agent.llm.runtime owns the entry point that installs
-    a runtime provider when the user connects via the TUI.
-    """
-
-    def __init__(self):
-        self.providers: Dict[str, LLMProvider] = {}
-        self._models: Dict[str, List[Dict[str, Any]]] = {}
-        self._current_provider: Optional[str] = None
-        self._current_model: Optional[str] = None
-        self._api_keys: Dict[str, str] = {}
-        self._fallback_chain: List[str] = []
-        self._lock = asyncio.Lock()
-
-        logger.info("LLM Provider Registry initialized (empty; connect via /connect)")
-
     # ------------------------------------------------------------------
-    # RUNTIME INSTALLATION
+    # OPTIONAL OVERRIDES
     # ------------------------------------------------------------------
 
-    def install_provider(
-        self,
-        name: str,
-        provider: LLMProvider,
-        api_key: Optional[str] = None,
-        model: Optional[str] = None,
-        metadata: Optional[Dict[str, Any]] = None,
-    ) -> None:
-        """
-        Install a runtime provider. Called by agent.llm.runtime when the
-        user connects a model. Idempotent — replaces any existing entry
-        with the same name.
-        """
-        self.providers[name] = provider
-        if api_key:
-            self._api_keys[name] = api_key
-            provider.api_key = api_key
-
-        if model:
-            self._current_provider = name
-            self._current_model = model
-            if metadata:
-                MODEL_METADATA[model] = metadata
-            else:
-                MODEL_METADATA.setdefault(model, {
-                    "provider": name,
-                    "name": model,
-                    "description": "User-connected runtime model",
-                    "context_window": 200_000,
-                    "max_output": 16_384,
-                    "cost_input": 0.0,
-                    "cost_output": 0.0,
-                    "capabilities": ["text", "function_calling"],
-                    "recommended_for": ["agentic tasks"],
-                    "speed": "provider-dependent",
-                    "quality": "provider-dependent",
-                })
-
-        logger.info(
-            "Installed runtime provider %r (model=%s)", name, model or "(none)"
-        )
-
-    def uninstall_provider(self, name: str) -> bool:
-        """Remove a runtime provider."""
-        provider = self.providers.pop(name, None)
-        if provider is None:
-            return False
-        self._api_keys.pop(name, None)
-        if self._current_provider == name:
-            self._current_provider = None
-            self._current_model = None
-        return True
-
-    # ------------------------------------------------------------------
-    # MODEL DISCOVERY
-    # ------------------------------------------------------------------
-
-    def list_all_models(self) -> Dict[str, List[Dict[str, Any]]]:
-        """Return all available models grouped by provider."""
-        result: Dict[str, List[Dict[str, Any]]] = {}
-
-        for model_id, metadata in MODEL_METADATA.items():
-            provider = metadata.get("provider", "unknown")
-            if provider not in result:
-                result[provider] = []
-
-            model_entry = {
-                "id": model_id,
-                "model": model_id,
-                **metadata,
-                "available": self._is_model_available(provider, model_id),
-            }
-            result[provider].append(model_entry)
-
-        return result
-
-    def list_models(self, provider: Optional[str] = None) -> List[Dict[str, Any]]:
-        """Return a flat list of models, optionally filtered by provider"""
-        all_models = self.list_all_models()
-        if provider:
-            return all_models.get(provider, [])
-        return [m for models in all_models.values() for m in models]
-
-    def list_providers(self) -> List[str]:
-        """Return list of provider names"""
-        return list(self.providers.keys())
-
-    def get_model_info(self, model_id: str) -> Optional[Dict[str, Any]]:
-        """Get detailed info for a specific model"""
-        if model_id in MODEL_METADATA:
-            metadata = MODEL_METADATA[model_id]
-            return {
-                "id": model_id,
-                "model": model_id,
-                **metadata,
-                "available": self._is_model_available(
-                    metadata.get("provider", ""), model_id
-                ),
-            }
+    def model_info(self, model_id: str) -> Optional[ModelInfo]:
+        """Look up one model. Default: search `list_models()`."""
+        for info in self.list_models():
+            if info.id == model_id:
+                return info
         return None
 
-    def is_model_available(self, provider: str, model: str) -> bool:
-        """Check if a specific model is available"""
-        return self._is_model_available(provider, model)
-
-    def _is_model_available(self, provider: str, model: str) -> bool:
-        """Internal availability check"""
-        if provider not in self.providers:
-            return False
-
-        p = self.providers[provider]
-
-        if provider in ("local", "gpt-oss"):
-            return p.is_available()
-
-        return bool(self._api_keys.get(provider) or p.api_key)
-
-    # ------------------------------------------------------------------
-    # MODEL SELECTION
-    # ------------------------------------------------------------------
-
-    def set_model(self, model_id: str) -> Dict[str, Any]:
+    def capabilities(self) -> Dict[str, bool]:
         """
-        Switch to a specific model.
-
-        Returns:
-            {"success": bool, "provider": str, "model": str, "error": str}
+        Provider-wide feature flags. Callers should still check the
+        per-model flags on `ModelInfo` before relying on a feature.
         """
-        info = self.get_model_info(model_id)
-        if not info:
-            return {
-                "success": False,
-                "error": f"Model '{model_id}' not found in registry",
-            }
-
-        provider = info.get("provider")
-        if provider not in self.providers:
-            return {
-                "success": False,
-                "error": f"Provider '{provider}' not available",
-            }
-
-        if not self._is_model_available(provider, model_id):
-            return {
-                "success": False,
-                "error": f"Model '{model_id}' not available (check API key or service)",
-            }
-
-        self._current_provider = provider
-        self._current_model = model_id
-
-        logger.info(f"Switched to model: {provider}/{model_id}")
-
         return {
-            "success": True,
-            "provider": provider,
-            "model": model_id,
+            "tools": True,
+            "streaming": False,
+            "vision": False,
+            "json_mode": False,
+            "system_prompt": True,
         }
 
-    def set_provider(self, provider_name: str) -> bool:
-        """Switch to a provider (keeping current model if compatible)"""
-        if provider_name not in self.providers:
-            return False
-
-        self._current_provider = provider_name
-
-        if self._current_model:
-            info = self.get_model_info(self._current_model)
-            if info and info.get("provider") != provider_name:
-                models = self.list_models(provider_name)
-                if models:
-                    self._current_model = models[0]["id"]
-
-        return True
-
-    def set_fallback_chain(self, models: List[str]) -> None:
+    def is_configured(self) -> bool:
         """
-        Set an ordered fallback chain. When complete() fails on the current
-        model, the next model in this chain is tried. An empty chain means
-        no fallback.
+        True when this provider has everything it needs to make a call
+        (typically an API key, or a reachable local endpoint).
         """
-        self._fallback_chain = [m for m in (models or []) if m]
+        return bool(self.config.api_key) or self._is_local()
 
-    def get_fallback_chain(self) -> List[str]:
-        return list(self._fallback_chain)
-
-    def set_api_key(self, provider: str, key: str) -> None:
-        """Set API key for a provider"""
-        self._api_keys[provider] = key
-        if provider in self.providers:
-            self.providers[provider].api_key = key
-        logger.info(f"API key set for provider: {provider}")
-
-    def get_api_key(self, provider: str) -> Optional[str]:
-        """Get the API key for a provider"""
-        return self._api_keys.get(provider)
-
-    def get_current_model(self) -> Optional[str]:
-        """Get the current model ID"""
-        return self._current_model
-
-    def get_current_provider(self) -> Optional[str]:
-        """Get the current provider name"""
-        return self._current_provider
+    def _is_local(self) -> bool:
+        """Override for providers that talk to localhost (Ollama, vLLM...)."""
+        return False
 
     # ------------------------------------------------------------------
-    # COMPLETION
+    # LIFECYCLE
     # ------------------------------------------------------------------
 
-    async def complete(
-        self,
-        messages: List[Any],
-        model: Optional[str] = None,
-        temperature: float = 0.1,
-        max_tokens: int = 4096,
-        tools: Optional[List[Dict[str, Any]]] = None,
-        **kwargs,
-    ) -> LLMResponse:
+    async def start(self) -> None:
         """
-        Send a completion request. On failure, walks the fallback chain
-        (if any) in order until one model succeeds.
+        Prepare the provider (open an HTTP session, warm a connection...).
+        Default: no-op. Safe to call more than once.
         """
-        primary = model or self._current_model
-        if not primary:
-            raise LLMError(
-                "No model selected. Connect a model via the /connect panel first."
-            )
+        self._started = True
 
-        candidates: List[str] = [primary]
-        for fallback in self._fallback_chain:
-            if fallback and fallback not in candidates:
-                candidates.append(fallback)
+    async def close(self) -> None:
+        """
+        Release resources. Default: no-op. Safe to call more than once.
+        """
+        self._started = False
 
-        last_error: Optional[Exception] = None
-        for candidate in candidates:
-            info = self.get_model_info(candidate)
-            if not info:
-                last_error = LLMError(f"Unknown model: {candidate}")
-                continue
-            provider_name = info.get("provider")
-            provider = self.providers.get(provider_name)
-            if not provider:
-                last_error = LLMError(f"Provider not available: {provider_name}")
-                continue
+    @property
+    def started(self) -> bool:
+        return self._started
 
-            try:
-                return await provider.complete(
-                    messages=messages,
-                    model=candidate,
-                    temperature=temperature,
-                    max_tokens=max_tokens,
-                    tools=tools,
-                    **kwargs,
-                )
-            except Exception as exc:
-                last_error = exc
-                logger.warning(
-                    "Model %s failed (%s); trying next fallback",
-                    candidate,
-                    exc,
-                )
-                continue
+    # ------------------------------------------------------------------
+    # STREAMING — optional, expressible in terms of chat()
+    # ------------------------------------------------------------------
 
-        if last_error is not None:
-            raise LLMError(f"All models failed. Last error: {last_error}")
-        raise LLMError("No usable model for completion.")
-
-    async def complete_with_tools(
+    async def stream(
         self,
-        messages: List[Any],
-        tools: List[Dict[str, Any]],
-        model: Optional[str] = None,
-        temperature: float = 0.1,
-        **kwargs,
-    ) -> LLMResponse:
-        """Convenience method for tool-calling completions"""
-        return await self.complete(
-            messages=messages,
-            model=model,
-            temperature=temperature,
-            tools=tools,
-            **kwargs,
-        )
+        messages: Sequence[Message],
+        **kwargs: Any,
+    ) -> AsyncIterator[LLMResponse]:
+        """
+        Optional streaming interface.
+
+        The default implementation calls `chat()` once and yields the
+        whole response as a single chunk. Providers that support real
+        streaming override this. Callers that only need incremental text
+        can consume `chunk.content`; tool calls arrive on the final chunk.
+        """
+        response = await self.chat(messages, **kwargs)
+        yield response
 
     # ------------------------------------------------------------------
     # HEALTH
     # ------------------------------------------------------------------
 
-    def is_healthy(self) -> bool:
-        """Check if at least one provider is healthy"""
-        return any(p.is_healthy() for p in self.providers.values())
+    async def health(self) -> bool:
+        """
+        A cheap reachability probe. Default: whether we're configured.
+        Providers with a real ping endpoint (models list, etc.) override.
+        """
+        return self.is_configured()
 
-    def has_model(self) -> bool:
-        """True if a current model is selected and reachable."""
-        if not self._current_model:
-            return False
-        info = self.get_model_info(self._current_model)
-        if not info:
-            return False
-        return info.get("provider") in self.providers
+    # ------------------------------------------------------------------
+    # CONVENIENCE
+    # ------------------------------------------------------------------
 
-    async def reconnect_all(self) -> None:
-        """Attempt to reconnect all providers"""
-        for name, provider in self.providers.items():
-            try:
-                await provider.reconnect()
-                logger.debug(f"Reconnected provider: {name}")
-            except Exception as e:
-                logger.warning(f"Failed to reconnect {name}: {e}")
+    async def complete(
+        self,
+        messages: Sequence[Message],
+        **kwargs: Any,
+    ) -> LLMResponse:
+        """
+        Alias for `chat()`. Kept for call sites that predate the rename
+        and for readability in loops that think in terms of "completions".
+        """
+        return await self.chat(messages, **kwargs)
 
-
-# ======================================================================
-# GLOBAL REGISTRY
-# ======================================================================
-
-_registry: Optional[LLMProviderRegistry] = None
-
-
-def get_llm_registry() -> LLMProviderRegistry:
-    """Get or create the global LLM provider registry"""
-    global _registry
-    if _registry is None:
-        _registry = LLMProviderRegistry()
-    return _registry
-
-
-def reset_llm_registry() -> None:
-    """Reset the global registry (for tests)"""
-    global _registry
-    _registry = None
+    def __repr__(self) -> str:
+        return (
+            f"<{type(self).__name__} name={self.name!r} "
+            f"configured={self.is_configured()} started={self._started}>"
+        )
 
 
 __all__ = [
-    "LLMProvider",
-    "LLMProviderRegistry",
-    "LLMResponse",
+    "Role",
+    "FinishReason",
+    "ProviderErrorCode",
     "Message",
     "ToolCall",
-    "MODEL_METADATA",
-    "get_llm_registry",
-    "reset_llm_registry",
+    "ToolSpec",
+    "ModelInfo",
+    "ProviderConfig",
+    "ProviderError",
+    "LLMResponse",
+    "LLMProvider",
 ]

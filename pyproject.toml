@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "depression.ai"
 version = "1.0.5"
 description = "AI agent for everything — development, deployment, and analysis"
-readme = "README.md"source deprssion/bin/activate
+readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
 authors = [{name = "rnaveenpatil", email = "rnaveenpatil@example.com"}]
