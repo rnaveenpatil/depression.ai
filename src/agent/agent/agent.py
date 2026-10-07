@@ -132,7 +132,7 @@ class Agent:
         logger.info("Initializing agent...")
 
         try:
-            from agent.llm.provider import get_llm_registry
+            from agent.llm.runtime import get_llm_registry
 
             self.llm = get_llm_registry()
 

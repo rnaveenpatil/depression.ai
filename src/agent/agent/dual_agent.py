@@ -129,7 +129,7 @@ class BaseAgent:
             return
         logger.info("Initializing %s agent...", self.role.value)
 
-        from agent.llm.provider import get_llm_registry
+        from agent.llm.runtime import get_llm_registry
         self.llm = get_llm_registry()
 
         llm_cfg = self.config.get("llm", {}) or {}

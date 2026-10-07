@@ -1035,7 +1035,10 @@ def _assistant_to_blocks(m: Dict[str, Any]) -> List[Dict[str, Any]]:
             "input": args,
         })
 
-    return blocksdef _merge_usage(existing: Dict[str, int], incoming: Dict[str, Any]) -> Dict[str, int]:
+    return blocks
+
+
+def _merge_usage(existing: Dict[str, int], incoming: Dict[str, Any]) -> Dict[str, int]:
     """Anthropic reports usage twice (message_start and message_delta)."""
     out = dict(existing or {})
     for k, v in _normalize_usage(incoming).items():

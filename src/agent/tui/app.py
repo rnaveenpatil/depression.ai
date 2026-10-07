@@ -17,8 +17,11 @@ from textual.screen import ModalScreen
 from textual.widgets import Button, Footer, Input, Select, Static
 
 from agent.agent.dual_agent import AgentCoordinator
-from agent.llm.provider import get_llm_registry
-from agent.llm.runtime import configure_runtime_provider, load_runtime_config
+from agent.llm.runtime import (
+    configure_runtime_provider,
+    get_llm_registry,
+    load_runtime_config,
+)
 from agent.utils.env_manager import (
     EnvManager,
     get_aws_credentials,

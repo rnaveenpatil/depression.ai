@@ -733,7 +733,7 @@ class Config:
         """
         if registry is None:
             try:
-                from agent.llm.provider import get_llm_registry
+                from agent.llm.runtime import get_llm_registry
                 registry = get_llm_registry()
             except Exception as e:
                 logger.debug(f"LLM registry unavailable: {e}")

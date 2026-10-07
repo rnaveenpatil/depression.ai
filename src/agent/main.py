@@ -371,7 +371,7 @@ Examples:
         # 9. Context ---------------------------------------------------
         ctx_cfg = self.config_dict.get("context", {}) or {}
         # Pass LLM registry through so the compactor can summarize
-        from agent.llm.provider import get_llm_registry
+        from agent.llm.runtime import get_llm_registry
         llm_registry = get_llm_registry()
 
         self.context_manager = ContextManager(
