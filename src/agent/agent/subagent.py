@@ -135,7 +135,7 @@ class SubAgentManager:
         logger.info("SubAgentManager initialized with roles: %s", list(self.subagent_configs.keys()))
 
     async def initialize(self) -> None:
-        from agent.llm.provider import get_llm_registry
+        from agent.llm.runtime import get_llm_registry
         self.llm_registry = get_llm_registry()
 
         llm_cfg = self.agent.config.get("llm", {}) or {}

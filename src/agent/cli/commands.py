@@ -109,7 +109,7 @@ class CommandProcessor:
             return self.agent.llm_registry
         # Fallback: lazily import the global registry
         try:
-            from agent.llm.provider import get_llm_registry
+            from agent.llm.runtime import get_llm_registry
             return get_llm_registry()
         except Exception as e:
             logger.warning(f"Could not resolve LLM registry: {e}")

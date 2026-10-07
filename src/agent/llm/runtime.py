@@ -30,11 +30,12 @@ from __future__ import annotations
 import asyncio
 import os
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import urlparse
 
 from agent.llm.provider import (
     LLMProvider,
+    LLMResponse,
     ModelInfo,
     ProviderConfig,
     ProviderError,
@@ -121,9 +122,449 @@ _FAMILY_FALLBACKS: Dict[str, Dict[str, Any]] = {
     },
 }
 
-# Reasonable defaults for the adapter constructor.
-_DEFAULT_TIMEOUT = 120.0
+# Fail fast: one hung request should not stall the whole turn for two
+# minutes. Matches the documented "30s x 2 retries" behaviour.
+_DEFAULT_TIMEOUT = 30.0
 _DEFAULT_MAX_RETRIES = 2
+
+
+# ======================================================================
+# MODEL CATALOG
+# ======================================================================
+#
+# Starts empty — there is no built-in model list anywhere in this
+# codebase. `install_provider()` fills it in when the user connects, and
+# everything downstream (cost accounting, context limits, model pickers)
+# reads it. Until then those callers simply see empty/zero values.
+
+#: Context window assumed when the connected model's is unknown or tiny.
+DEFAULT_CONTEXT_WINDOW = 8_192
+
+#: model id -> metadata (context_window, cost_input, capabilities, ...)
+MODEL_METADATA: Dict[str, Dict[str, Any]] = {}
+
+
+# ======================================================================
+# PROVIDER REGISTRY
+# ======================================================================
+
+class LLMProviderRegistry:
+    """
+    Process-wide holder for the active provider, model, and model catalog.
+
+    Begins empty. `agent.llm.runtime` owns the install path — connecting
+    (TUI / CLI / persisted env) calls `install_provider()`; nothing else
+    ever puts a provider in here.
+
+    Note the two provider names in play:
+
+        install name  — "custom", the key in `providers` and what
+                        `get_current_provider()` returns.
+        family        — the adapter family the metadata was built from
+                        ("openai-compatible", "anthropic", ...). It is
+                        what `MODEL_METADATA[model]["provider"]` and the
+                        model-list group key say.
+
+    `_model_owner` maps model id -> install name so lookups work with
+    either spelling.
+    """
+
+    def __init__(self) -> None:
+        self.providers: Dict[str, LLMProvider] = {}
+        self._model_owner: Dict[str, str] = {}
+        self._current_provider: Optional[str] = None
+        self._current_model: Optional[str] = None
+        self._api_keys: Dict[str, str] = {}
+        self._fallback_chain: List[str] = []
+
+        logger.info("LLM registry initialized (empty; connect a model first)")
+
+    # ------------------------------------------------------------------
+    # INSTALL / REMOVE
+    # ------------------------------------------------------------------
+
+    def install_provider(
+        self,
+        name: str,
+        provider: LLMProvider,
+        api_key: Optional[str] = None,
+        model: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """
+        Push a runtime provider into the registry.
+
+        Called by this module's `configure_runtime_provider*()`. Idempotent:
+        reinstalling the same name replaces the entry.
+        """
+        self.providers[name] = provider
+        if api_key:
+            self._api_keys[name] = api_key
+            provider.api_key = api_key
+
+        if model:
+            self._current_provider = name
+            self._current_model = model
+            self._model_owner[model] = name
+            if metadata:
+                MODEL_METADATA[model] = dict(metadata)
+            else:
+                MODEL_METADATA[model] = {
+                    "provider": name,
+                    "name": model,
+                    "description": "User-connected runtime model",
+                    "context_window": DEFAULT_CONTEXT_WINDOW,
+                    "max_output": 4_096,
+                    "cost_input": 0.0,
+                    "cost_output": 0.0,
+                    "capabilities": ["text", "function_calling"],
+                    "recommended_for": ["agentic tasks"],
+                    "speed": "provider-dependent",
+                    "quality": "provider-dependent",
+                }
+
+        logger.info(
+            "Installed runtime provider %r (model=%s)", name, model or "(none)"
+        )
+
+    def uninstall_provider(self, name: str) -> bool:
+        """Remove a runtime provider and everything registered for it."""
+        provider = self.providers.pop(name, None)
+        self._api_keys.pop(name, None)
+        if provider is None:
+            return False
+        for model in [
+            m for m, owner in self._model_owner.items() if owner == name
+        ]:
+            self._model_owner.pop(model, None)
+            MODEL_METADATA.pop(model, None)
+        if self._current_provider == name:
+            self._current_provider = None
+            self._current_model = None
+        return True
+
+    # ------------------------------------------------------------------
+    # LOOKUP HELPERS
+    # ------------------------------------------------------------------
+
+    def _provider_for(self, model_id: str) -> Optional[LLMProvider]:
+        """Resolve the installed provider serving `model_id`, if any."""
+        owner = self._model_owner.get(model_id)
+        if owner and owner in self.providers:
+            return self.providers[owner]
+
+        family = (MODEL_METADATA.get(model_id) or {}).get("provider")
+        if not family:
+            return None
+        if family in self.providers:
+            return self.providers[family]
+        for provider in self.providers.values():
+            if getattr(provider, "name", "") == family:
+                return provider
+        return None
+
+    def _family_of(self, model_id: str) -> str:
+        meta = MODEL_METADATA.get(model_id) or {}
+        return str(meta.get("provider") or self._model_owner.get(model_id) or "")
+
+    # ------------------------------------------------------------------
+    # MODEL DISCOVERY
+    # ------------------------------------------------------------------
+
+    def list_all_models(self) -> Dict[str, List[Dict[str, Any]]]:
+        """All known models grouped by provider family."""
+        result: Dict[str, List[Dict[str, Any]]] = {}
+        for model_id in MODEL_METADATA:
+            entry = self.get_model_info(model_id)
+            if entry is None:
+                continue
+            result.setdefault(self._family_of(model_id), []).append(entry)
+        return result
+
+    async def list_all_models_async(self) -> Dict[str, List[Dict[str, Any]]]:
+        """Async twin of `list_all_models()` (the CLI prefers this one)."""
+        return self.list_all_models()
+
+    def list_models(self, provider: Optional[str] = None) -> List[Dict[str, Any]]:
+        """Flat list of models, optionally filtered by family or install name."""
+        if not provider:
+            return [
+                m
+                for models in self.list_all_models().values()
+                for m in models
+            ]
+        return [
+            entry
+            for model_id in MODEL_METADATA
+            if provider in (self._family_of(model_id), self._model_owner.get(model_id))
+            for entry in [self.get_model_info(model_id)]
+            if entry is not None
+        ]
+
+    def list_providers(self) -> List[str]:
+        """Installed provider names (the keys of `providers`)."""
+        return list(self.providers.keys())
+
+    def get_model_info(self, model_id: str) -> Optional[Dict[str, Any]]:
+        """Detailed info for one model, or None if it isn't registered."""
+        meta = MODEL_METADATA.get(model_id)
+        if meta is None:
+            return None
+        owner = self._model_owner.get(model_id)
+        return {
+            "id": model_id,
+            "model": model_id,
+            **meta,
+            "provider": self._family_of(model_id),
+            "installed_as": owner,
+            "available": self.is_model_available(self._family_of(model_id), model_id),
+        }
+
+    def is_model_available(self, provider: str, model: str) -> bool:
+        """
+        Is `model` installed and its provider usable?
+
+        `provider` may be either the install name ("custom") or the
+        family the model's metadata was built from.
+        """
+        meta = MODEL_METADATA.get(model)
+        if not meta:
+            return False
+        owner = self._model_owner.get(model)
+        if provider and provider not in (owner, meta.get("provider")):
+            return False
+        active = self.providers.get(owner or "") or self._provider_for(model)
+        if active is None:
+            return False
+        return bool(active.is_configured())
+
+    # ------------------------------------------------------------------
+    # MODEL SELECTION
+    # ------------------------------------------------------------------
+
+    def set_model(self, model_id: str) -> Dict[str, Any]:
+        """Switch to a registered model."""
+        info = self.get_model_info(model_id)
+        if not info:
+            return {"success": False, "error": f"Model '{model_id}' not found in registry"}
+        if not info["available"]:
+            return {
+                "success": False,
+                "error": f"Model '{model_id}' not available (connect the provider first)",
+            }
+        owner = info.get("installed_as") or info.get("provider")
+        self._current_provider = owner
+        self._current_model = model_id
+        logger.info("Switched to model: %s/%s", owner, model_id)
+        return {"success": True, "provider": owner, "model": model_id}
+
+    def set_provider(self, provider_name: str) -> bool:
+        """Switch provider by install name or by family."""
+        target = provider_name if provider_name in self.providers else None
+        if target is None:
+            target = next(
+                (
+                    name
+                    for name, p in self.providers.items()
+                    if getattr(p, "name", "") == provider_name
+                ),
+                None,
+            )
+        if target is None:
+            target = next(
+                (
+                    owner
+                    for model, owner in self._model_owner.items()
+                    if MODEL_METADATA.get(model, {}).get("provider") == provider_name
+                    and owner in self.providers
+                ),
+                None,
+            )
+        if target is None:
+            return False
+
+        self._current_provider = target
+        if not self._current_model or self._model_owner.get(self._current_model) != target:
+            self._current_model = next(
+                (
+                    model
+                    for model, owner in self._model_owner.items()
+                    if owner == target
+                ),
+                self._current_model,
+            )
+        return True
+
+    def set_fallback_chain(self, models: List[str]) -> None:
+        """Ordered alternates tried when the primary model fails."""
+        self._fallback_chain = [m for m in (models or []) if m]
+
+    def get_fallback_chain(self) -> List[str]:
+        return list(self._fallback_chain)
+
+    def set_api_key(self, provider: str, key: str) -> None:
+        """Store an API key for an installed provider."""
+        self._api_keys[provider] = key
+        installed = self.providers.get(provider)
+        if installed is not None:
+            installed.api_key = key
+        logger.info("API key set for provider: %s", provider)
+
+    def get_api_key(self, provider: str) -> Optional[str]:
+        return self._api_keys.get(provider)
+
+    def get_current_model(self) -> Optional[str]:
+        return self._current_model
+
+    def get_current_provider(self) -> Optional[str]:
+        return self._current_provider
+
+    def get_context_limit(self) -> int:
+        """Context window for the active model, with a sane floor."""
+        meta = MODEL_METADATA.get(self._current_model or "") or {}
+        try:
+            window = int(meta.get("context_window") or 0)
+        except (TypeError, ValueError):
+            window = 0
+        return window if window >= 2048 else DEFAULT_CONTEXT_WINDOW
+
+    # ------------------------------------------------------------------
+    # COMPLETION
+    # ------------------------------------------------------------------
+
+    async def complete(
+        self,
+        messages: Sequence[Any],
+        model: Optional[str] = None,
+        temperature: float = 0.1,
+        max_tokens: int = 4096,
+        tools: Optional[Sequence[Any]] = None,
+        tool_choice: Optional[str] = None,
+        **kwargs: Any,
+    ) -> LLMResponse:
+        """
+        Send a completion through the active provider.
+
+        On a retryable failure the fallback chain (if any) is walked in
+        order; the last error is re-raised when every candidate fails.
+        """
+        primary = model or self._current_model
+        if not primary:
+            raise ProviderError(
+                "No model selected. Connect a model first (TUI /connect, "
+                "or set DEPRESSION_BASE_URL / DEPRESSION_MODEL).",
+                code=ProviderErrorCode.MODEL_NOT_FOUND,
+            )
+
+        candidates = [primary]
+        for fallback in self._fallback_chain:
+            if fallback and fallback not in candidates:
+                candidates.append(fallback)
+
+        request: Dict[str, Any] = {
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+            "tools": tools,
+            "tool_choice": tool_choice,
+        }
+        request.update(kwargs)
+
+        last_error: Optional[BaseException] = None
+        for candidate in candidates:
+            provider = self._provider_for(candidate)
+            if provider is None:
+                last_error = ProviderError(
+                    f"No installed provider for model: {candidate}",
+                    code=ProviderErrorCode.MODEL_NOT_FOUND,
+                    model=candidate,
+                )
+                continue
+            try:
+                return await provider.chat(
+                    messages, model=candidate, **request
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                last_error = exc
+                logger.warning(
+                    "Model %s failed (%s); trying next fallback",
+                    candidate, exc,
+                )
+                continue
+
+        if isinstance(last_error, ProviderError):
+            raise last_error
+        raise ProviderError(
+            f"All models failed. Last error: {last_error}",
+            code=ProviderErrorCode.UNKNOWN,
+            model=primary,
+            cause=last_error if isinstance(last_error, BaseException) else None,
+        )
+
+    async def complete_with_tools(
+        self,
+        messages: Sequence[Any],
+        tools: Sequence[Any],
+        model: Optional[str] = None,
+        temperature: float = 0.1,
+        **kwargs: Any,
+    ) -> LLMResponse:
+        """`complete()` with a tool list — the shape the agent loop uses."""
+        return await self.complete(
+            messages=messages,
+            model=model,
+            temperature=temperature,
+            tools=tools,
+            **kwargs,
+        )
+
+    # ------------------------------------------------------------------
+    # HEALTH
+    # ------------------------------------------------------------------
+
+    def has_model(self) -> bool:
+        """True if a model is selected and its provider is installed."""
+        if not self._current_model:
+            return False
+        return self._provider_for(self._current_model) is not None
+
+    def is_healthy(self) -> bool:
+        """True when at least one installed provider can make a call."""
+        if not self.providers:
+            return False
+        return any(p.is_configured() for p in self.providers.values())
+
+    async def reconnect_all(self) -> None:
+        """Best-effort restart of every installed provider."""
+        for name, provider in self.providers.items():
+            try:
+                if not provider.started:
+                    await provider.start()
+                logger.debug("Reconnected provider: %s", name)
+            except Exception as exc:
+                logger.warning("Failed to reconnect %s: %s", name, exc)
+
+
+# ======================================================================
+# GLOBAL REGISTRY
+# ======================================================================
+
+_registry: Optional[LLMProviderRegistry] = None
+
+
+def get_llm_registry() -> LLMProviderRegistry:
+    """Get (or lazily create) the process-wide registry."""
+    global _registry
+    if _registry is None:
+        _registry = LLMProviderRegistry()
+    return _registry
+
+
+def reset_llm_registry() -> None:
+    """Drop the process-wide registry (tests use this for isolation)."""
+    global _registry
+    _registry = None
 
 
 # ======================================================================
@@ -709,6 +1150,13 @@ __all__ = [
     "FAMILY_ANTHROPIC",
     "FAMILY_OLLAMA",
     "FAMILY_GEMINI",
+    # Model catalog
+    "MODEL_METADATA",
+    "DEFAULT_CONTEXT_WINDOW",
+    # Registry
+    "LLMProviderRegistry",
+    "get_llm_registry",
+    "reset_llm_registry",
     # Config
     "load_runtime_config",
     "save_runtime_config",

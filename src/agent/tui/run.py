@@ -18,8 +18,11 @@ if str(_REPO_ROOT / "src") not in sys.path:
 
 def main() -> None:
     from agent.main import CLIAgent
-    from agent.llm.provider import get_llm_registry
-    from agent.llm.runtime import load_runtime_config, configure_runtime_provider
+    from agent.llm.runtime import (
+        configure_runtime_provider,
+        get_llm_registry,
+        load_runtime_config,
+    )
 
     cli = CLIAgent()
     args = cli.parse_arguments()

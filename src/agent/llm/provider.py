@@ -440,6 +440,53 @@ class LLMProvider(ABC):
         return False
 
     # ------------------------------------------------------------------
+    # CONFIG SHORTHANDS
+    # ------------------------------------------------------------------
+    # Call sites (and the registry) talk about `provider.api_key` /
+    # `provider.base_url` without reaching into `.config`. These are
+    # plain pass-throughs to the ProviderConfig — no extra state.
+
+    @property
+    def api_key(self) -> Optional[str]:
+        return self.config.api_key
+
+    @api_key.setter
+    def api_key(self, value: Optional[str]) -> None:
+        self.config.api_key = value
+
+    @property
+    def base_url(self) -> Optional[str]:
+        return self.config.base_url
+
+    @base_url.setter
+    def base_url(self, value: Optional[str]) -> None:
+        self.config.base_url = value
+
+    @property
+    def timeout(self) -> float:
+        return self.config.timeout
+
+    @timeout.setter
+    def timeout(self, value: float) -> None:
+        self.config.timeout = float(value)
+
+    @property
+    def max_retries(self) -> int:
+        return self.config.max_retries
+
+    @max_retries.setter
+    def max_retries(self, value: int) -> None:
+        self.config.max_retries = int(value)
+
+    @property
+    def default_model(self) -> Optional[str]:
+        return self.config.default_model
+
+    @default_model.setter
+    def default_model(self, value: Optional[str]) -> None:
+        self.config.default_model = value
+
+    # ------------------------------------------------------------------
     # LIFECYCLE
     # ------------------------------------------------------------------
 

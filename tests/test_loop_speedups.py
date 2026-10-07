@@ -7,7 +7,8 @@ from types import SimpleNamespace
 import pytest
 
 from agent.agent.loop import AgentLoop
-from agent.llm.provider import LLMResponse, ToolCall, get_llm_registry, reset_llm_registry
+from agent.llm.provider import LLMResponse, ToolCall
+from agent.llm.runtime import get_llm_registry, reset_llm_registry
 from agent.llm.runtime import configure_runtime_provider
 
 

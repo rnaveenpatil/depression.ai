@@ -38,7 +38,8 @@ from enum import Enum
 from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 from agent.agent.planner import Plan, Planner, TaskStatus
-from agent.llm.provider import LLMProvider, Message, ToolCall, MODEL_METADATA
+from agent.llm.provider import LLMProvider, Message, ToolCall
+from agent.llm.runtime import MODEL_METADATA
 from agent.tools.registry import ToolRegistry, INTENT_CATEGORIES
 from agent.utils.errors import TimeoutError
 from agent.utils.logging import get_logger
@@ -1450,7 +1451,7 @@ Never claim success without evidence.
         except Exception:
             pass
         try:
-            from agent.llm.provider import MODEL_METADATA, DEFAULT_CONTEXT_WINDOW
+            from agent.llm.runtime import MODEL_METADATA, DEFAULT_CONTEXT_WINDOW
             model = self.llm.get_current_model()
             meta = MODEL_METADATA.get(model, {}) if model else {}
             w = int(meta.get("context_window") or 0)
