@@ -1,61 +1,214 @@
 """Generic OpenAI-compatible provider adapter.
 
-Supports providers exposing POST /chat/completions with standard tool calls.
-This lets users supply a provider/model/base URL/API key without adding a new
-hard-coded provider class for every compatible gateway.
+Handles every backend that speaks OpenAI's HTTP shape:
 
-Tool call argument policy:
-    * If the provider returns `arguments` as a JSON string, it is parsed.
-    * Malformed JSON does NOT become {"_raw": ...}. Instead the ToolCall
-      carries an empty arguments dict plus a `parse_error` field. The
-      runtime's ToolRegistry validator will reject it and the loop will
-      ask the model to re-emit the call with valid JSON.
-    * Tool calls missing a name are dropped (they cannot be dispatched).
-    * Missing ids are synthesized so the tool result can always be paired.
+    POST /chat/completions      (non-streaming and streaming)
+    GET  /models                (model discovery, optional)
+
+Tested against the shape used by OpenAI, Groq, DeepSeek, OpenRouter,
+Together, NVIDIA NIM, and the many "openai-compatible" local servers
+(vLLM, LM Studio, llama.cpp's server, text-generation-webui, ...).
+
+What this file owns
+-------------------
+    * Request building       — message normalisation, tool spec passthrough
+    * Response parsing       — content, usage, finish_reason, tool calls
+    * Streaming              — SSE parsing with tool-call reassembly
+    * Errors                 — every httpx/JSON failure mapped to
+                               ProviderError with a stable code
+    * Retries                — on 408/409/425/429/5xx, honoring Retry-After
+    * Lifecycle              — one long-lived httpx.AsyncClient per provider
+
+What this file does NOT own
+---------------------------
+    * Model selection, fallback chains, cost tables  — those live in
+      agent.llm.runtime / the registry.
+    * Tool execution                                 — the loop dispatches.
+
+Tool-call argument policy
+-------------------------
+    * `arguments` arrives as a JSON string. It is parsed into a dict.
+    * Malformed JSON does NOT become {"_raw": ...}. The ToolCall carries
+      arguments={} plus a `parse_error` string; the loop re-prompts the
+      model with that error.
+    * Calls missing a `name` are dropped (nothing to dispatch).
+    * Calls missing an `id` get a synthesized one so the tool result can
+      always be paired back to the assistant turn.
 """
+
 from __future__ import annotations
 
 import asyncio
 import json
+import random
 import uuid
-from typing import Any, Dict, List, Optional
+from typing import Any, AsyncIterator, Dict, List, Optional, Sequence, Tuple
 
 import httpx
 
-from agent.llm.provider import LLMProvider, LLMResponse, Message, ToolCall
-from agent.utils.errors import LLMError
+from agent.llm.provider import (
+    FinishReason,
+    LLMProvider,
+    LLMResponse,
+    Message,
+    ModelInfo,
+    ProviderConfig,
+    ProviderError,
+    ProviderErrorCode,
+    ToolCall,
+    ToolSpec,
+)
 from agent.utils.logging import get_logger
 
 logger = get_logger(__name__)
 
 
-# HTTP statuses that are worth retrying.
+# ======================================================================
+# CONSTANTS
+# ======================================================================
+
+# HTTP statuses worth retrying. 401/403/404/422 are not — they need the
+# user to fix something.
 _RETRYABLE_STATUSES = {408, 409, 425, 429, 500, 502, 503, 504}
 
-# Fields on Message.to_dict() we pass through. Anything not listed is
-# dropped to keep the request shape tight.
+# Message keys we forward. Anything else is dropped so the request body
+# stays spec-shaped.
 _ALLOWED_MESSAGE_KEYS = {"role", "content", "name", "tool_call_id", "tool_calls"}
 
+# Optional top-level body fields we'll forward if the caller supplies them.
+_PASSTHROUGH_BODY_KEYS = (
+    "top_p",
+    "stop",
+    "presence_penalty",
+    "frequency_penalty",
+    "logit_bias",
+    "logprobs",
+    "top_logprobs",
+    "seed",
+    "user",
+    "response_format",
+    "parallel_tool_calls",
+)
+
+# Auth-related codes that map to ProviderErrorCode.AUTH.
+_AUTH_STATUSES = {401, 403}
+
+
+# ======================================================================
+# PROVIDER
+# ======================================================================
 
 class OpenAICompatibleProvider(LLMProvider):
+    """
+    Adapter for any endpoint that implements OpenAI's chat completions API.
+
+    Configure with a base URL, API key, and (optionally) a default model:
+
+        OpenAICompatibleProvider(ProviderConfig(
+            api_key="sk-...",
+            base_url="https://api.openai.com/v1",
+            default_model="gpt-4o-mini",
+        ))
+
+    `base_url` should point at the API root that contains `/chat/completions`
+    and `/models` — i.e. usually ending in `/v1`. The trailing slash is
+    stripped.
+    """
+
     name = "openai-compatible"
 
+    def __init__(self, config: Optional[Any] = None):
+        super().__init__(config)
+        self._client: Optional[httpx.AsyncClient] = None
+
     # ------------------------------------------------------------------
-    # Message serialization
+    # LIFECYCLE
+    # ------------------------------------------------------------------
+
+    async def start(self) -> None:
+        """Open the shared HTTP client. Safe to call more than once."""
+        if self._client is not None:
+            self._started = True
+            return
+        headers = {"Content-Type": "application/json"}
+        if self.config.api_key:
+            headers["Authorization"] = f"Bearer {self.config.api_key}"
+        if self.config.organization:
+            headers["OpenAI-Organization"] = self.config.organization
+
+        base = (self.config.base_url or "").rstrip("/")
+        self._client = httpx.AsyncClient(
+            base_url=base,
+            headers=headers,
+            timeout=httpx.Timeout(
+                connect=min(15.0, self.config.timeout),
+                read=self.config.timeout,
+                write=self.config.timeout,
+                pool=self.config.timeout,
+            ),
+            # Follow redirects; some gateways put /v1 behind a 308.
+            follow_redirects=True,
+        )
+        self._started = True
+
+    async def close(self) -> None:
+        """Close the shared HTTP client."""
+        client, self._client = self._client, None
+        if client is not None:
+            try:
+                await client.aclose()
+            except Exception:
+                pass
+        self._started = False
+
+    def _require_client(self) -> httpx.AsyncClient:
+        if self._client is None:
+            raise ProviderError(
+                "Provider not started. Call `await provider.start()` first.",
+                code=ProviderErrorCode.UNKNOWN,
+                provider=self.name,
+            )
+        return self._client
+
+    # ------------------------------------------------------------------
+    # CAPABILITY / CONFIG
+    # ------------------------------------------------------------------
+
+    def is_configured(self) -> bool:
+        return bool(self.config.api_key) and bool(self.config.base_url)
+
+    def _is_local(self) -> bool:
+        base = (self.config.base_url or "").lower()
+        return any(h in base for h in ("localhost", "127.0.0.1", "0.0.0.0", "::1"))
+
+    def capabilities(self) -> Dict[str, bool]:
+        # Anything OpenAI-compatible will at least do these.
+        return {
+            "tools": True,
+            "streaming": True,
+            "vision": False,      # per-model
+            "json_mode": True,    # many gateways support response_format
+            "system_prompt": True,
+            "parallel_tool_calls": True,
+        }
+
+    # ------------------------------------------------------------------
+    # MESSAGE NORMALISATION
     # ------------------------------------------------------------------
 
     @staticmethod
     def _normalize_message(m: Any) -> Dict[str, Any]:
+        """
+        Turn a Message (or dict, or duck-typed object) into the exact
+        body shape the OpenAI spec accepts.
+        """
         if isinstance(m, Message):
             d = m.to_dict()
         elif isinstance(m, dict):
             d = dict(m)
         else:
-            # Best-effort duck typing for callers that pass a foreign type.
-            d = {
-                "role": getattr(m, "role", "user"),
-                "content": getattr(m, "content", ""),
-            }
+            d = {"role": getattr(m, "role", "user"),
+                 "content": getattr(m, "content", "")}
             tc = getattr(m, "tool_calls", None)
             if tc:
                 d["tool_calls"] = tc
@@ -71,17 +224,18 @@ class OpenAICompatibleProvider(LLMProvider):
             if k not in d:
                 continue
             v = d[k]
-            # The OpenAI spec requires content=null (not "") when tool_calls
-            # are present on an assistant message.
+
             if k == "content":
+                # The spec requires content=null when tool_calls are present
+                # on an assistant message. Some gateways reject "" there.
                 if v == "" and d.get("tool_calls"):
                     out[k] = None
-                elif v == "" and d.get("role") == "assistant" and not d.get("tool_calls"):
-                    # Some gateways accept "", others prefer null. Keep ""
-                    # for a plain assistant turn.
-                    out[k] = ""
                 else:
                     out[k] = v
+            elif k == "tool_calls":
+                # Ensure each call is in the {"id","type","function":{...}}
+                # shape the API expects, whatever we were handed.
+                out[k] = OpenAICompatibleProvider._normalize_tool_calls_out(v)
             else:
                 out[k] = v
 
@@ -92,8 +246,51 @@ class OpenAICompatibleProvider(LLMProvider):
 
         return out
 
+    @staticmethod
+    def _normalize_tool_calls_out(calls: Any) -> List[Dict[str, Any]]:
+        """Coerce outgoing tool calls into the exact wire shape."""
+        if not calls:
+            return []
+        out: List[Dict[str, Any]] = []
+        for tc in calls:
+            if isinstance(tc, ToolCall):
+                out.append({
+                    "id": tc.id,
+                    "type": "function",
+                    "function": {
+                        "name": tc.name,
+                        "arguments": _args_to_json_string(tc.arguments),
+                    },
+                })
+                continue
+            if not isinstance(tc, dict):
+                continue
+            # Already shaped.
+            if "function" in tc and isinstance(tc["function"], dict):
+                fn = dict(tc["function"])
+                fn["arguments"] = _args_to_json_string(fn.get("arguments", {}))
+                out.append({
+                    "id": tc.get("id") or f"call_{uuid.uuid4().hex[:12]}",
+                    "type": tc.get("type", "function"),
+                    "function": fn,
+                })
+                continue
+            # Flat shape: {"id","name","arguments"}.
+            name = tc.get("name") or (tc.get("function") or {}).get("name")
+            if not name:
+                continue
+            out.append({
+                "id": tc.get("id") or f"call_{uuid.uuid4().hex[:12]}",
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "arguments": _args_to_json_string(tc.get("arguments", {})),
+                },
+            })
+        return out
+
     # ------------------------------------------------------------------
-    # Tool call parsing (the important part)
+    # TOOL CALL PARSING (incoming)
     # ------------------------------------------------------------------
 
     @staticmethod
@@ -105,7 +302,7 @@ class OpenAICompatibleProvider(LLMProvider):
         arguments={} plus a `parse_error` attribute the loop reads back.
         """
         out: List[ToolCall] = []
-        for idx, tc in enumerate(raw_calls or []):
+        for tc in raw_calls or []:
             if not isinstance(tc, dict):
                 logger.warning("Skipping non-dict tool_call: %r", tc)
                 continue
@@ -113,22 +310,14 @@ class OpenAICompatibleProvider(LLMProvider):
             fn = tc.get("function") or {}
             name = fn.get("name") or tc.get("name") or ""
             if not name:
-                logger.warning(
-                    "Skipping tool_call with no name (id=%r)", tc.get("id")
-                )
+                logger.warning("Skipping tool_call with no name (id=%r)", tc.get("id"))
                 continue
 
             call_id = tc.get("id") or f"call_{uuid.uuid4().hex[:12]}"
-            if not tc.get("id"):
-                logger.debug("Tool call missing id; synthesized %s", call_id)
-
             raw_args = fn.get("arguments", tc.get("arguments"))
             args, parse_error = OpenAICompatibleProvider._coerce_args(raw_args)
 
             call = ToolCall(id=call_id, name=name, arguments=args)
-            # Attach parse_error as a plain attribute; ToolCall is a dataclass
-            # so we can setattr freely. If a future version freezes it, we
-            # fall back to embedding the error inside arguments.
             if parse_error:
                 try:
                     setattr(call, "parse_error", parse_error)
@@ -138,140 +327,446 @@ class OpenAICompatibleProvider(LLMProvider):
         return out
 
     @staticmethod
-    def _coerce_args(raw: Any) -> tuple[Dict[str, Any], Optional[str]]:
-        """
-        Return (args_dict, parse_error). args_dict is always a dict.
-        parse_error is a short human-readable string or None.
-        """
+    def _coerce_args(raw: Any) -> Tuple[Dict[str, Any], Optional[str]]:
+        """Return (args_dict, parse_error_or_None). args_dict is always a dict."""
         if raw is None or raw == "":
             return {}, None
         if isinstance(raw, dict):
             return raw, None
         if not isinstance(raw, str):
-            # Provider sent an int/list/etc. Wrap it so the caller can see
-            # the shape, but flag it as invalid for the schema.
             return {}, f"tool arguments were {type(raw).__name__}, not JSON string or object"
 
-        # Trim and try to parse. Some gateways pad with whitespace or
-        # append a trailing newline.
         s = raw.strip()
         try:
             parsed = json.loads(s)
         except json.JSONDecodeError as e:
-            # Truncated JSON is the most common failure. Give the model a
-            # hint about how much was lost.
             return {}, f"invalid JSON arguments ({e.msg} at pos {e.pos})"
 
         if isinstance(parsed, dict):
             return parsed, None
-        # Valid JSON but not an object: wrap it so downstream validation
-        # reports a clear type error.
         return {}, f"tool arguments parsed as {type(parsed).__name__}, expected object"
 
     # ------------------------------------------------------------------
-    # Completion
+    # REQUEST BODY
     # ------------------------------------------------------------------
 
-    async def complete(
+    def _build_body(
         self,
-        messages: List[Any],
-        model: Optional[str] = None,
-        temperature: float = 0.1,
-        max_tokens: int = 4096,
-        tools: Optional[List[Dict[str, Any]]] = None,
-        **kwargs,
-    ) -> LLMResponse:
-        if not self.api_key:
-            raise LLMError("API key not configured")
-        if not self.base_url:
-            raise LLMError("Base URL not configured")
-        if not model:
-            raise LLMError("Model not configured")
-
-        normalized = [self._normalize_message(m) for m in messages]
-
-        payload: Dict[str, Any] = {
+        messages: Sequence[Any],
+        model: str,
+        temperature: float,
+        max_tokens: int,
+        tools: Optional[Sequence[Any]],
+        tool_choice: Optional[str],
+        stream: bool,
+        **kwargs: Any,
+    ) -> Dict[str, Any]:
+        body: Dict[str, Any] = {
             "model": model,
-            "messages": normalized,
+            "messages": [self._normalize_message(m) for m in messages],
             "temperature": temperature,
             "max_tokens": max_tokens,
         }
+        if stream:
+            body["stream"] = True
+            # Include usage in the final SSE chunk when the gateway supports it.
+            body.setdefault("stream_options", {"include_usage": True})
+
         if tools:
-            payload["tools"] = tools
-            payload["tool_choice"] = kwargs.get("tool_choice", "auto")
-        for key in ("response_format", "top_p", "stop", "presence_penalty",
-                    "frequency_penalty", "seed", "user"):
-            if key in kwargs and kwargs[key] is not None:
-                payload[key] = kwargs[key]
+            body["tools"] = [_tool_to_dict(t) for t in tools]
+            body["tool_choice"] = tool_choice or "auto"
+        elif tool_choice == "none":
+            body["tool_choice"] = "none"
 
-        headers = {
-            "Authorization": f"Bearer {self.api_key}",
-            "Content-Type": "application/json",
-        }
+        for key in _PASSTHROUGH_BODY_KEYS:
+            v = kwargs.get(key)
+            if v is not None:
+                body[key] = v
+        return body
 
-        last: Optional[Exception] = None
-        async with httpx.AsyncClient(
-            base_url=self.base_url.rstrip("/"),
-            headers=headers,
-            timeout=self.timeout,
-        ) as client:
-            for attempt in range(self.max_retries):
-                try:
-                    response = await client.post("/chat/completions", json=payload)
-                    response.raise_for_status()
-                    return self._parse(response.json(), model)
+    # ------------------------------------------------------------------
+    # NON-STREAMING
+    # ------------------------------------------------------------------
 
-                except httpx.HTTPStatusError as exc:
-                    last = exc
-                    status = exc.response.status_code
+    async def chat(
+        self,
+        messages: Sequence[Message],
+        *,
+        model: Optional[str] = None,
+        temperature: float = 0.1,
+        max_tokens: int = 4096,
+        tools: Optional[Sequence[ToolSpec]] = None,
+        tool_choice: Optional[str] = None,
+        stop: Optional[Sequence[str]] = None,
+        **kwargs: Any,
+    ) -> LLMResponse:
+        if not self.config.api_key:
+            raise ProviderError(
+                "API key not configured", code=ProviderErrorCode.AUTH, provider=self.name
+            )
+        if not self.config.base_url:
+            raise ProviderError(
+                "Base URL not configured", code=ProviderErrorCode.UNKNOWN, provider=self.name
+            )
 
-                    if status in _RETRYABLE_STATUSES:
-                        delay = self._retry_delay(attempt, exc.response)
-                        logger.warning(
-                            "LLM %s attempt %d/%d: HTTP %d, retrying in %.1fs",
-                            model, attempt + 1, self.max_retries, status, delay,
-                        )
-                        await asyncio.sleep(delay)
-                        continue
+        model = model or self.config.default_model
+        if not model:
+            raise ProviderError(
+                "Model not specified and no default configured",
+                code=ProviderErrorCode.UNKNOWN,
+                provider=self.name,
+            )
 
-                    if status == 401:
-                        raise LLMError(
-                            "Authentication failed — check the API key "
-                            f"for model '{model}'"
-                        )
-                    if status == 403:
-                        raise LLMError(
-                            f"Access forbidden for model '{model}' (403)"
-                        )
-                    if status == 404:
-                        raise LLMError(
-                            f"Model '{model}' not found at this endpoint (404)"
-                        )
-                    body = exc.response.text[:500]
-                    raise LLMError(f"LLM API error {status} for '{model}': {body}")
+        client = self._require_client()
+        body = self._build_body(
+            messages=messages, model=model,
+            temperature=temperature, max_tokens=max_tokens,
+            tools=tools, tool_choice=tool_choice, stream=False,
+            stop=stop, **kwargs,
+        )
 
-                except (httpx.TimeoutException, httpx.NetworkError) as exc:
-                    last = exc
-                    delay = self._retry_delay(attempt, getattr(exc, "response", None))
-                    logger.warning(
-                        "LLM %s attempt %d/%d: %s, retrying in %.1fs",
-                        model, attempt + 1, self.max_retries,
-                        type(exc).__name__, delay,
+        data = await self._post_json(client, "/chat/completions", body, model)
+        return self._parse(data, model)
+
+    # ------------------------------------------------------------------
+    # STREAMING (SSE)
+    # ------------------------------------------------------------------
+
+    async def stream(
+        self,
+        messages: Sequence[Message],
+        *,
+        model: Optional[str] = None,
+        temperature: float = 0.1,
+        max_tokens: int = 4096,
+        tools: Optional[Sequence[ToolSpec]] = None,
+        tool_choice: Optional[str] = None,
+        stop: Optional[Sequence[str]] = None,
+        **kwargs: Any,
+    ) -> AsyncIterator[LLMResponse]:
+        """
+        Yield incremental `LLMResponse` chunks.
+
+        Text arrives as `chunk.content` deltas. Tool calls accumulate on
+        the provider side and are emitted whole on the final chunk (their
+        JSON `arguments` are only complete when the stream ends).
+
+        If the gateway silently ignores `stream=True` and returns a normal
+        JSON body, we detect that and yield a single full response — the
+        caller sees the same contract either way.
+        """
+        if not self.config.api_key:
+            raise ProviderError(
+                "API key not configured", code=ProviderErrorCode.AUTH, provider=self.name
+            )
+        model = model or self.config.default_model
+        if not model:
+            raise ProviderError(
+                "Model not specified and no default configured",
+                code=ProviderErrorCode.UNKNOWN, provider=self.name,
+            )
+
+        client = self._require_client()
+        body = self._build_body(
+            messages=messages, model=model,
+            temperature=temperature, max_tokens=max_tokens,
+            tools=tools, tool_choice=tool_choice, stream=True,
+            stop=stop, **kwargs,
+        )
+
+        try:
+            async with client.stream("POST", "/chat/completions", json=body) as resp:
+                if resp.status_code >= 400:
+                    # Read the body so we can produce a useful message.
+                    text = await resp.aread()
+                    raise _status_to_error(
+                        resp.status_code, text.decode("utf-8", "replace"), model, self.name
                     )
-                    await asyncio.sleep(delay)
 
-        raise LLMError(
-            f"LLM request failed after {self.max_retries} attempts "
-            f"for model '{model}': {last}"
+                content_type = (resp.headers.get("content-type") or "").lower()
+                if "text/event-stream" not in content_type:
+                    # Gateway ignored streaming. Fall back to a single response.
+                    data = await resp.aread()
+                    try:
+                        parsed = json.loads(data.decode("utf-8"))
+                    except Exception:
+                        raise ProviderError(
+                            f"Non-SSE response could not be parsed (content-type={content_type})",
+                            code=ProviderErrorCode.SERVER,
+                            provider=self.name, model=model,
+                        )
+                    yield self._parse(parsed, model)
+                    return
+
+                async for chunk in self._iter_sse(resp, model):
+                    yield chunk
+
+        except httpx.TimeoutException as exc:
+            raise ProviderError(
+                f"Stream timed out after {self.config.timeout}s",
+                code=ProviderErrorCode.TIMEOUT,
+                provider=self.name, model=model,
+                retryable=True, cause=exc,
+            ) from exc
+        except httpx.NetworkError as exc:
+            raise ProviderError(
+                f"Network error during stream: {exc}",
+                code=ProviderErrorCode.CONNECTION,
+                provider=self.name, model=model,
+                retryable=True, cause=exc,
+            ) from exc
+        except ProviderError:
+            raise
+        except Exception as exc:
+            raise ProviderError(
+                f"Unexpected streaming failure: {exc}",
+                code=ProviderErrorCode.UNKNOWN,
+                provider=self.name, model=model, cause=exc,
+            ) from exc
+
+    async def _iter_sse(
+        self, resp: httpx.Response, model: str
+    ) -> AsyncIterator[LLMResponse]:
+        """
+        Parse the SSE body. OpenAI sends `data: {json}` lines terminated by
+        `data: [DONE]`. Every chunk is a partial ChatCompletion.
+        """
+        # Per-request state — reset for each stream() call.
+        content_buf: List[str] = []
+        tool_buf: Dict[int, Dict[str, Any]] = {}
+        finish_reason: str = FinishReason.STOP.value
+        usage: Dict[str, int] = {}
+
+        async for line in resp.aiter_lines():
+            if not line:
+                continue
+            if not line.startswith("data:"):
+                continue
+            payload = line[5:].strip()
+            if payload == "[DONE]":
+                break
+            try:
+                event = json.loads(payload)
+            except json.JSONDecodeError:
+                # Some gateways send keep-alives or comments.
+                continue
+
+            # Usage-only chunk (OpenAI emits one at the end when
+            # stream_options.include_usage is set).
+            if isinstance(event.get("usage"), dict):
+                usage = _normalize_usage(event["usage"])
+
+            choices = event.get("choices") or []
+            if not choices:
+                continue
+            choice = choices[0]
+            delta = choice.get("delta") or {}
+
+            # Text delta.
+            text = delta.get("content")
+            if text:
+                content_buf.append(text)
+                yield LLMResponse(
+                    content=text,
+                    model=model,
+                    provider=self.name,
+                    finish_reason="",
+                    usage={},
+                )
+
+            # Tool-call deltas. Each entry has an `index` that ties it to a
+            # specific call; name and arguments can arrive in pieces.
+            for tc_delta in delta.get("tool_calls") or []:
+                idx = int(tc_delta.get("index", 0) or 0)
+                slot = tool_buf.setdefault(idx, {
+                    "id": "", "name": "", "arguments": "",
+                })
+                if tc_delta.get("id"):
+                    slot["id"] = tc_delta["id"]
+                fn = tc_delta.get("function") or {}
+                if fn.get("name"):
+                    slot["name"] = (slot["name"] or "") + fn["name"] if slot["name"] else fn["name"]
+                if fn.get("arguments"):
+                    slot["arguments"] += fn["arguments"]
+
+            fr = choice.get("finish_reason")
+            if fr:
+                finish_reason = fr
+
+        # Final chunk: assembled tool calls and usage.
+        calls = self._parse_tool_calls(
+            [{"id": s["id"], "function": {"name": s["name"], "arguments": s["arguments"]}}
+             for _, s in sorted(tool_buf.items())]
+        )
+        if calls:
+            finish_reason = FinishReason.TOOL_CALLS.value
+
+        yield LLMResponse(
+            content="",
+            model=model,
+            provider=self.name,
+            tool_calls=calls,
+            finish_reason=finish_reason,
+            usage=usage or {},
+            raw={"streamed": True},
         )
 
     # ------------------------------------------------------------------
-    # Retry policy
+    # MODEL DISCOVERY
     # ------------------------------------------------------------------
+
+    def list_models(self) -> List[ModelInfo]:
+        """
+        Static list — always empty. Real discovery is async; call
+        `await discover_models()` instead. Kept for the abstract contract.
+        """
+        return []
+
+    async def discover_models(self) -> List[ModelInfo]:
+        """
+        GET /models and map to ModelInfo.
+
+        Returns an empty list when the gateway does not implement /models
+        or the call fails — this is a nice-to-have, not a hard failure.
+        """
+        if not self.config.base_url:
+            return []
+        try:
+            client = self._require_client()
+        except ProviderError:
+            # Lazy-start if the caller forgot.
+            await self.start()
+            client = self._require_client()
+
+        try:
+            resp = await client.get("/models")
+            resp.raise_for_status()
+            data = resp.json()
+        except Exception as exc:
+            logger.debug("Model discovery failed (%s): %s", self.name, exc)
+            return []
+
+        raw = data.get("data") if isinstance(data, dict) else None
+        if not isinstance(raw, list):
+            return []
+
+        out: List[ModelInfo] = []
+        for entry in raw:
+            if not isinstance(entry, dict):
+                continue
+            mid = entry.get("id") or entry.get("name")
+            if not mid:
+                continue
+            out.append(ModelInfo(
+                id=str(mid),
+                provider=self.name,
+                name=str(entry.get("name") or mid),
+                description=str(entry.get("description") or ""),
+                context_window=int(entry.get("context_length") or entry.get("context_window") or 0),
+                max_output=int(entry.get("max_output_tokens") or 0),
+                supports_tools=bool(entry.get("supports_tools", True)),
+                supports_streaming=bool(entry.get("supports_streaming", True)),
+                supports_vision=bool(entry.get("supports_vision", False)),
+                supports_json_mode=bool(entry.get("supports_json_mode", True)),
+            ))
+        return out
+
+    # ------------------------------------------------------------------
+    # HEALTH
+    # ------------------------------------------------------------------
+
+    async def health(self) -> bool:
+        """Cheap reachability probe via GET /models."""
+        if not self.is_configured():
+            return False
+        try:
+            client = self._require_client()
+        except ProviderError:
+            await self.start()
+            client = self._require_client()
+        try:
+            resp = await client.get("/models")
+            return resp.status_code < 500
+        except Exception:
+            return False
+
+    # ------------------------------------------------------------------
+    # TRANSPORT: POST WITH RETRIES
+    # ------------------------------------------------------------------
+
+    async def _post_json(
+        self,
+        client: httpx.AsyncClient,
+        path: str,
+        body: Dict[str, Any],
+        model: str,
+    ) -> Dict[str, Any]:
+        last_error: Optional[ProviderError] = None
+        attempts = max(1, int(self.config.max_retries) + 1)
+
+        for attempt in range(attempts):
+            try:
+                resp = await client.post(path, json=body)
+                if resp.status_code >= 400:
+                    raise _status_to_error(
+                        resp.status_code, resp.text, model, self.name
+                    )
+                return resp.json()
+
+            except ProviderError as exc:
+                last_error = exc
+                if not exc.retryable or attempt == attempts - 1:
+                    raise
+                delay = self._retry_delay(attempt, None)
+                logger.warning(
+                    "LLM %s attempt %d/%d: %s (retrying in %.1fs)",
+                    model, attempt + 1, attempts, exc.code, delay,
+                )
+                await asyncio.sleep(delay)
+
+            except httpx.TimeoutException as exc:
+                last_error = ProviderError(
+                    f"Request timed out after {self.config.timeout}s",
+                    code=ProviderErrorCode.TIMEOUT,
+                    provider=self.name, model=model,
+                    retryable=True, cause=exc,
+                )
+                if attempt == attempts - 1:
+                    raise last_error from exc
+                await asyncio.sleep(self._retry_delay(attempt, None))
+
+            except httpx.NetworkError as exc:
+                last_error = ProviderError(
+                    f"Network error: {exc}",
+                    code=ProviderErrorCode.CONNECTION,
+                    provider=self.name, model=model,
+                    retryable=True, cause=exc,
+                )
+                if attempt == attempts - 1:
+                    raise last_error from exc
+                await asyncio.sleep(self._retry_delay(attempt, None))
+
+            except json.JSONDecodeError as exc:
+                # A 200 with a broken body — not worth retrying.
+                raise ProviderError(
+                    f"Provider returned non-JSON body: {exc}",
+                    code=ProviderErrorCode.SERVER,
+                    provider=self.name, model=model,
+                    cause=exc,
+                ) from exc
+
+        # Unreachable, but keeps type checkers happy.
+        if last_error is not None:
+            raise last_error
+        raise ProviderError(
+            "Request failed with no error recorded",
+            code=ProviderErrorCode.UNKNOWN,
+            provider=self.name, model=model,
+        )
 
     @staticmethod
     def _retry_delay(attempt: int, response: Optional[httpx.Response]) -> float:
-        # Honor Retry-After if present and sane.
+        """Retry-After if sane, else exponential backoff with jitter."""
         if response is not None:
             ra = response.headers.get("retry-after")
             if ra:
@@ -280,12 +775,13 @@ class OpenAICompatibleProvider(LLMProvider):
                     if 0 < v <= 30:
                         return v
                 except Exception:
+                    # Retry-After can be an HTTP-date; we ignore those.
                     pass
-        # Exponential backoff, capped.
-        return min(2 ** attempt, 8)
+        base = min(2 ** attempt, 8)
+        return base + random.uniform(0, 0.25)
 
     # ------------------------------------------------------------------
-    # Response parsing
+    # RESPONSE PARSING
     # ------------------------------------------------------------------
 
     def _parse(self, data: Dict[str, Any], model: str) -> LLMResponse:
@@ -299,31 +795,173 @@ class OpenAICompatibleProvider(LLMProvider):
         if content is None:
             content = ""
 
-        usage = data.get("usage") or {}
-        prompt_tokens = int(usage.get("prompt_tokens", 0) or 0)
-        completion_tokens = int(usage.get("completion_tokens", 0) or 0)
-        total_tokens = int(usage.get("total_tokens", 0) or 0)
-        if not total_tokens:
-            total_tokens = prompt_tokens + completion_tokens
-
-        # Some providers (OpenAI, NIM) expose cached/detailed token counts.
-        details = usage.get("prompt_tokens_details") or {}
-        cached_tokens = int(details.get("cached_tokens", 0) or 0)
+        usage = _normalize_usage(data.get("usage") or {})
 
         return LLMResponse(
             content=content,
             model=model,
             provider=self.name,
-            usage={
-                "prompt_tokens": prompt_tokens,
-                "completion_tokens": completion_tokens,
-                "total_tokens": total_tokens,
-                "cached_tokens": cached_tokens,
-            },
+            usage=usage,
             tool_calls=calls,
-            finish_reason=choice.get("finish_reason", "stop"),
+            finish_reason=choice.get("finish_reason") or FinishReason.STOP.value,
             raw=data,
         )
 
-    def list_models(self) -> List[Dict[str, Any]]:
-        return []
+
+# ======================================================================
+# HELPERS
+# ======================================================================
+
+def _tool_to_dict(tool: Any) -> Dict[str, Any]:
+    """Normalise a ToolSpec (or already-shaped dict) into the wire form."""
+    if isinstance(tool, ToolSpec):
+        return tool.to_dict()
+    if isinstance(tool, dict):
+        # Already has the OpenAI shape?
+        if "type" in tool and "function" in tool:
+            return tool
+        # Flat shape — wrap it.
+        return {
+            "type": "function",
+            "function": {
+                "name": tool.get("name", ""),
+                "description": tool.get("description", ""),
+                "parameters": tool.get("parameters") or {"type": "object", "properties": {}},
+            },
+        }
+    raise ProviderError(
+        f"Unsupported tool spec type: {type(tool).__name__}",
+        code=ProviderErrorCode.UNSUPPORTED,
+    )
+
+
+def _args_to_json_string(args: Any) -> str:
+    """Tool arguments must go over the wire as a JSON string."""
+    if args is None:
+        return "{}"
+    if isinstance(args, str):
+        return args
+    try:
+        return json.dumps(args)
+    except Exception:
+        return "{}"
+
+
+def _normalize_usage(usage: Dict[str, Any]) -> Dict[str, int]:
+    """Flatten the many token-count shapes into one dict."""
+    prompt = int(usage.get("prompt_tokens", 0) or 0)
+    completion = int(usage.get("completion_tokens", 0) or 0)
+    total = int(usage.get("total_tokens", 0) or 0)
+    if not total:
+        total = prompt + completion
+
+    details = usage.get("prompt_tokens_details") or {}
+    cached = int(details.get("cached_tokens", 0) or 0)
+
+    completion_details = usage.get("completion_tokens_details") or {}
+    reasoning = int(completion_details.get("reasoning_tokens", 0) or 0)
+
+    return {
+        "prompt_tokens": prompt,
+        "completion_tokens": completion,
+        "total_tokens": total,
+        "cached_tokens": cached,
+        "reasoning_tokens": reasoning,
+    }
+
+
+def _status_to_error(
+    status: int, body_text: str, model: str, provider: str
+) -> ProviderError:
+    """
+    Map an HTTP status + body to a ProviderError with the right code.
+
+    Prefers the provider's own error message when it's present in the body
+    (OpenAI-style: {"error": {"message": "..."}}).
+    """
+    message = _extract_error_message(body_text) or body_text[:400] or f"HTTP {status}"
+
+    if status in _AUTH_STATUSES:
+        return ProviderError(
+            f"Authentication failed ({status}): {message}",
+            code=ProviderErrorCode.AUTH,
+            provider=provider, model=model, status=status,
+        )
+    if status == 404:
+        # Some gateways use 404 for both "no such model" and "no such route".
+        lowered = message.lower()
+        code = (
+            ProviderErrorCode.MODEL_NOT_FOUND
+            if "model" in lowered
+            else ProviderErrorCode.BAD_REQUEST
+        )
+        return ProviderError(
+            f"Not found ({status}): {message}",
+            code=code, provider=provider, model=model, status=status,
+        )
+    if status == 429:
+        return ProviderError(
+            f"Rate limited: {message}",
+            code=ProviderErrorCode.RATE_LIMIT,
+            provider=provider, model=model, status=status, retryable=True,
+        )
+    if status == 408:
+        return ProviderError(
+            f"Provider timed out the request: {message}",
+            code=ProviderErrorCode.TIMEOUT,
+            provider=provider, model=model, status=status, retryable=True,
+        )
+    if status == 400 or status == 422:
+        # Detect the common "context too long" case so callers can trim.
+        if "context" in message.lower() and ("length" in message.lower()
+                                             or "too long" in message.lower()):
+            code = ProviderErrorCode.CONTEXT_LENGTH
+        else:
+            code = ProviderErrorCode.BAD_REQUEST
+        return ProviderError(
+            f"Bad request ({status}): {message}",
+            code=code, provider=provider, model=model, status=status,
+        )
+    if 500 <= status < 600:
+        return ProviderError(
+            f"Provider error ({status}): {message}",
+            code=ProviderErrorCode.SERVER,
+            provider=provider, model=model, status=status, retryable=True,
+        )
+    return ProviderError(
+        f"Request failed ({status}): {message}",
+        code=ProviderErrorCode.UNKNOWN,
+        provider=provider, model=model, status=status,
+    )
+
+
+def _extract_error_message(body_text: str) -> str:
+    """
+    Pull a human message out of an error body.
+
+    Handles:
+        {"error": {"message": "..."}}
+        {"error": "..."}
+        {"message": "..."}
+        {"detail": "..."}
+    """
+    if not body_text:
+        return ""
+    try:
+        data = json.loads(body_text)
+    except Exception:
+        return body_text.strip()
+
+    if isinstance(data, dict):
+        err = data.get("error")
+        if isinstance(err, dict) and err.get("message"):
+            return str(err["message"])
+        if isinstance(err, str) and err:
+            return err
+        for key in ("message", "detail", "reason"):
+            if isinstance(data.get(key), str) and data[key]:
+                return data[key]
+    return body_text.strip()
+
+
+__all__ = ["OpenAICompatibleProvider"]
