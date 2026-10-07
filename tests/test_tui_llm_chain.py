@@ -8,8 +8,7 @@ import pytest
 from agent.agent.dual_agent import AgentRole, BaseAgent
 from agent.agent.loop import AgentLoop
 from agent.llm.provider import ToolCall
-from agent.llm.runtime import get_llm_registry, reset_llm_registry
-from agent.llm.runtime import configure_runtime_provider
+from agent.llm.runtime import configure_runtime_provider, get_llm_registry, reset_llm_registry
 
 
 def test_runtime_provider_is_selected_by_the_registry():

@@ -49,7 +49,6 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 from agent.llm.provider import (
     FinishReason,
-    LLMProvider,
     LLMResponse,
     Message,
     ProviderError,
@@ -205,6 +204,20 @@ class NormalizedResponse:
     @property
     def has_tool_calls(self) -> bool:
         return bool(self.tool_calls)
+
+    @property
+    def content(self) -> str:
+        """
+        Legacy alias for `text`.
+
+        `LLMResponse` calls the response body `content`, and every
+        existing call site (loop, planner, compaction, subagent, CLI
+        test-command) reads `response.content`. Keeping the canonical
+        field named `text` while exposing `content` means those call
+        sites work unchanged whether or not their LLM went through the
+        normalizer. Read-only — build a new response to change it.
+        """
+        return self.text
 
     @property
     def has_text(self) -> bool:

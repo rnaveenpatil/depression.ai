@@ -43,6 +43,7 @@ import json
 import random
 import uuid
 from typing import Any, AsyncIterator, Dict, List, Optional, Sequence, Tuple
+from urllib.parse import urlparse
 
 import httpx
 
@@ -130,14 +131,17 @@ class OpenAICompatibleProvider(LLMProvider):
         if self._client is not None:
             self._started = True
             return
+        self._client = self._build_client((self.config.base_url or "").rstrip("/"))
+        self._started = True
+
+    def _build_client(self, base: str) -> httpx.AsyncClient:
         headers = {"Content-Type": "application/json"}
         if self.config.api_key:
             headers["Authorization"] = f"Bearer {self.config.api_key}"
         if self.config.organization:
             headers["OpenAI-Organization"] = self.config.organization
 
-        base = (self.config.base_url or "").rstrip("/")
-        self._client = httpx.AsyncClient(
+        return httpx.AsyncClient(
             base_url=base,
             headers=headers,
             timeout=httpx.Timeout(
@@ -149,7 +153,6 @@ class OpenAICompatibleProvider(LLMProvider):
             # Follow redirects; some gateways put /v1 behind a 308.
             follow_redirects=True,
         )
-        self._started = True
 
     async def close(self) -> None:
         """Close the shared HTTP client."""
@@ -169,6 +172,45 @@ class OpenAICompatibleProvider(LLMProvider):
                 provider=self.name,
             )
         return self._client
+
+    def _candidate_bases(self) -> List[str]:
+        """
+        API roots to try when the configured one404s.
+
+        A pasted URL is usually off by a version segment in one direction
+        or the other ("/v1" present or missing), and a couple of gateways
+        live under "/api/v1". The configured base always goes first — the
+        user told us where their endpoint is — then the alternates.
+        """
+        base = (self.config.base_url or "").rstrip("/")
+        path = urlparse(base).path.rstrip("/")
+
+        out = [base]
+        if path.endswith("/v1"):
+            out.append(base[: -len("/v1")].rstrip("/"))
+        else:
+            out.append(f"{base}/v1")
+            if not path:
+                out.append(f"{base}/api/v1")
+
+        ordered: List[str] = []
+        for candidate in out:
+            if candidate and candidate not in ordered:
+                ordered.append(candidate)
+        return ordered
+
+    async def _adopt_base(self, base: str) -> None:
+        """Switch onto the API root that actually answered."""
+        if base == (self.config.base_url or "").rstrip("/"):
+            return
+        logger.info("Adapted base URL to %s", base)
+        self.config.base_url = base
+        old, self._client = self._client, self._build_client(base)
+        if old is not None:
+            try:
+                await old.aclose()
+            except Exception:
+                pass
 
     # ------------------------------------------------------------------
     # CAPABILITY / CONFIG
@@ -425,8 +467,40 @@ class OpenAICompatibleProvider(LLMProvider):
             stop=stop, **kwargs,
         )
 
-        data = await self._post_json(client, "/chat/completions", body, model)
-        return self._parse(data, model)
+        # Endpoint adaptation: a wrong "/v1" shows up as a 404 on the
+        # route, so walk the candidate roots and stick with the one that
+        # works instead of failing the call.
+        candidates = self._candidate_bases()
+        current = (self.config.base_url or "").rstrip("/")
+        last_error: Optional[ProviderError] = None
+        for index, base in enumerate(candidates):
+            attempt = client if base == current else self._build_client(base)
+            try:
+                data = await self._post_json(attempt, "/chat/completions", body, model)
+            except ProviderError as exc:
+                if exc.status not in (404, 405) or index == len(candidates) - 1:
+                    raise
+                last_error = exc
+                if attempt is not client:
+                    try:
+                        await attempt.aclose()
+                    except Exception:
+                        pass
+                logger.info(
+                    "%s not found on %s; trying %s",
+                    "/chat/completions", base, candidates[index + 1],
+                )
+                continue
+            if base != current:
+                await self._adopt_base(base)
+            return self._parse(data, model)
+
+        if last_error is not None:
+            raise last_error
+        raise ProviderError(
+            "No usable endpoint", code=ProviderErrorCode.UNKNOWN,
+            provider=self.name, model=model,
+        )
 
     # ------------------------------------------------------------------
     # STREAMING (SSE)

@@ -41,6 +41,8 @@ Design notes
 
 from __future__ import annotations
 
+import json
+import uuid
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from enum import Enum
@@ -110,7 +112,17 @@ class Message:
     content: Optional[str] = None
     name: Optional[str] = None                # tool/function name (for role=tool)
     tool_call_id: Optional[str] = None        # for role=tool
-    tool_calls: Optional[List[ToolCall]] = None
+    # ToolCall objects, or the dict forms the context layer and the loop
+    # serialize into message metadata. Canonicalized in __post_init__.
+    tool_calls: Optional[List[Any]] = None
+
+    def __post_init__(self) -> None:
+        if not self.tool_calls:
+            return
+        self.tool_calls = [
+            tc for tc in (_coerce_tool_call(t) for t in self.tool_calls)
+            if tc is not None
+        ]
 
     def to_dict(self) -> Dict[str, Any]:
         d: Dict[str, Any] = {"role": self.role, "content": self.content}
@@ -177,9 +189,48 @@ class ToolSpec:
         }
 
 
+def _coerce_tool_call(raw: Any) -> Optional[ToolCall]:
+    """
+    Canonicalize one entry of `Message.tool_calls`.
+
+    Three shapes arrive here:
+      * `ToolCall`                              — already canonical
+      * `{"id","type","function":{...}}`        — OpenAI wire form, which is
+        exactly what `context.runtime.add_tool_call()` and the loop write
+        into message metadata
+      * `{"name", "arguments": {...}}`          — the plain form
+
+    Anything unrecognised is dropped instead of exploding later inside an
+    adapter, because a malformed history entry must not kill the request.
+    """
+    if isinstance(raw, ToolCall):
+        return raw
+    if not isinstance(raw, dict):
+        return None
+
+    fn = raw.get("function")
+    fn = fn if isinstance(fn, dict) else {}
+    name = fn.get("name") or raw.get("name") or raw.get("tool") or ""
+    if not isinstance(name, str) or not name:
+        return None
+
+    args: Any = fn.get("arguments", raw.get("arguments", raw.get("parameters")))
+    if isinstance(args, str):
+        try:
+            args = json.loads(args) if args.strip() else {}
+        except Exception:
+            args = {}
+    if not isinstance(args, dict):
+        args = {}
+
+    call_id = raw.get("id") or fn.get("id")
+    if not isinstance(call_id, str) or not call_id:
+        call_id = f"call_{uuid.uuid4().hex[:12]}"
+    return ToolCall(id=call_id, name=name, arguments=args)
+
+
 def _stringify_args(args: Any) -> str:
     """Providers want tool arguments as a JSON string, not a dict."""
-    import json
     if isinstance(args, str):
         return args
     try:

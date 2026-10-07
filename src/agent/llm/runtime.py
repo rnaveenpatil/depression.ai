@@ -29,13 +29,14 @@ from __future__ import annotations
 
 import asyncio
 import os
+import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import urlparse
 
+from agent.llm.normalizer import NormalizedResponse, normalize
 from agent.llm.provider import (
     LLMProvider,
-    LLMResponse,
     ModelInfo,
     ProviderConfig,
     ProviderError,
@@ -441,9 +442,12 @@ class LLMProviderRegistry:
         tools: Optional[Sequence[Any]] = None,
         tool_choice: Optional[str] = None,
         **kwargs: Any,
-    ) -> LLMResponse:
+    ) -> NormalizedResponse:
         """
         Send a completion through the active provider.
+
+        The adapter's `LLMResponse` is passed through the normalizer on
+        the way out, so callers always get a `NormalizedResponse`.
 
         On a retryable failure the fallback chain (if any) is walked in
         order; the last error is re-raised when every candidate fails.
@@ -479,10 +483,9 @@ class LLMProviderRegistry:
                     model=candidate,
                 )
                 continue
+            started_at = time.time()
             try:
-                return await provider.chat(
-                    messages, model=candidate, **request
-                )
+                response = await provider.chat(messages, model=candidate, **request)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -492,6 +495,16 @@ class LLMProviderRegistry:
                     candidate, exc,
                 )
                 continue
+
+            # This is the adapters → normalizer → loop boundary: whatever
+            # the adapter produced is re-shaped here once, so the loop
+            # only ever sees NormalizedResponse.
+            return normalize(
+                response,
+                provider=getattr(provider, "name", "") or "",
+                model=candidate,
+                started_at=started_at,
+            )
 
         if isinstance(last_error, ProviderError):
             raise last_error
@@ -509,8 +522,14 @@ class LLMProviderRegistry:
         model: Optional[str] = None,
         temperature: float = 0.1,
         **kwargs: Any,
-    ) -> LLMResponse:
-        """`complete()` with a tool list — the shape the agent loop uses."""
+    ) -> NormalizedResponse:
+        """
+        `complete()` with a tool list — the shape the agent loop uses.
+
+        Both methods return a `NormalizedResponse`: guaranteed str text,
+        tool calls with ids + dict arguments, canonical finish_reason,
+        and usage that always sums correctly.
+        """
         return await self.complete(
             messages=messages,
             model=model,
@@ -689,6 +708,77 @@ def _safe_host(url: str) -> str:
         return ""
 
 
+# Endpoint suffixes users paste verbatim. Every adapter appends its own
+# path ("/chat/completions", "/v1/messages", "/api/chat", ...), so a
+# pasted endpoint has to come back off or the request doubles up.
+_PASTED_ENDPOINT_SUFFIXES: Tuple[str, ...] = (
+    "/chat/completions",
+    "/v1/messages",
+    "/messages",
+    "/api/chat",
+    "/api/generate",
+    "/completions",
+    "/models",
+)
+
+
+def normalize_base_url(base_url: str, family: str) -> str:
+    """
+    Turn whatever the user pasted into a URL the adapter can build on.
+
+    People paste a bare host without a scheme, a whole endpoint
+    (".../chat/completions"), or a versioned prefix the adapter will add
+    again itself (".../v1" for Anthropic). Adapters only append their own
+    path, so the connection is normalized here — that way the same paste
+    works no matter which shape it arrived in.
+
+    Family rules:
+        openai-compatible  — a bare origin gets "/v1", because essentially
+                             every OpenAI-compatible server serves there
+        anthropic         — drop a trailing "/v1" (adapter posts /v1/messages)
+        gemini            — drop "/v1" or "/v1beta" (adapter posts /{version}/models)
+        ollama            — drop "/v1" (that is Ollama's OpenAI-compat layer;
+                             the adapter posts /api/chat)
+
+    Never raises; a garbage URL just comes back tidied.
+    """
+    url = (base_url or "").strip()
+    if not url:
+        return ""
+    url = url.split("#", 1)[0].split("?", 1)[0].strip()
+    if "://" not in url:
+        url = "https://" + url.lstrip("/")
+    url = url.rstrip("/")
+
+    # 1. Strip a pasted endpoint (longest suffix first).
+    lowered = url.lower()
+    stripped_endpoint = False
+    for suffix in _PASTED_ENDPOINT_SUFFIXES:
+        if lowered.endswith(suffix):
+            url = url[: -len(suffix)].rstrip("/")
+            stripped_endpoint = True
+            break
+
+    # 2. Family-specific version handling.
+    if family == FAMILY_ANTHROPIC and url.endswith("/v1"):
+        url = url[: -len("/v1")].rstrip("/")
+    elif family == FAMILY_GEMINI:
+        for version in ("/v1beta", "/v1"):
+            if url.endswith(version):
+                url = url[: -len(version)].rstrip("/")
+                break
+    elif family == FAMILY_OLLAMA and url.endswith("/v1"):
+        url = url[: -len("/v1")].rstrip("/")
+    elif family == FAMILY_OPENAI:
+        path = urlparse(url).path.rstrip("/")
+        # Only when the user gave us a bare origin: if they pasted the
+        # endpoint itself, they have already told us where it lives.
+        if path in ("",) and not stripped_endpoint:
+            url = f"{url}/v1"
+
+    return url
+
+
 # ======================================================================
 # PROVIDER CONSTRUCTION
 # ======================================================================
@@ -748,7 +838,7 @@ def plan_runtime(
     `family` short-circuits detection when the caller already knows
     (e.g. re-applying a saved connection).
     """
-    base_url = (base_url or "").strip().rstrip("/")
+    base_url = (base_url or "").strip()
     api_key = (api_key or "").strip()
     model = (model or "").strip()
 
@@ -761,6 +851,13 @@ def plan_runtime(
     if not chosen:
         chosen = detect_family(base_url, model, api_key)
         notes.append(f"detected family: {chosen}")
+
+    # Adapt whatever the user pasted into a URL the adapter can build on,
+    # so a bare host, a full endpoint, or a versioned prefix all work.
+    normalized = normalize_base_url(base_url, chosen)
+    if normalized != base_url:
+        notes.append(f"base URL adapted → {normalized}")
+        base_url = normalized
 
     cfg = _build_provider_config(chosen, base_url, api_key, model)
     spec = RuntimeSpec(
@@ -912,7 +1009,7 @@ def configure_runtime_provider(
         capabilities=capabilities,
     )
 
-    save_runtime_config(base_url, api_key, model, family=spec.family)
+    save_runtime_config(spec.base_url, spec.api_key, spec.model, family=spec.family)
 
     # Kick off start() so the shared HTTP client exists before the first
     # real call. Fire-and-forget is fine here: providers treat a missing
@@ -951,7 +1048,7 @@ async def configure_runtime_provider_async(
         capabilities=capabilities,
     )
 
-    save_runtime_config(base_url, api_key, model, family=spec.family)
+    save_runtime_config(spec.base_url, spec.api_key, spec.model, family=spec.family)
     return provider
 
 
@@ -1163,6 +1260,7 @@ __all__ = [
     # Detection / planning
     "RuntimeSpec",
     "detect_family",
+    "normalize_base_url",
     "plan_runtime",
     "discover_capabilities",
     # Install

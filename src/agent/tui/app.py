@@ -21,6 +21,7 @@ from agent.llm.runtime import (
     configure_runtime_provider,
     get_llm_registry,
     load_runtime_config,
+    plan_runtime,
 )
 from agent.utils.env_manager import (
     EnvManager,
@@ -1701,9 +1702,12 @@ class DepressionApp(App):
             status.update("enter a base URL first")
             return
         try:
+            # Same adaptation the connect button uses: pasted "/v1",
+            # missing "/v1", or a bare host all resolve to one root.
+            base = plan_runtime(url, key, "").base_url or url
             async with httpx.AsyncClient(timeout=20) as client:
                 headers = ({"Authorization": f"Bearer {key}"} if key else {})
-                response = await client.get(f"{url}/models", headers=headers)
+                response = await client.get(f"{base}/models", headers=headers)
                 response.raise_for_status()
                 models = response.json().get("data", [])
             ids = [str(m.get("id")) for m in models if m.get("id")]
