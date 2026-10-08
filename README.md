@@ -1,4 +1,16 @@
-# depression
+# depression.ai
+
+<p align="center">
+  <strong>THE TERMINAL-NATIVE AGENT HARNESS</strong><br>
+  <em>From intent to execution — your AI works with the machine, not just the conversation.</em>
+</p>
+
+<p align="center">
+  <a href="https://github.com/rnaveenpatil/depression.ai"><img src="https://img.shields.io/badge/Open%20Source-Yes-111827?style=for-the-badge&logo=github" alt="Open Source"></a>
+  <a href="https://pypi.org/project/depression.ai/"><img src="https://img.shields.io/pypi/v/depression.ai?style=for-the-badge&logo=pypi&logoColor=white" alt="PyPI"></a>
+  <a href="https://github.com/rnaveenpatil/depression.ai"><img src="https://img.shields.io/github/stars/rnaveenpatil/depression.ai?style=for-the-badge&logo=github" alt="GitHub Stars"></a>
+  <a href="https://github.com/rnaveenpatil/depression.ai/blob/main/LICENSE"><img src="https://img.shields.io/badge/License-See%20LICENSE-111827?style=for-the-badge" alt="License"></a>
+</p>
 
 ### `You A-Z. AI depression.ai`
 
@@ -9,6 +21,24 @@
 <p align="center">
   <b>Terminal-native agentic AI for development, system operations, analysis, and cloud deployment.</b>
 </p>
+
+<p align="center">
+  <img src="https://img.shields.io/badge/Agentic%20AI-Execution--First-0f172a?style=flat-square" alt="Agentic AI">
+  <img src="https://img.shields.io/badge/Terminal--Native-Textual-0f172a?style=flat-square" alt="Terminal Native">
+  <img src="https://img.shields.io/badge/Cloud-AWS-0f172a?style=flat-square&logo=amazonaws" alt="AWS">
+  <img src="https://img.shields.io/badge/Extensible-MCP-0f172a?style=flat-square" alt="MCP">
+</p>
+
+<table align="center">
+<tr>
+<td align="center" width="25%"><strong>UNDERSTAND</strong><br><sub>Read the environment and context</sub></td>
+<td align="center" width="25%"><strong>PLAN</strong><br><sub>Break complex work into steps</sub></td>
+<td align="center" width="25%"><strong>EXECUTE</strong><br><sub>Use real tools on real systems</sub></td>
+<td align="center" width="25%"><strong>VERIFY</strong><br><sub>Check what actually happened</sub></td>
+</tr>
+</table>
+
+> **depression.ai is not a chatbot wrapper. It is an agent harness that gives an LLM a controlled path from reasoning to real execution.**
 
 ---
 
@@ -115,11 +145,11 @@ R Naveen Patil is the primary developer behind the `depression.ai` framework, re
 
 # 🚀 What Is depression.ai?
 
-**depression.ai** is an advanced **CLI-based agentic AI harness** developed by **Team Depression**.
+**depression.ai** is a **terminal-native agentic AI harness** developed by **Team Depression** — an execution layer that turns an LLM from a text generator into a tool-using technical operator.
 
-It is built for people who want an AI agent that can work with a real computer, real projects, real tools and real infrastructure — not just answer questions in a chat window.
+It is built for people who want AI to work with **real computers, real codebases, real tools and real infrastructure** — not merely describe what a human should do next.
 
-Think of `depression.ai` as an **agent runtime for a software engineer and technical operator**:
+Think of `depression.ai` as a **runtime for an AI software engineer and technical operator**:
 
 ```text
                     USER
@@ -175,7 +205,7 @@ The **LLM provides the reasoning capability**. `depression.ai` provides the envi
 
 # 🧠 Agentic, Not Just Chat
 
-A normal chatbot primarily returns text.
+A normal chatbot primarily returns text. **depression.ai is built around actions, observations and verification.**
 
 `depression.ai` is designed around an execution loop:
 
@@ -285,6 +315,53 @@ The interface brings the agent workflow into a single workspace with features su
 * Agent execution feedback
 
 The goal is to provide a workflow similar to modern terminal-native coding agents while extending the scope beyond software development into system and cloud operations.
+
+---
+
+# ✨ What Makes depression.ai Different
+
+<table>
+<tr>
+<td width="33%" valign="top">
+
+### 🧠 Reasoning → Action
+The model can inspect context, choose tools, execute operations and react to the results.
+
+</td>
+<td width="33%" valign="top">
+
+### 🛠️ One Runtime, Many Tools
+Filesystem, terminal, Git, browser automation, MCP, processes, search and AWS live inside one agent workflow.
+
+</td>
+<td width="33%" valign="top">
+
+### 🔁 Observe → Correct → Verify
+The workflow is designed to inspect failures, adapt the next action and verify the outcome instead of stopping at the first response.
+
+</td>
+</tr>
+<tr>
+<td width="33%" valign="top">
+
+### 🔐 Human-Controlled Execution
+Permissions, snapshots, diffs and undo workflows help keep consequential operations visible and controllable.
+
+</td>
+<td width="33%" valign="top">
+
+### ☁️ Local + Cloud
+Run the agent locally while connecting to supported remote LLMs and AWS environments.
+
+</td>
+<td width="33%" valign="top">
+
+### 🧩 Extensible by Design
+MCP and configurable LLM endpoints make it possible to extend the agent without rebuilding the core runtime.
+
+</td>
+</tr>
+</table>
 
 ---
 
@@ -494,6 +571,37 @@ Depending on the configured tools, AWS permissions and available credentials, th
 * Application deployment workflows
 
 The exact operations available depend on the AWS credentials, IAM permissions and tools configured in the environment.
+
+### ☁️ AWS Capability Map
+
+<table>
+<tr>
+<th>Area</th>
+<th>What the agent can assist with</th>
+</tr>
+<tr>
+<td><strong>🔎 Inspect</strong></td>
+<td>Environment inspection, resource discovery, configuration analysis and troubleshooting.</td>
+</tr>
+<tr>
+<td><strong>⚙️ Operate</strong></td>
+<td>Supported AWS CLI/SDK workflows, resource creation, modification and removal.</td>
+</tr>
+<tr>
+<td><strong>🚀 Deploy</strong></td>
+<td>Application deployment preparation and cloud deployment workflows.</td>
+</tr>
+<tr>
+<td><strong>📊 Diagnose</strong></td>
+<td>Monitoring, failure investigation and operational analysis.</td>
+</tr>
+<tr>
+<td><strong>🔐 Govern</strong></td>
+<td>IAM-controlled access, least-privilege operation and user-controlled credentials.</td>
+</tr>
+</table>
+
+> **AWS is not a bypass layer.** The agent can only do what the configured AWS identity and IAM policies allow.
 
 ---
 
@@ -1490,6 +1598,29 @@ Deployment
 
 ---
 
+# 🎯 Built for Real Technical Work
+
+`depression.ai` is intentionally positioned between a **chat assistant** and a **fully autonomous operator**.
+
+It gives the model access to the execution surface, while keeping the important boundaries visible:
+
+<table>
+<tr>
+<td align="center" width="25%"><strong>🧠 MODEL</strong><br><sub>Reasoning & decisions</sub></td>
+<td align="center" width="25%"><strong>🧰 TOOLS</strong><br><sub>Actions & observations</sub></td>
+<td align="center" width="25%"><strong>🔐 GUARDRAILS</strong><br><sub>Permissions & state</sub></td>
+<td align="center" width="25%"><strong>✅ VERIFICATION</strong><br><sub>Evidence of results</sub></td>
+</tr>
+</table>
+
+The core idea is simple:
+
+> **Give AI a workspace, not just a textbox.**
+
+That workspace can span software development, system operations, Git workflows, browser automation, MCP extensions and AWS operations while remaining configurable around the user's environment and chosen LLM.
+
+---
+
 # 🔒 Security, Privacy & Data Boundary
 
 `depression.ai` is designed with a **local-first, security-focused architecture**.
@@ -1706,7 +1837,7 @@ The development direction includes:
 
 ---
 
-# 📞 Team Depression — Contact Information
+# 🤝 Team Depression — Contact Information
 
 ## R Naveen Patil
 
@@ -1764,6 +1895,19 @@ https://github.com/rnaveenpatil/depression.ai
 **depression.ai — Developed by Team Depression**
 
 </div>
+
+---
+
+---
+
+<p align="center">
+  <strong>depression.ai</strong><br>
+  <em>Understand. Plan. Execute. Verify.</em>
+</p>
+
+<p align="center">
+  Built by <strong>Team Depression</strong> · Moodlakatte Institute of Technology, Kundapura · ISE
+</p>
 
 ---
 

@@ -26,7 +26,6 @@ from agent.utils.logging import get_logger
 logger = get_logger(__name__)
 
 
-<<<<<<< HEAD
 DEFAULT_TOOL_RESULT_BYTE_CAP = 8 * 1024
 
 
@@ -46,27 +45,6 @@ def _calculate_tool_result_cap(context_window: int) -> int:
     else:
         cap = int(context_window * 4 * 0.02)
         return min(512 * 1024, max(128 * 1024, cap))
-=======
-def _calculate_tool_result_cap(context_window: int) -> int:
-    """Calculate dynamic tool result byte cap based on model's context window."""
-    if context_window <= 0:
-        return 8 * 1024
-    
-    if context_window < 32_768:
-        return 8 * 1024       # 8 KB
-    elif context_window < 131_072:
-        return 16 * 1024      # 16 KB
-    elif context_window < 500_000:
-        return 64 * 1024      # 64 KB
-    elif context_window < 1_000_000:
-        return 128 * 1024     # 128 KB
-    else:
-        cap = int(context_window * 4 * 0.02)
-        return min(512 * 1024, max(128 * 1024, cap))
-
-
-TOOL_RESULT_BYTE_CAP = 8 * 1024
->>>>>>> f2aabb6 (finaly fixed)
 
 
 # ----------------------------------------------------------------------
@@ -426,11 +404,7 @@ async def add_tool_result(
     result: Any,
     context_window: int = 0,
 ) -> None:
-<<<<<<< HEAD
     cap = _calculate_tool_result_cap(context_window) if context_window > 0 else DEFAULT_TOOL_RESULT_BYTE_CAP
-=======
-    cap = _calculate_tool_result_cap(context_window) if context_window > 0 else TOOL_RESULT_BYTE_CAP
->>>>>>> f2aabb6 (finaly fixed)
     payload = _truncate_payload(result, cap=cap)
     await context_manager.add_message(
         role="tool",
