@@ -139,7 +139,7 @@ _DEFAULT_MAX_RETRIES = 2
 # reads it. Until then those callers simply see empty/zero values.
 
 #: Context window assumed when the connected model's is unknown or tiny.
-DEFAULT_CONTEXT_WINDOW = 8_192
+DEFAULT_CONTEXT_WINDOW = 1_000_000
 
 #: model id -> metadata (context_window, cost_input, capabilities, ...)
 MODEL_METADATA: Dict[str, Dict[str, Any]] = {}
@@ -877,6 +877,51 @@ def plan_runtime(
 # CAPABILITY DISCOVERY
 # ======================================================================
 
+# Import known models lookup functions from provider modules.
+def _lookup_known_model_for_family(family: str, model_id: str) -> Optional[Tuple[int, int, bool, bool]]:
+    """
+    Look up a model in the known models database for the given family.
+    
+    Returns: (context_window, max_output, supports_vision, supports_tools)
+    or None if not found.
+    """
+    if not model_id:
+        return None
+    
+    if family == FAMILY_OPENAI:
+        try:
+            from agent.llm.openai_compatible import _lookup_known_model
+            return _lookup_known_model(model_id)
+        except ImportError:
+            pass
+    elif family == FAMILY_GEMINI:
+        try:
+            from agent.llm.gemini import _lookup_known_gemini_model
+            result = _lookup_known_gemini_model(model_id)
+            if result:
+                ctx, max_out = result
+                return (ctx, max_out, True, True)
+        except ImportError:
+            pass
+    elif family == FAMILY_ANTHROPIC:
+        try:
+            from agent.llm.anthropic import _lookup_known_anthropic_model
+            result = _lookup_known_anthropic_model(model_id)
+            if result:
+                ctx, max_out = result
+                return (ctx, max_out, True, True)
+        except ImportError:
+            pass
+    elif family == FAMILY_OLLAMA:
+        try:
+            from agent.llm.ollama import _lookup_known_ollama_model
+            return _lookup_known_ollama_model(model_id)
+        except ImportError:
+            pass
+    
+    return None
+
+
 async def discover_capabilities(
     provider: LLMProvider,
     model: str,
@@ -888,7 +933,8 @@ async def discover_capabilities(
     Order of precedence:
         1. The provider's `discover_models()` result, if the model is in it.
         2. The provider's `model_info(model)` result, if implemented.
-        3. Conservative defaults for the family.
+        3. Known models database for the family (OpenAI-compatible, Gemini, Anthropic, Ollama).
+        4. Conservative defaults for the family.
 
     Never raises — a failure yields the family fallbacks with a note.
 
@@ -896,7 +942,7 @@ async def discover_capabilities(
         context_window, max_output,
         supports_tools, supports_streaming, supports_vision, supports_json_mode,
         description, source
-    where source is one of "discovered", "model_info", "fallback".
+    where source is one of "discovered", "model_info", "known_db", "fallback".
     """
     fallback = dict(_FAMILY_FALLBACKS.get(family, _FAMILY_FALLBACKS[FAMILY_OPENAI]))
     fallback.setdefault("description", "")
@@ -942,7 +988,22 @@ async def discover_capabilities(
             "source": "model_info",
         }
 
-    # 3. Family fallbacks.
+    # 3. Try known models database for the family.
+    known = _lookup_known_model_for_family(family, model)
+    if known:
+        ctx, max_out, vision, tools = known
+        return {
+            "context_window": ctx if ctx > 0 else 1_000_000,
+            "max_output": max_out if max_out > 0 else 8_192,
+            "supports_tools": tools,
+            "supports_streaming": True,
+            "supports_vision": vision,
+            "supports_json_mode": True,
+            "description": "Known model from built-in database",
+            "source": "known_db",
+        }
+
+    # 4. Family fallbacks.
     return fallback
 
 

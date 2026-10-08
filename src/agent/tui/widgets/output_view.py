@@ -13,6 +13,12 @@ so the transcript reads like a report, not a wall of text:
       • onboarding/welcome.py       +42 −18
       • onboarding/identity.py       +6 −2
 
+    ## Plan
+      ✓ parse config
+      ✓ render template
+      ▸ run tests
+      ○ report results
+
     ## Table
       ┌───────────────┬──────────┬────────┐
       │ step          │ status   │ time   │
@@ -21,14 +27,10 @@ so the transcript reads like a report, not a wall of text:
       │ render        │ done     │ 4ms    │
       └───────────────┴──────────┴────────┘
 
-    ## Code
-    ```python
-    x = 1
-    ```
-
 Recognized:
     # ## / ### section headers
     * / - / • bullets
+    - [ ] / - [x] task list items
     1. numbered items
     | a | b | tables (Markdown)
     ```lang ... ``` code blocks
@@ -58,7 +60,6 @@ BORDER = "#0a3d20"
 
 
 def _esc(text: Any) -> str:
-    """Escape brackets so markup in raw text renders literally."""
     if text is None:
         return ""
     return str(text).replace("[", r"\[")
@@ -69,7 +70,8 @@ def _esc(text: Any) -> str:
 # ----------------------------------------------------------------------
 
 _H_RE = re.compile(r"^(#{1,6})\s+(.*)")
-_BULLET_RE = re.compile(r"^\s*[-*•]\s+(.*)")
+_BULLET_RE = re.compile(r"^(\s*)[-*•]\s+(.*)")
+_TASK_RE = re.compile(r"^(\s*)[-*•]\s+\[([ xX])\]\s+(.*)")
 _NUM_RE = re.compile(r"^\s*(\d+)[.)]\s+(.*)")
 _HR_RE = re.compile(r"^\s*(?:-{3,}|\*{3,}|_{3,})\s*$")
 _FENCE_RE = re.compile(r"^\s*```(\w*)")
@@ -77,26 +79,18 @@ _TABLE_RE = re.compile(r"^\s*\|(.+)\|\s*$")
 
 
 def _inline_format(text: str) -> str:
-    """Convert a subset of inline Markdown to Textual markup."""
-    # Escape brackets first so we don't break markup.
     s = text.replace("[", r"\[")
 
-    # `code`
     s = re.sub(
         r"`([^`]+)`",
         lambda m: f"[{AMBER}]{m.group(1)}[/]",
         s,
     )
-
-    # **bold**
     s = re.sub(
         r"\*\*([^*]+)\*\*",
         lambda m: f"[bold {GREEN_GLOW}]{m.group(1)}[/]",
         s,
     )
-
-    # *italic* (single asterisk, not part of a bullet — bullets are handled
-    # separately by the block parser).
     s = re.sub(
         r"(?<!\*)\*([^*\n]+)\*(?!\*)",
         lambda m: f"[italic {TEXT}]{m.group(1)}[/]",
@@ -112,10 +106,11 @@ def _inline_format(text: str) -> str:
 
 @dataclass
 class Block:
-    kind: str  # "h" | "p" | "ul" | "ol" | "code" | "table" | "hr"
+    kind: str  # "h" | "p" | "ul" | "task" | "ol" | "code" | "table" | "hr"
     text: str = ""
     level: int = 0
     items: Optional[List[str]] = None
+    task_states: Optional[List[bool]] = None
     lang: str = ""
     rows: Optional[List[List[str]]] = None
     header: Optional[List[str]] = None
@@ -130,12 +125,10 @@ def _parse_blocks(text: str) -> List[Block]:
     while i < n:
         line = lines[i]
 
-        # Blank → skip
         if not line.strip():
             i += 1
             continue
 
-        # Code fence
         m = _FENCE_RE.match(line)
         if m:
             lang = m.group(1) or ""
@@ -145,17 +138,15 @@ def _parse_blocks(text: str) -> List[Block]:
                 buf.append(lines[i])
                 i += 1
             if i < n:
-                i += 1  # closing fence
+                i += 1
             blocks.append(Block(kind="code", text="\n".join(buf), lang=lang))
             continue
 
-        # Horizontal rule
         if _HR_RE.match(line):
             blocks.append(Block(kind="hr"))
             i += 1
             continue
 
-        # Table: consecutive |...| lines
         if _TABLE_RE.match(line):
             table_lines: List[str] = []
             while i < n and _TABLE_RE.match(lines[i]):
@@ -165,13 +156,10 @@ def _parse_blocks(text: str) -> List[Block]:
             if header is not None:
                 blocks.append(Block(kind="table", header=header, rows=rows))
                 continue
-
-            # If it wasn't a real table, fall through as paragraphs.
             for tl in table_lines:
                 blocks.append(Block(kind="p", text=tl))
             continue
 
-        # Heading
         m = _H_RE.match(line)
         if m:
             blocks.append(
@@ -180,16 +168,26 @@ def _parse_blocks(text: str) -> List[Block]:
             i += 1
             continue
 
-        # Unordered list
-        if _BULLET_RE.match(line):
+        # Task list (- [ ] / - [x]) must be checked before plain bullets.
+        if _TASK_RE.match(line):
             items: List[str] = []
+            states: List[bool] = []
+            while i < n and _TASK_RE.match(lines[i]):
+                mm = _TASK_RE.match(lines[i])
+                states.append(mm.group(2).lower() == "x")
+                items.append(mm.group(3).rstrip())
+                i += 1
+            blocks.append(Block(kind="task", items=items, task_states=states))
+            continue
+
+        if _BULLET_RE.match(line):
+            items = []
             while i < n and _BULLET_RE.match(lines[i]):
-                items.append(_BULLET_RE.match(lines[i]).group(1).rstrip())
+                items.append(_BULLET_RE.match(lines[i]).group(2).rstrip())
                 i += 1
             blocks.append(Block(kind="ul", items=items))
             continue
 
-        # Ordered list
         if _NUM_RE.match(line):
             items = []
             while i < n and _NUM_RE.match(lines[i]):
@@ -198,7 +196,6 @@ def _parse_blocks(text: str) -> List[Block]:
             blocks.append(Block(kind="ol", items=items))
             continue
 
-        # Paragraph — gather consecutive non-blank, non-special lines
         buf = [line.rstrip()]
         i += 1
         while i < n:
@@ -212,6 +209,7 @@ def _parse_blocks(text: str) -> List[Block]:
                 or _FENCE_RE.match(nxt)
                 or _HR_RE.match(nxt)
                 or _TABLE_RE.match(nxt)
+                or _TASK_RE.match(nxt)
             ):
                 break
             buf.append(nxt.rstrip())
@@ -229,13 +227,10 @@ def _split_row(line: str) -> List[str]:
 def _parse_table(
     lines: List[str],
 ) -> Tuple[Optional[List[str]], Optional[List[List[str]]]]:
-    """Return ``(header, rows)`` or ``(None, None)`` if not a real table."""
     if len(lines) < 2:
         return None, None
     header = _split_row(lines[0])
     sep = _split_row(lines[1])
-
-    # Markdown tables have a separator of dashes with optional colons.
     if not all(re.fullmatch(r":?-{2,}:?", c or "") for c in sep):
         return None, None
     rows = [_split_row(l) for l in lines[2:]]
@@ -258,7 +253,6 @@ def _render_header(text: str, level: int) -> str:
 
 
 def _render_table(header: List[str], rows: List[List[str]]) -> str:
-    """Column widths from the widest cell in each column."""
     widths = [len(h) for h in header]
     for r in rows:
         for i, cell in enumerate(r):
@@ -273,7 +267,6 @@ def _render_table(header: List[str], rows: List[List[str]]) -> str:
 
     lines = [f"[{BORDER}]{top}[/]"]
 
-    # Header row
     header_cells = []
     for i, c in enumerate(header):
         padded = _esc(c.ljust(widths[i]))
@@ -286,7 +279,6 @@ def _render_table(header: List[str], rows: List[List[str]]) -> str:
 
     lines.append(f"[{BORDER}]{mid}[/]")
 
-    # Data rows
     for r in rows:
         cells = []
         for i, w in enumerate(widths):
@@ -319,6 +311,18 @@ def _render_block(b: Block) -> str:
         return "\n".join(
             f" [{GREEN}]•[/] {_inline_format(item)}" for item in (b.items or [])
         )
+    if b.kind == "task":
+        items = b.items or []
+        states = b.task_states or [False] * len(items)
+        lines = []
+        for item, done in zip(items, states):
+            if done:
+                lines.append(
+                    f" [{GREEN}]✓[/] [{MUTED}]{_inline_format(item)}[/]"
+                )
+            else:
+                lines.append(f" [{DIM}]○[/] {_inline_format(item)}")
+        return "\n".join(lines)
     if b.kind == "ol":
         return "\n".join(
             f" [{GREEN}]{i + 1}.[/] {_inline_format(item)}"
@@ -326,8 +330,6 @@ def _render_block(b: Block) -> str:
         )
     if b.kind == "table":
         return _render_table(b.header or [], b.rows or [])
-
-    # paragraph
     return _inline_format(b.text)
 
 
@@ -371,16 +373,13 @@ class OutputView(Vertical):
         self._meta = meta
 
     def compose(self) -> ComposeResult:
-        # Header strip
         head_line = f"[bold {GREEN}]{_esc(self._header)}[/]"
         if self._meta:
             head_line += f" [{DIM}]{_esc(self._meta)}[/]"
         yield Static(head_line, markup=True)
 
-        # Divider
         yield Static(f"[{BORDER}]" + "─" * 56 + "[/]", markup=True)
 
-        # Body — one Static per block, so long outputs stay cheap to update.
         for b in _parse_blocks(self._text):
             markup = _render_block(b)
             if markup:

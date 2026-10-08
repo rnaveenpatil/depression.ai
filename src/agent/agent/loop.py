@@ -23,6 +23,12 @@ Consistency guarantees enforced here:
       raw execute_safe is only used when the agent has no execute_tool
       (tests / sub-agents). A belt-and-braces check in _act() also refuses
       destructive calls that somehow reach the registry directly.
+    * [Verification gate] Whenever a mutating tool succeeds, the mutation
+      is recorded. The loop refuses to produce a final answer while any
+      mutation is still unverified. A subsequent successful read-only
+      tool call (or an explicit UNVERIFIED statement from the model)
+      clears the pending set. This makes the reason -> modify -> verify
+      cycle a structural guarantee, not a prompt suggestion.
 """
 from __future__ import annotations
 
@@ -61,15 +67,14 @@ _QUESTION_PREFIXES = (
 # pinned system message is NOT the prompt. [Bug 5]
 SYSTEM_PROMPT_MARKER = "system_prompt"
 
+# Marker the model can emit to explicitly declare something unverifiable.
+# Matches "UNVERIFIED: <reason>" anywhere on its own line.
+_UNVERIFIED_MARKER = re.compile(r"^\s*UNVERIFIED\s*:\s*(.+?)\s*$", re.MULTILINE)
+
 
 # ----------------------------------------------------------------------
 # Destructive-call detection (belt-and-braces permission guard)
 # ----------------------------------------------------------------------
-# If a tool call looks destructive, _act() requires that the agent's
-# permission manager EXPLICITLY allowed it. This catches the case where
-# execute_tool is missing (tests, stripped agents) or where the registry
-# was called directly and the permission gate was skipped.
-
 _DESTRUCTIVE_TOOL_TOKENS = (
     "delete", "remove", "unlink", "destroy", "purge", "wipe", "erase",
     "rmdir", "shred", "truncate", "drop",
@@ -107,23 +112,24 @@ _DESTRUCTIVE_SHELL_PATTERNS = (
     re.compile(r"wget\b.*\|\s*(?:ba)?sh\b"),
 )
 
+# Patterns that indicate the final response is offering to demonstrate work.
+_DEMO_OFFER_PATTERNS = (
+    re.compile(r"\bwould you like me to\b", re.I),
+    re.compile(r"\bwant me to (run|show|launch|demo|open|execute)\b", re.I),
+    re.compile(r"\bshall i (run|show|launch|demo|open|execute)\b", re.I),
+    re.compile(r"\bi can (run|show|launch|demo|open|execute)\b", re.I),
+    re.compile(r"\bready (for me )?to (run|show|launch|demo)\b", re.I),
+)
+
 
 def _looks_destructive_call(name: str, args: Dict[str, Any]) -> bool:
-    """
-    Conservative detector for destructive tool calls.
-
-    Used as a safety net: if the call looks destructive, `_act` requires
-    the permission manager to have explicitly allowed it.
-    """
+    """Conservative detector for destructive tool calls."""
     name_l = (name or "").lower()
 
-    # 1. Tool name matches a destructive keyword.
     for tok in _DESTRUCTIVE_TOOL_TOKENS:
         if tok in name_l:
             return True
 
-    # 2. Action string (either the top-level `action` param or the
-    #    tool-name-suffix) matches a destructive keyword.
     action = ""
     if isinstance(args, dict):
         for k in ("action", "operation", "op", "verb"):
@@ -141,7 +147,6 @@ def _looks_destructive_call(name: str, args: Dict[str, Any]) -> bool:
             if tok in action:
                 return True
 
-    # 3. Any string-valued argument matches a destructive shell pattern.
     if isinstance(args, dict):
         for key, val in args.items():
             if not isinstance(val, str) or not val:
@@ -184,6 +189,14 @@ class LoopContext:
     hit_iteration_limit: bool = False
     intent: str = "unknown"
 
+    # [Verification gate] Successful mutating tool calls that have not yet
+    # been followed by a successful read-only tool call. The loop refuses
+    # to finish while this list is non-empty (unless the model explicitly
+    # emits an UNVERIFIED: line).
+    unverified_mutations: List[Dict[str, Any]] = field(default_factory=list)
+    # Number of times the loop has nudged the model to verify this turn.
+    verification_nudges: int = 0
+
     def add_observation(self, observation: Dict[str, Any]) -> None:
         self.observations.append(observation)
         self.metadata["last_observation_time"] = time.time()
@@ -203,11 +216,16 @@ class LoopContext:
             "output_tokens": self.output_tokens,
             "llm_calls": self.llm_calls,
             "cost": self.cost,
-            "errors": len(self.errors),
+            "errors": len(self.context_errors()) if False else len(self.errors),
             "duration": time.time() - self.start_time,
             "hit_iteration_limit": self.hit_iteration_limit,
             "intent": self.intent,
+            "unverified_mutations": len(self.unverified_mutations),
         }
+
+    # Helper kept so get_summary stays readable across refactors.
+    def context_errors(self) -> List[str]:
+        return self.errors
 
 
 class AgentLoop:
@@ -236,11 +254,16 @@ class AgentLoop:
         self.enable_intent_classification = config.get("enable_intent_classification", True)
         self.enable_qa_verification = config.get("enable_qa_verification", True)
         self.reserve_output_tokens = int(config.get("reserve_output_tokens", 2000))
-        # Set to False to disable the belt-and-braces destructive guard
-        # (the agent's permission manager is still authoritative).
         self.require_permission_for_destructive = bool(
             config.get("require_permission_for_destructive", True)
         )
+        self.require_demo_offer = bool(config.get("require_demo_offer", True))
+
+        # [Verification gate] Master switch and budget.
+        self.require_verification = bool(config.get("require_verification", True))
+        # How many times the loop may refuse a final answer and ask the
+        # model to verify before giving up and accepting the answer.
+        self.max_verification_nudges = int(config.get("max_verification_nudges", 3))
 
         self.state = LoopState.IDLE
         self.context = LoopContext()
@@ -275,8 +298,7 @@ class AgentLoop:
     # ------------------------------------------------------------------
 
     def _is_read_only(self, name: str) -> bool:
-        registry = self.tool_registry
-        probe = getattr(registry, "is_read_only", None)
+        probe = getattr(self.tool_registry, "is_read_only", None)
         if not callable(probe):
             return False
         try:
@@ -338,39 +360,27 @@ class AgentLoop:
                 continue
             try:
                 raw = probe(self.context.intent) if with_intent else probe()
-                return list(raw)
+                schemas = list(raw)
+                if not schemas:
+                    logger.warning(
+                        "Tool registry returned zero schemas via %s (intent=%s)",
+                        attr, self.context.intent,
+                    )
+                return schemas
             except Exception:
                 logger.debug("%s probe failed", attr, exc_info=True)
+        logger.error("No schema provider found on tool registry")
         return []
 
     async def _registry_execute(self, name: str, args: Dict[str, Any]) -> Any:
-        """
-        Execute a tool.
-
-        [Permission gate] The AGENT's execute_tool is preferred because it
-        runs the permission manager. The registry's raw execute_safe is
-        only used as a fallback when the agent has no execute_tool (tests,
-        stripped sub-agents).
-        """
         agent_exec = getattr(self.agent, "execute_tool", None)
         if callable(agent_exec):
-            try:
-                result = agent_exec(name, args)
-                if inspect.isawaitable(result):
-                    result = await result
-                return result
-            except Exception as exc:
-                logger.error(
-                    "agent.execute_tool(%s) failed: %s", name, exc, exc_info=True
-                )
-                return {
-                    "success": False,
-                    "tool": name,
-                    "error": str(exc),
-                    "recoverable": True,
-                }
+            return await self._execute_with_retry(
+                lambda: agent_exec(name, args),
+                name,
+                "agent.execute_tool",
+            )
 
-        # Fallback: registry directly (no permission gate — tests only).
         probe = getattr(self.tool_registry, "execute_safe", None)
         if not callable(probe):
             probe = getattr(self.tool_registry, "execute", None)
@@ -381,19 +391,48 @@ class AgentLoop:
                 "error": "no tool executor available",
                 "recoverable": True,
             }
-        try:
-            result = probe(name, args)
-            if inspect.isawaitable(result):
-                result = await result
-            return result
-        except Exception as exc:
-            logger.error("registry execute(%s) failed: %s", name, exc, exc_info=True)
-            return {
-                "success": False,
-                "tool": name,
-                "error": str(exc),
-                "recoverable": True,
-            }
+        return await self._execute_with_retry(
+            lambda: probe(name, args),
+            name,
+            "registry.execute",
+        )
+
+    async def _execute_with_retry(self, fn: Callable, name: str, source: str) -> Any:
+        transient_errors = (asyncio.TimeoutError, ConnectionError, TimeoutError)
+
+        for attempt in range(2):
+            try:
+                result = fn()
+                if inspect.isawaitable(result):
+                    result = await result
+                return result
+            except transient_errors as exc:
+                if attempt == 0:
+                    logger.warning(
+                        "Transient error in %s(%s): %s — retrying once",
+                        source, name, exc,
+                    )
+                    await asyncio.sleep(0.5)
+                    continue
+                logger.error(
+                    "%s(%s) failed after retry: %s", source, name, exc, exc_info=True
+                )
+                return {
+                    "success": False,
+                    "tool": name,
+                    "error": str(exc),
+                    "recoverable": True,
+                }
+            except Exception as exc:
+                logger.error(
+                    "%s(%s) failed: %s", source, name, exc, exc_info=True
+                )
+                return {
+                    "success": False,
+                    "tool": name,
+                    "error": str(exc),
+                    "recoverable": True,
+                }
 
     # ==================================================================
     # PUBLIC ENTRY
@@ -554,9 +593,46 @@ class AgentLoop:
 
                 continue
 
+            # ------------------------------------------------------------------
+            # [Verification gate] The model produced a final answer with no
+            # tool call. If there are pending mutations that have not been
+            # verified, refuse to finish and ask the model to verify.
+            # ------------------------------------------------------------------
             response_text = (thought.get("response") or "").strip()
+
+            if (
+                self.require_verification
+                and self.context.unverified_mutations
+                and self.context.verification_nudges < self.max_verification_nudges
+                and self.context.iteration < self.max_iterations
+            ):
+                # Allow the model to explicitly declare something unverifiable.
+                # Only accept the escape hatch once the model has had a chance
+                # to see the nudge — not on the first attempt.
+                if not _UNVERIFIED_MARKER.search(response_text):
+                    self.context.verification_nudges += 1
+                    logger.info(
+                        "Refusing final answer: %d unverified mutation(s) "
+                        "(nudge %d/%d)",
+                        len(self.context.unverified_mutations),
+                        self.context.verification_nudges,
+                        self.max_verification_nudges,
+                    )
+                    await self._inject_verification_guidance()
+                    continue
+
+                # Model explicitly said UNVERIFIED: — accept but record it.
+                logger.info(
+                    "Model declared UNVERIFIED — accepting answer without "
+                    "verification: %s",
+                    _UNVERIFIED_MARKER.search(response_text).group(1)[:200],
+                )
+                self.context.metadata["unverified_declared"] = True
+
             if not response_text:
                 response_text = await self._generate_final_response()
+
+            response_text = await self._ensure_demo_offer(response_text)
 
             self.state = LoopState.STOPPED
             self._update_metrics()
@@ -565,6 +641,7 @@ class AgentLoop:
         self.context.hit_iteration_limit = self.context.iteration >= self.max_iterations
         self.state = LoopState.STOPPED
         final = await self._generate_final_response()
+        final = await self._ensure_demo_offer(final)
         self._update_metrics()
         success = bool(final and final.strip())
         return self._result(success, final,
@@ -672,6 +749,7 @@ class AgentLoop:
 
         if all_done or stalled:
             summary = await self._summarize_plan(plan, system_prompt)
+            summary = await self._ensure_demo_offer(summary)
             self.state = LoopState.STOPPED
             self._update_metrics()
 
@@ -720,6 +798,8 @@ class AgentLoop:
             "summary prefixed by 'TASK COMPLETE:' that includes the exact "
             "evidence (command output or diff).\n"
             "If the task cannot be completed, respond with 'TASK FAILED: <reason>'.\n"
+            "If the task cannot be verified for a concrete reason, respond "
+            "with 'UNVERIFIED: <reason>'.\n"
             "Do not describe the plan — execute this task."
         )
 
@@ -730,6 +810,7 @@ class AgentLoop:
 
         local_turns = 0
         max_local_turns = self.max_tool_calls_per_iteration * 2
+        local_unverified: List[Dict[str, Any]] = []
 
         while local_turns < max_local_turns:
             local_turns += 1
@@ -759,6 +840,29 @@ class AgentLoop:
                 if upper.startswith("TASK FAILED"):
                     return {"success": False, "retry": True, "error": content}
 
+                # [Verification gate] In plan mode, a task cannot be marked
+                # complete while it has unverified mutations, unless the
+                # model explicitly declares UNVERIFIED.
+                if (
+                    self.require_verification
+                    and local_unverified
+                    and not _UNVERIFIED_MARKER.search(content)
+                    and local_turns < max_local_turns
+                ):
+                    names = [m["tool"] for m in local_unverified]
+                    messages.append(Message(role="assistant", content=content))
+                    messages.append(Message(
+                        role="user",
+                        content=(
+                            f"You modified state via {names} but have not "
+                            f"verified the result. Read the changed artifact "
+                            f"back or rerun the affected command and quote "
+                            f"the output. If it cannot be verified, respond "
+                            f"with 'UNVERIFIED: <reason>'."
+                        ),
+                    ))
+                    continue
+
                 summary = content
                 if "TASK COMPLETE" in upper:
                     summary = content.split("TASK COMPLETE", 1)[1].lstrip(": ").strip()
@@ -777,6 +881,8 @@ class AgentLoop:
                 task.status = TaskStatus.COMPLETED
                 task.result = summary or task.description
                 task.actual_time = time.time() - task.created_at
+                if _UNVERIFIED_MARKER.search(content):
+                    task.metadata["unverified"] = True
                 self._update_todo_status(task, "done")
                 self._refresh_plan_metadata()
                 return {"success": True, "summary": task.result}
@@ -799,6 +905,17 @@ class AgentLoop:
             results = await self._act(tool_calls)
             await self._observe(results)
             self._maybe_invalidate_cache()
+
+            # Local mutation tracking for this task's turn budget.
+            for x in results:
+                r = x.get("result") or {}
+                tool = x.get("tool", "")
+                if not r.get("success"):
+                    continue
+                if self._is_read_only(tool):
+                    local_unverified.clear()
+                else:
+                    local_unverified.append({"tool": tool, "time": time.time()})
 
             by_id = {r.get("tool_call_id"): r for r in results}
             for tc in tool_calls:
@@ -871,10 +988,12 @@ class AgentLoop:
             if upper.startswith("FAIL"):
                 reason = raw.split(":", 1)[1].strip() if ":" in raw else raw
                 return {"passed": False, "reason": reason}
-            return {"passed": True, "reason": "unrecognized verdict"}
+            # Unrecognized verdict is not proof of success — treat as failure.
+            return {"passed": False, "reason": f"unrecognized verdict: {raw[:80]}"}
         except Exception as exc:
             logger.warning("QA verification failed for task %s: %s", task.id, exc)
-            return {"passed": True, "reason": f"verifier error: {exc}"}
+            # Fail closed: a verifier crash cannot be treated as success.
+            return {"passed": False, "reason": f"verifier error: {exc}"}
 
     async def _summarize_plan(self, plan: Plan, system_prompt: str) -> str:
         completed = [
@@ -909,8 +1028,10 @@ class AgentLoop:
                             "describing what you actually did, why, and "
                             "anything the user should know. Cite the concrete "
                             "evidence (command output, diff, or file content) "
-                            "that proves each major step. Do not repeat the "
-                            "step list. Do not claim unverified success.\n\n"
+                            "that proves each major step. End with a one-line "
+                            "offer to demonstrate the result (see DEMONSTRATE). "
+                            "Do not repeat the step list. Do not claim "
+                            "unverified success.\n\n"
                             f"Plan: {plan.goal}\n\n"
                             f"Task outcomes:\n{body}"
                         ),
@@ -996,223 +1117,108 @@ class AgentLoop:
         env_block = self._build_environment_block()
         aws_block = self._build_aws_guidance()
 
-        self._system_prompt_cache = ("""
-            You are an advanced AI CLI agent. Your job is to complete the user's task,
-not merely explain how to do it. Inspect, modify, execute, test, and verify
-when necessary.
+        base_prompt = """
+You are an advanced AI CLI agent (depression.ai). Complete the user's task; do not merely
+describe it. Inspect, modify, execute, test, and verify as needed.
 
-## CORE RULES
-
-1. Understand the user's goal before acting.
-2. Inspect relevant files/code first.
-3. Use the most specific tool available instead of bash.
-4. Make the smallest change that solves the problem.
-5. Never invent tool results, file contents, command output, or success.
-6. Never expose API keys, passwords, tokens, AWS secrets, private keys, or
-   other credentials.
-
-## TOOL SELECTION
-
-Prefer:
-- read/list/glob/search → inspect files
-- edit/write/append → modify files
-- process → long-running applications/servers
-- bash → short commands that terminate
-- git tools → git operations
-- AWS tools → AWS operations
-
-Use bash only when no suitable specialized tool exists.
-
-Never run long-lived applications or servers through bash.
-Use process.start for them.
-
-## WORKFLOW
-
-For a multi-step task:
-
-1. Inspect
-2. Identify the actual problem
-3. Plan the minimum fix
-4. Modify
-5. Verify
-6. Test
-7. Report evidence
-
-Do not perform unnecessary steps.
+## RULES
+1. Understand the goal, then inspect relevant files/code before acting.
+2. Prefer the most specific tool. Use bash only for short, terminating
+   commands and when no specialized tool fits. Never run long-lived
+   servers via bash — use the process tool.
+3. Make the smallest change that solves the problem.
+4. Never invent tool results, file contents, command output, or success.
+5. Never expose secrets, keys, tokens, or credentials.
 
 ## TOOL ERRORS
+A tool error is information, not a task failure. Read the full error,
+identify the cause, compare it with the tool schema, correct the arguments,
+retry once with the fix. Never repeat the exact same failing call. If the
+cause is unfixable, stop that operation and state the blocker.
 
-A tool error is information, not automatically a task failure.
+## VERIFY BEFORE CLAIMING
+After ANY change to state (write, edit, delete, move, execute), you MUST
+verify it before finishing:
+- files  → read the changed section back and quote it
+- bugs   → rerun the command that failed and quote the new output
+- APIs   → curl the endpoint and show the response
+- servers → start it, show startup log + URL
+- data   → show row counts / sample output
 
-When a tool fails:
+The runtime enforces this: if you modify state and then try to answer
+without a read-back, the loop will reject your answer and ask you to
+verify. Do not fight it. Do the verification.
 
-1. Read the complete error.
-2. Identify the actual cause.
-3. Compare the error with the tool's parameters/schema.
-4. Correct the cause.
-5. Retry with corrected arguments.
+If verification is genuinely impossible (no tool exists, side effect is
+irreversible, environment unavailable), reply with a line:
+    UNVERIFIED: <concrete reason>
+That is the only accepted escape hatch.
 
-Never repeat the exact same failed call.
+Never say "fixed", "working", or "done" without evidence in this session.
 
-If the error indicates a missing file, invalid path, wrong parameter,
-permission problem, timeout, dependency problem, or incorrect command,
-adapt the next action accordingly.
+## DEMONSTRATE THE RESULT
+Finishing the change is not the end. After the work is verified, your
+default next step is to OFFER TO SHOW the user the actual artifact.
 
-If the failure cannot be safely resolved, stop that operation and explain
-the exact blocker.
+Match the medium to the work:
+- script / CLI       → run it, show output
+- web UI / dev server→ start it, show URL + startup line
+- Flutter / desktop  → launch it, show startup status
+- generated file     → show path, size, first lines
+- refactor           → show the diff
+- API endpoint       → curl it, show response
+- bug fix            → rerun the failing command, show output
+- build              → show log tail + artifact path
+- data pipeline      → show row counts / sample output
 
-Do not blame the tool without analysing its error.
+End your response with ONE concrete offer, e.g.:
+  "I've implemented X. Want me to run it and show you the output?"
 
-## VERIFICATION
+Do NOT ask when the user already asked you to run it, when running is
+required to complete the task, or when the only "result" is a pure
+information answer. If the user declines, stop — do not nag. When they
+say yes, actually launch it and present the real output verbatim.
 
-After changing something, verify the resulting state.
+## WORKFLOW
+For multi-step tasks:
+  1 inspect → 2 identify → 3 plan minimum fix → 4 modify → 5 verify → 6 test
+Show a short checklist once before executing; mark items complete only with
+evidence. Skip the checklist for simple tasks. Do not repeat it.
 
-For files:
-- read the changed section/file when practical.
-
-For commands:
-- rerun the command that previously failed.
-
-For bugs:
-- reproduce the original failure, apply the fix, then rerun the same
-  operation to prove the problem is resolved.
-
-For applications:
-- start the application only when useful for verification.
-
-Exit code 0 alone is not proof that the intended result exists.
-
-Never claim "fixed", "working", or "successful" without evidence.
-
-## APPLICATION RUNNING
-
-After fixing code, determine whether running the application would provide
-meaningful verification.
-
-If running it would help verify the fix, ask the user:
-
-"Would you like me to run the application and verify the fix?"
-
-Do not ask this when:
-- the user explicitly asked you to run it
-- the application must be run to complete the requested task
-- automated tests already provide sufficient verification
-- running it would be irrelevant or unnecessarily expensive
-
-If the user agrees:
-- start it using the process tool
-- monitor the startup result
-- report whether it started successfully
-- if appropriate, show the relevant output/status to the user
-
-Never claim that an application works merely because its process started.
-
-## LONG-RUNNING PROCESSES
-
-Use process.start for:
-- development servers
-- web applications
-- Flutter applications
-- Vite
-- npm dev servers
-- uvicorn
-- nodemon
-- watchers
-- interactive programs
-
-Use bash for short commands that should terminate.
-
-Do not retry a command that may still be running.
-
-## STATE
-
-Keep track of:
-- current working directory
-- files inspected
-- files changed
-- important errors
-- tests performed
-- verification status
-
-Never assume a previous operation succeeded without its result confirming it.
-
-## TOOL ARGUMENTS
-
-Use only parameters defined by the tool schema.
-
-Never invent parameter names or argument formats.
-
-If a tool rejects arguments:
-- inspect the error
-- correct the arguments
-- retry with the corrected call
-
-Do not repeatedly guess.
+## EFFICIENCY
+Do not narrate every successful tool call. Do not repeat known facts.
+Do not quote large files/logs unless necessary. After a routine success,
+immediately continue. Explain only: key findings, failures, unexpected
+results, verification evidence, and decisions needing user input.
 
 ## PERMISSIONS
+Never bypass permission checks. For destructive or high-risk operations
+(delete, overwrite, force-push, infra destroy, credential changes) use the
+configured permission mechanism. If a destructive call is denied, do not
+work around it (no alternate tools, no shell tricks) — explain the block
+and ask the user.
 
-Never bypass permission checks.
+## TOOL ARGUMENTS
+Use only parameters defined by the tool schema. Never invent parameter
+names. If a tool rejects arguments, read the error, fix them, retry.
 
-For destructive or high-risk operations such as deletion, overwriting,
-production deployment, infrastructure destruction, or credential changes,
-use the configured permission mechanism.
-
-Prefer reversible operations when possible.
-
-If a destructive tool call is denied by the permission system, do not
-attempt to work around it (no `bash` tricks, no alternate tools). Explain
-what was blocked and ask the user how to proceed.
-
-## PLANNING
-
-For tasks requiring multiple operations, show a short checklist before
-execution:
-
-- [ ] inspect
-- [ ] identify and fix
-- [ ] verify
-- [ ] test
-
-Mark an item complete only when evidence confirms it.
-
-Do not repeat the checklist.
-
-For simple tasks, skip the checklist.
-
-## TOKEN EFFICIENCY
-
-Do not narrate every successful tool call.
-
-Do not repeat information already known.
-
-Do not quote large files or logs unless necessary.
-
-After a successful routine tool call, immediately continue with the next
-useful action.
-
-Explicitly explain only:
-- important findings
-- failures
-- unexpected results
-- verification evidence
-- decisions requiring the user's input
-
-Prefer concise reasoning and concrete actions.
+## STATE
+Track: cwd, files inspected, files changed, key errors, tests run,
+verification status. Never assume a prior step succeeded without its
+result confirming it.
 
 ## FINAL RESPONSE
-
-After completing the task:
-
-- state what was changed
-- state what was verified
-- mention important test output briefly
-- mention anything still unverified
-- ask whether the user wants the application run if that is the next
-  useful verification step
-
+Order:
+  1. WHAT changed (short list)
+  2. WHY (reasoning)
+  3. EVIDENCE (command output, diff, file content)
+  4. WHAT is still unverified or blocked
+  5. The one-line DEMONSTRATE offer
 Never claim success without evidence.
 """
 
+        self._system_prompt_cache = (
+            base_prompt
             + env_block
             + aws_block
             + "\n\n## Available Tools\n"
@@ -1305,7 +1311,7 @@ Never claim success without evidence.
                 "git_info": git_info,
             }
         else:
-            ctx = {}
+            ctx = {"project_path": "", "files": [], "git_info": None}
 
         self._project_ctx = ctx
         self._project_ctx_ts = now
@@ -1359,10 +1365,6 @@ Never claim success without evidence.
                 context=plan_context,
                 constraints=self._get_plan_constraints(intent=intent),
             )
-            # [Bug 3] Plan guidance is NOT persisted as a system message.
-            # It is delivered per-request via the state block that _think
-            # already builds.
-
             self._mirror_plan_to_todos(self.current_plan)
             self._checklist_rendered = True
 
@@ -1457,7 +1459,7 @@ Never claim success without evidence.
             w = int(meta.get("context_window") or 0)
             return w if w >= 2048 else DEFAULT_CONTEXT_WINDOW
         except Exception:
-            return 8192
+            return 8000
 
     async def _maybe_compact_before_call(
         self,
@@ -1576,11 +1578,6 @@ Never claim success without evidence.
         return {"response": content, "tool_calls": calls}
 
     async def _ensure_system_prompt(self) -> None:
-        """
-        Ensure the real system prompt is present.
-
-        [Bug 5] The real prompt is identified by metadata["system_prompt"].
-        """
         messages = getattr(self.model_context, "messages", None) or []
         has_real_prompt = any(
             getattr(m, "role", None) == "system"
@@ -1660,6 +1657,7 @@ Never claim success without evidence.
             "completed_tool_calls": len(self.completed_tool_calls),
             "pending_tool_calls": len(self.pending_tool_calls),
             "intent": self.context.intent,
+            "unverified_mutations": len(self.context.unverified_mutations),
         }
 
     def _get_plan_context(self) -> Dict[str, Any]:
@@ -1686,6 +1684,12 @@ Never claim success without evidence.
         thought: Dict[str, Any],
         results: List[Dict[str, Any]],
     ) -> Optional[str]:
+        """
+        Return a short answer directly when the very first turn was a
+        single trivial read-only tool call. Never fast-path when the
+        request implied user-facing work — those must go through the
+        normal closing response so the DEMONSTRATE offer can appear.
+        """
         if self.context.iteration != 1:
             return None
         calls = thought.get("tool_calls") or []
@@ -1693,8 +1697,17 @@ Never claim success without evidence.
             return None
         if thought.get("response"):
             return None
+
         tool_name = getattr(calls[0], "name", "")
         if tool_name in ("question",):
+            return None
+
+        # Only allow fast-path for read-only tools.
+        if not self._is_read_only(tool_name):
+            return None
+
+        # Never fast-path when the request implied user-facing work.
+        if self.context.intent in ("feature", "bugfix", "refactor", "analysis"):
             return None
 
         outcome = results[0].get("result") or {}
@@ -1714,9 +1727,14 @@ Never claim success without evidence.
             else:
                 out = f"Result written to {outcome['path']}"
 
-        if isinstance(out, str) and out.strip():
-            return out.strip()
-        return None
+        if not (isinstance(out, str) and out.strip()):
+            return None
+
+        # Only fast-path short outputs; long ones deserve a real summary.
+        if len(out) > 4000:
+            return None
+
+        return out.strip()
 
     # ==================================================================
     # ACT
@@ -1752,14 +1770,13 @@ Never claim success without evidence.
                 continue
 
             # ---- Belt-and-braces permission guard --------------------
-            # If the call looks destructive AND the agent has no permission
-            # manager wired in, refuse outright. This catches the case where
-            # execute_tool was replaced or the manager was never attached.
             if (
                 self.require_permission_for_destructive
                 and _looks_destructive_call(name, args)
             ):
                 pm = getattr(self.agent, "permission_manager", None)
+                pm_enabled = bool(getattr(pm, "enabled", True)) if pm is not None else False
+
                 if pm is None:
                     logger.warning(
                         "Refusing destructive call to %s: no permission manager",
@@ -1781,6 +1798,13 @@ Never claim success without evidence.
                         "result": result, "success": False,
                     })
                     continue
+
+                if not pm_enabled:
+                    logger.warning(
+                        "Destructive call to %s allowed because the permission "
+                        "manager is disabled. This bypasses the safety gate.",
+                        name,
+                    )
 
             try:
                 key = f"{name}:{json.dumps(args, sort_keys=True, default=str)}"
@@ -1805,6 +1829,10 @@ Never claim success without evidence.
                         "tool": name, "tool_call_id": call_id,
                         "result": result, "cached": True,
                     })
+                    # A read that hits cache is still a read for the
+                    # verification gate.
+                    if result.get("success", False) and self._is_read_only(name):
+                        self._clear_unverified_mutations(name)
                     await self._trigger_event("on_tool_executed", {
                         "tool": name, "tool_call_id": call_id,
                         "params": args, "result": result, "cached": True,
@@ -1822,8 +1850,6 @@ Never claim success without evidence.
                 except Exception:
                     pass
 
-                # If the executor denied the call for permission reasons,
-                # surface it clearly.
                 if result.get("permission_denied"):
                     logger.info(
                         "Tool %s denied by permission manager: %s",
@@ -1837,14 +1863,15 @@ Never claim success without evidence.
                 })
                 await self._safe_add_tool_result(call, result)
 
-                if (
-                    self.enable_caching
-                    and result.get("success", False)
-                    and self._is_read_only(name)
-                ):
-                    self.tool_result_cache[key] = {
-                        "result": result, "timestamp": time.time(),
-                    }
+                if result.get("success", False):
+                    # Clear any prior failure signature for this call.
+                    self._clear_failure_signature(name, args)
+                    if self.enable_caching and self._is_read_only(name):
+                        self.tool_result_cache[key] = {
+                            "result": result, "timestamp": time.time(),
+                        }
+                    # [Verification gate] Track mutation vs. verification.
+                    self._track_mutation_or_read(name, args, call_id, result)
 
                 self.completed_tool_calls.append(call)
                 results.append({
@@ -1879,23 +1906,104 @@ Never claim success without evidence.
 
         return results
 
-    def _is_duplicate_failing_call(self, name: str, args: Dict[str, Any]) -> bool:
-        try:
-            sig = f"{name}:{json.dumps(args, sort_keys=True, default=str)}"
-        except Exception:
-            return False
+    # ------------------------------------------------------------------
+    # [Verification gate] mutation tracking
+    # ------------------------------------------------------------------
 
+    def _track_mutation_or_read(
+        self,
+        name: str,
+        args: Dict[str, Any],
+        call_id: str,
+        result: Dict[str, Any],
+    ) -> None:
+        """Update the unverified_mutations list after a successful tool call."""
+        if not self.require_verification:
+            return
+
+        if self._is_read_only(name):
+            # A successful read proves the current state of whatever it read.
+            # Clear the pending mutations — the model has now observed the
+            # post-mutation world (or at least part of it).
+            self._clear_unverified_mutations(name)
+            return
+
+        # Non-read-only → assume mutation. Record it.
+        self.context.unverified_mutations.append({
+            "tool": name,
+            "args": args,
+            "call_id": call_id,
+            "time": time.time(),
+        })
+        logger.debug(
+            "Recorded unverified mutation: %s (%d pending)",
+            name, len(self.context.unverified_mutations),
+        )
+
+    def _clear_unverified_mutations(self, by_tool: str) -> None:
+        if not self.context.unverified_mutations:
+            return
+        logger.debug(
+            "Clearing %d unverified mutation(s) after read via %s",
+            len(self.context.unverified_mutations), by_tool,
+        )
+        self.context.unverified_mutations.clear()
+
+    async def _inject_verification_guidance(self) -> None:
+        """Tell the model to verify its pending mutations before answering."""
+        pending = self.context.unverified_mutations
+        if not pending:
+            return
+        names = sorted({m["tool"] for m in pending})
+        count = len(pending)
+        msg = (
+            f"You have {count} unverified change(s) to state via: "
+            f"{', '.join(names)}.\n"
+            f"Before answering the user, verify each change:\n"
+            f"- if you wrote/edited a file, read the changed section back\n"
+            f"- if you ran a command, rerun the affected command\n"
+            f"- if you changed config, read it back\n"
+            f"Quote the actual output as evidence.\n"
+            f"If verification is genuinely impossible, reply with:\n"
+            f"    UNVERIFIED: <concrete reason>\n"
+            f"That is the only accepted escape hatch."
+        )
+        try:
+            await self.model_context.add_system_message(msg)
+        except Exception as exc:
+            logger.debug("add_system_message (verification) failed: %s", exc)
+
+    # ------------------------------------------------------------------
+    # Failure signature bookkeeping
+    # ------------------------------------------------------------------
+
+    def _call_signature(self, name: str, args: Dict[str, Any]) -> Optional[str]:
+        try:
+            return f"{name}:{json.dumps(args, sort_keys=True, default=str)}"
+        except Exception:
+            return None
+
+    def _is_duplicate_failing_call(self, name: str, args: Dict[str, Any]) -> bool:
+        sig = self._call_signature(name, args)
+        if sig is None:
+            return False
         seen = self.context.metadata.setdefault("failing_signatures", {})
-        count = seen.get(sig, 0)
-        return count >= 2
+        return seen.get(sig, 0) >= 2
 
     def _record_failure_signature(self, name: str, args: Dict[str, Any]) -> None:
-        try:
-            sig = f"{name}:{json.dumps(args, sort_keys=True, default=str)}"
-        except Exception:
+        sig = self._call_signature(name, args)
+        if sig is None:
             return
         seen = self.context.metadata.setdefault("failing_signatures", {})
         seen[sig] = seen.get(sig, 0) + 1
+
+    def _clear_failure_signature(self, name: str, args: Dict[str, Any]) -> None:
+        sig = self._call_signature(name, args)
+        if sig is None:
+            return
+        seen = self.context.metadata.get("failing_signatures")
+        if seen and sig in seen:
+            del seen[sig]
 
     def _maybe_invalidate_cache(self) -> None:
         current = self._registry_epoch()
@@ -1910,7 +2018,8 @@ Never claim success without evidence.
 
     async def _safe_add_tool_result(self, call: ToolCall, result: Dict[str, Any]) -> None:
         try:
-            await add_tool_result(self.model_context, call, result)
+            context_window = self._context_limit()
+            await add_tool_result(self.model_context, call, result, context_window=context_window)
         except Exception as inner:
             logger.error(
                 "add_tool_result failed for %s: %s",
@@ -2025,6 +2134,50 @@ Never claim success without evidence.
         return True
 
     # ==================================================================
+    # DEMO OFFER NUDGE
+    # ==================================================================
+
+    def _response_offers_demo(self, text: str) -> bool:
+        """True if the response appears to offer to demonstrate the result."""
+        if not text or not text.strip():
+            return False
+        if not self.completed_tool_calls:
+            return True
+        if self.context.intent == "question":
+            return True
+        for pat in _DEMO_OFFER_PATTERNS:
+            if pat.search(text):
+                return True
+        return False
+
+    async def _ensure_demo_offer(self, text: str) -> str:
+        if not self.require_demo_offer:
+            return text
+        if not text or not text.strip():
+            return text
+        if self._response_offers_demo(text):
+            return text
+
+        target = None
+        for action in reversed(self.context.actions_taken):
+            r = action.get("result") or {}
+            if r.get("success") and not self._is_read_only(action.get("tool", "")):
+                target = action.get("tool")
+                break
+
+        if target:
+            offer = (
+                f"\n\nI've finished the changes. Want me to run it and show you "
+                f"the output?"
+            )
+        else:
+            offer = (
+                "\n\nWant me to show you the result — the diff, file contents, "
+                "or command output?"
+            )
+        return text.rstrip() + offer
+
+    # ==================================================================
     # FINAL RESPONSE
     # ==================================================================
 
@@ -2033,23 +2186,39 @@ Never claim success without evidence.
         Generate a closing summary text.
 
         [M2/N4/N10] This method does NOT persist the assistant turn. The
-        caller (`BaseAgent._run_query_pipeline` / `AgentCoordinator._process_auto`)
-        is the single writer of the final assistant message.
+        caller is the single writer of the final assistant message.
+
+        [Verification gate] If the loop is calling this while mutations are
+        still pending (e.g. iteration limit hit, or the model refused to
+        verify), the prompt tells the model to declare UNVERIFIED.
         """
         messages = get_model_messages(self.model_context, self.max_history_length)
         if not any(getattr(m, "role", None) == "system" for m in messages):
             messages.insert(0, Message(role="system",
                                        content=await self._get_system_prompt()))
+
+        if self.context.unverified_mutations:
+            pending_names = sorted({m["tool"] for m in self.context.unverified_mutations})
+            extra = (
+                f" WARNING: {len(self.context.unverified_mutations)} change(s) "
+                f"via {', '.join(pending_names)} are still UNVERIFIED. Either "
+                f"state the concrete evidence you already have, or begin the "
+                f"response with 'UNVERIFIED: <reason>'. Do not claim success "
+                f"without evidence."
+            )
+        else:
+            extra = ""
+
         messages.append(
             Message(
                 role="user",
                 content=(
-                    "Provide the final response to the user. Include a short "
-                    "closing summary (2–4 sentences) of what you actually did, "
-                    "why, and anything they should know. Cite the concrete "
-                    "evidence (command output, diff, or file content) that "
-                    "proves each major step. Do not claim unverified success. "
-                    "If anything is unverified or blocked, say so explicitly."
+                    "Provide the final response to the user. Structure it as: "
+                    "1) WHAT changed, 2) WHY, 3) EVIDENCE (concrete command "
+                    "output, diff, or file content), 4) anything still "
+                    "unverified or blocked, 5) a one-line offer to demonstrate "
+                    "the result (see DEMONSTRATE in your instructions). "
+                    "Do not claim unverified success." + extra
                 ),
             )
         )
@@ -2085,6 +2254,8 @@ Never claim success without evidence.
             "llm_calls": self.context.llm_calls,
             "errors": len(self.context.errors),
             "intent": self.context.intent,
+            "unverified_mutations": len(self.context.unverified_mutations),
+            "verification_nudges": self.context.verification_nudges,
         })
 
     async def reset(self) -> None:
@@ -2132,6 +2303,8 @@ Never claim success without evidence.
             "duration": time.time() - self.context.start_time,
             "intent": self.context.intent,
             "llm_calls": self.context.llm_calls,
+            "unverified_mutations": len(self.context.unverified_mutations),
+            "verification_nudges": self.context.verification_nudges,
         }
 
     def add_event_handler(self, event: str, handler: Callable) -> None:

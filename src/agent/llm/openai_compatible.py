@@ -96,6 +96,97 @@ _AUTH_STATUSES = {401, 403}
 
 
 # ======================================================================
+# KNOWN MODELS DATABASE — OpenAI-compatible backends
+# ======================================================================
+#
+# Context windows for popular models when the gateway doesn't advertise them.
+# Keys are substrings that match model IDs (case-insensitive).
+# Format: (context_window, max_output, supports_vision, supports_tools)
+#
+# Sources: Official docs, provider APIs, model cards.
+# Updated: 2026-10-09
+_KNOWN_OPENAI_COMPATIBLE_MODELS: Dict[str, Tuple[int, int, bool, bool]] = {
+    # TokenHarbor / DeepSeek
+    "deepseek-v4-flash:free": (1_048_576, 128_000, False, True),
+    "deepseek-v4-flash": (1_048_576, 128_000, False, True),
+    "deepseek-v3": (128_000, 8_192, False, True),
+    "deepseek-v2.5": (128_000, 8_192, False, True),
+    "deepseek-v2": (128_000, 8_192, False, True),
+    "deepseek-coder-v2": (128_000, 8_192, False, True),
+    "deepseek-coder": (16_384, 8_192, False, True),
+    "deepseek-r1": (128_000, 8_192, False, True),
+    "deepseek-r1-distill": (128_000, 8_192, False, True),
+
+    # OpenAI
+    "gpt-4o": (128_000, 16_384, True, True),
+    "gpt-4o-mini": (128_000, 16_384, True, True),
+    "gpt-4-turbo": (128_000, 4_096, True, True),
+    "gpt-4": (8_192, 4_096, False, True),
+    "gpt-3.5-turbo": (16_384, 4_096, False, True),
+    "o1-preview": (128_000, 32_768, False, True),
+    "o1-mini": (128_000, 65_536, False, True),
+
+    # Anthropic (via OpenAI-compatible gateways like OpenRouter)
+    "claude-3.5-sonnet": (200_000, 8_192, True, True),
+    "claude-3.5-haiku": (200_000, 8_192, True, True),
+    "claude-3-opus": (200_000, 4_096, True, True),
+    "claude-3-sonnet": (200_000, 4_096, True, True),
+    "claude-3-haiku": (200_000, 4_096, True, True),
+
+    # Meta Llama
+    "llama-3.1-405b": (128_000, 2_048, False, True),
+    "llama-3.1-70b": (128_000, 2_048, False, True),
+    "llama-3.1-8b": (128_000, 2_048, False, True),
+    "llama-3.2-90b": (128_000, 2_048, True, True),
+    "llama-3.2-11b": (128_000, 2_048, True, True),
+    "llama-3.2-3b": (128_000, 2_048, False, True),
+    "llama-3.2-1b": (128_000, 2_048, False, True),
+    "llama-3-70b": (8_192, 2_048, False, True),
+    "llama-3-8b": (8_192, 2_048, False, True),
+
+    # Mistral
+    "mistral-large": (128_000, 8_192, False, True),
+    "mistral-medium": (32_768, 8_192, False, True),
+    "mistral-small": (32_768, 8_192, False, True),
+    "mistral-7b": (32_768, 8_192, False, True),
+    "mixtral-8x7b": (32_768, 8_192, False, True),
+    "mixtral-8x22b": (65_536, 8_192, False, True),
+
+    # Qwen (Alibaba) - base instruct models support tools
+    "qwen2.5-72b": (131_072, 8_192, False, True),
+    "qwen2.5-32b": (131_072, 8_192, False, True),
+    "qwen2.5-14b": (131_072, 8_192, False, True),
+    "qwen2.5-7b": (131_072, 8_192, False, True),
+    "qwen2.5-3b": (131_072, 8_192, False, True),
+    "qwen2.5-1.5b": (131_072, 8_192, False, True),
+    "qwen2.5-0.5b": (131_072, 8_192, False, True),
+    "qwen2.5-coder": (131_072, 8_192, False, False),
+    "qwen2.5-math": (131_072, 8_192, False, False),
+    "qwen2.5-vl": (131_072, 8_192, True, True),
+
+    # Generic fallbacks by pattern
+    "32k": (32_768, 4_096, False, True),
+    "64k": (65_536, 4_096, False, True),
+    "128k": (131_072, 8_192, False, True),
+    "200k": (200_000, 8_192, False, True),
+    "256k": (256_000, 8_192, False, True),
+    "1m": (1_000_000, 8_192, False, True),
+    "1000k": (1_000_000, 8_192, False, True),
+}
+
+
+def _lookup_known_model(model_id: str) -> Optional[Tuple[int, int, bool, bool]]:
+    """Look up a model in the known models database (case-insensitive substring match)."""
+    if not model_id:
+        return None
+    model_lower = model_id.lower()
+    for key, (ctx, max_out, vision, tools) in _KNOWN_OPENAI_COMPATIBLE_MODELS.items():
+        if key in model_lower:
+            return (ctx, max_out, vision, tools)
+    return None
+
+
+# ======================================================================
 # PROVIDER
 # ======================================================================
 
@@ -731,16 +822,42 @@ class OpenAICompatibleProvider(LLMProvider):
             mid = entry.get("id") or entry.get("name")
             if not mid:
                 continue
+
+            # Get context window from API response, fallback to known models DB
+            api_ctx = int(entry.get("context_length") or entry.get("context_window") or 0)
+            api_max_out = int(entry.get("max_output_tokens") or 0)
+            api_vision = bool(entry.get("supports_vision", False))
+            api_tools = bool(entry.get("supports_tools", True))
+
+            known = _lookup_known_model(str(mid))
+            if known:
+                known_ctx, known_max_out, known_vision, known_tools = known
+                ctx = api_ctx if api_ctx > 0 else known_ctx
+                max_out = api_max_out if api_max_out > 0 else known_max_out
+                vision = api_vision or known_vision
+                tools = api_tools or known_tools
+            else:
+                ctx = api_ctx
+                max_out = api_max_out
+                vision = api_vision
+                tools = api_tools
+
+            # Ultimate fallback: 1M tokens if still unknown
+            if ctx <= 0:
+                ctx = 1_000_000
+            if max_out <= 0:
+                max_out = 8_192
+
             out.append(ModelInfo(
                 id=str(mid),
                 provider=self.name,
                 name=str(entry.get("name") or mid),
                 description=str(entry.get("description") or ""),
-                context_window=int(entry.get("context_length") or entry.get("context_window") or 0),
-                max_output=int(entry.get("max_output_tokens") or 0),
-                supports_tools=bool(entry.get("supports_tools", True)),
+                context_window=ctx,
+                max_output=max_out,
+                supports_tools=tools,
                 supports_streaming=bool(entry.get("supports_streaming", True)),
-                supports_vision=bool(entry.get("supports_vision", False)),
+                supports_vision=vision,
                 supports_json_mode=bool(entry.get("supports_json_mode", True)),
             ))
         return out
