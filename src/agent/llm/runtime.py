@@ -42,6 +42,7 @@ from agent.llm.provider import (
     ProviderError,
     ProviderErrorCode,
 )
+from agent.llm.openai_compatible import _lookup_known_model
 from agent.utils.env_manager import get_env_var, set_env_var, load_into_os_environ
 from agent.utils.logging import get_logger
 
@@ -139,7 +140,11 @@ _DEFAULT_MAX_RETRIES = 2
 # reads it. Until then those callers simply see empty/zero values.
 
 #: Context window assumed when the connected model's is unknown or tiny.
+<<<<<<< HEAD
 DEFAULT_CONTEXT_WINDOW = 1_000_000
+=======
+DEFAULT_CONTEXT_WINDOW = 1_048_576
+>>>>>>> f2aabb6 (finaly fixed)
 
 #: model id -> metadata (context_window, cost_input, capabilities, ...)
 MODEL_METADATA: Dict[str, Dict[str, Any]] = {}
@@ -989,6 +994,7 @@ async def discover_capabilities(
         }
 
     # 3. Try known models database for the family.
+<<<<<<< HEAD
     known = _lookup_known_model_for_family(family, model)
     if known:
         ctx, max_out, vision, tools = known
@@ -1002,6 +1008,22 @@ async def discover_capabilities(
             "description": "Known model from built-in database",
             "source": "known_db",
         }
+=======
+    if family == FAMILY_OPENAI:
+        known = _lookup_known_model(model)
+        if known:
+            ctx, max_out, vision, tools = known
+            return {
+                "context_window": ctx if ctx > 0 else 1_000_000,
+                "max_output": max_out if max_out > 0 else 8_192,
+                "supports_tools": tools,
+                "supports_streaming": True,
+                "supports_vision": vision,
+                "supports_json_mode": True,
+                "description": "Known model from built-in database",
+                "source": "known_db",
+            }
+>>>>>>> f2aabb6 (finaly fixed)
 
     # 4. Family fallbacks.
     return fallback

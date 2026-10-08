@@ -28,6 +28,7 @@ class TodoItem:
 
 class TodoTool(BaseTool):
     name = "todo"
+    category = "plan"
     description = "Maintain a task checklist across the session (add, update, list, complete)."
     parameters = {
         "type": "object",

@@ -21,6 +21,7 @@ logger = get_logger(__name__)
 class DiagnosticsTool(BaseTool):
     name = "diagnostics"
     description = "Run linters, type checkers, and compilers to surface errors and warnings."
+    category = "inspect"
     parameters = {
         "type": "object",
         "properties": {

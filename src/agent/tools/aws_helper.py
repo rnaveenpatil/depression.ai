@@ -46,6 +46,7 @@ class AWSHelperTool(BaseTool):
         "audited calls; automatically falls back to the AWS CLI if MCP is "
         "unavailable. Use this instead of raw bash for any AWS task."
     )
+    category = "cloud"
     parameters = {
         "type": "object",
         "properties": {

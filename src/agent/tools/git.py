@@ -23,6 +23,7 @@ _WRITE_ACTIONS = {
 
 class GitTool(BaseTool):
     name = "git"
+    category = "vcs"
     description = (
         "Inspect and manipulate git repositories "
         "(status, diff, log, add, commit, branch)."

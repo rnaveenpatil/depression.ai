@@ -24,6 +24,7 @@ logger = get_logger(__name__)
 
 class SearchTool(BaseTool):
     name = "search"
+    category = "inspect"
     description = (
         "Search for text or regex patterns across project files. "
         "Supports glob filtering, case-insensitive search, and file name search."

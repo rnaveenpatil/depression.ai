@@ -18,6 +18,7 @@ logger = get_logger(__name__)
 class MCPTool(BaseTool):
     name = "mcp"
     description = "List, inspect, or call tools exposed by connected MCP servers."
+    category = "cloud"
     parameters = {
         "type": "object",
         "properties": {

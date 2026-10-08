@@ -18,6 +18,7 @@ logger = get_logger(__name__)
 class BrowserTool(BaseTool):
     name = "browser"
     description = "Interact with web pages: navigate, click, type, extract text, take screenshots."
+    category = "net"
     parameters = {
         "type": "object",
         "properties": {

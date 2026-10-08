@@ -99,7 +99,12 @@ _AUTH_STATUSES = {401, 403}
 # KNOWN MODELS DATABASE — OpenAI-compatible backends
 # ======================================================================
 #
+<<<<<<< HEAD
 # Context windows for popular models when the gateway doesn't advertise them.
+=======
+# Context windows and max output for popular models when the gateway
+# doesn't advertise them via /models.
+>>>>>>> f2aabb6 (finaly fixed)
 # Keys are substrings that match model IDs (case-insensitive).
 # Format: (context_window, max_output, supports_vision, supports_tools)
 #

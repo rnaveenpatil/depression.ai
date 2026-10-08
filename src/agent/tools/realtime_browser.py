@@ -71,6 +71,7 @@ class RealtimeBrowserTool(BaseTool):
         "logs. Use 'snapshot' to get an ARIA tree with stable element refs "
         "(e1, e2, ...) that you can pass to 'click'/'type' via the 'ref' parameter."
     )
+    category = "net"
     parameters = {
         "type": "object",
         "properties": {

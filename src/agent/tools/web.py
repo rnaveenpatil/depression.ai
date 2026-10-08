@@ -97,6 +97,7 @@ def _assert_public_url(url: str, allowlist: Optional[List[str]] = None) -> str:
 class WebTool(BaseTool):
     name = "web"
     description = "Fetch URLs, extract page text, or search the web (DuckDuckGo)."
+    category = "net"
     parameters = {
         "type": "object",
         "properties": {

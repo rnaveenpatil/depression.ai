@@ -28,6 +28,7 @@ logger = get_logger(__name__)
 # ----------------------------------------------------------------------
 class BashTool(BaseTool):
     name = "bash"
+    category = "run"
     description = "Execute shell commands (canonical alias for terminal)."
     parameters = {
         "type": "object",
@@ -68,6 +69,7 @@ class BashTool(BaseTool):
 # ----------------------------------------------------------------------
 class ReadTool(BaseTool):
     name = "read"
+    category = "inspect"
     description = "Read file contents. Supports line ranges via limit/offset."
     parameters = {
         "type": "object",
@@ -110,6 +112,7 @@ class ReadTool(BaseTool):
 
 class WriteTool(BaseTool):
     name = "write"
+    category = "edit"
     description = (
         "Create or overwrite a file. Returns before/after content for "
         "diff rendering."
@@ -146,6 +149,7 @@ class WriteTool(BaseTool):
 
 class EditTool(BaseTool):
     name = "edit"
+    category = "edit"
     description = (
         "Modify an existing file via exact string replacement. Returns "
         "before/after content for diff rendering."
@@ -193,6 +197,7 @@ class EditTool(BaseTool):
 
 class ApplyPatchTool(BaseTool):
     name = "apply_patch"
+    category = "edit"
     description = (
         "Apply a patch using the marker format. Returns before/after content "
         "for diff rendering."
@@ -432,6 +437,7 @@ class ApplyPatchTool(BaseTool):
 # ----------------------------------------------------------------------
 class GrepTool(BaseTool):
     name = "grep"
+    category = "inspect"
     description = "Search file contents with regex."
     parameters = {
         "type": "object",
@@ -468,6 +474,7 @@ class GrepTool(BaseTool):
 
 class GlobTool(BaseTool):
     name = "glob"
+    category = "inspect"
     description = "Find files by glob pattern, newest first."
     parameters = {
         "type": "object",
@@ -512,6 +519,7 @@ class GlobTool(BaseTool):
 class WebFetchTool(BaseTool):
     name = "webfetch"
     description = "Fetch web content from a URL (static HTML)."
+    category = "net"
     parameters = {
         "type": "object",
         "properties": {
@@ -538,6 +546,7 @@ class WebFetchTool(BaseTool):
 class WebSearchTool(BaseTool):
     name = "websearch"
     description = "Search the web (static search results)."
+    category = "net"
     parameters = {
         "type": "object",
         "properties": {
@@ -564,6 +573,7 @@ class WebSearchTool(BaseTool):
 # ----------------------------------------------------------------------
 class TodoWriteTool(BaseTool):
     name = "todowrite"
+    category = "plan"
     description = "Create or replace the todo list."
     parameters = {
         "type": "object",
@@ -655,6 +665,7 @@ class TodoWriteTool(BaseTool):
 
 class TodoReadTool(BaseTool):
     name = "todoread"
+    category = "plan"
     description = "Read the current todo list."
     parameters = {"type": "object", "properties": {}, "required": []}
     timeout = 10.0
@@ -687,6 +698,7 @@ class TodoReadTool(BaseTool):
 # ----------------------------------------------------------------------
 class SkillTool(BaseTool):
     name = "skill"
+    category = "misc"
     description = "Load a skill file and return its content."
     parameters = {
         "type": "object",
@@ -745,6 +757,7 @@ class SkillTool(BaseTool):
 # ----------------------------------------------------------------------
 class QuestionTool(BaseTool):
     name = "question"
+    category = "ui"
     description = "Ask the user questions during execution."
     parameters = {
         "type": "object",
@@ -808,6 +821,7 @@ class QuestionTool(BaseTool):
 # ----------------------------------------------------------------------
 class LspTool(BaseTool):
     name = "lsp"
+    category = "inspect"
     description = "Code intelligence via LSP."
     parameters = {
         "type": "object",

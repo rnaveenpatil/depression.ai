@@ -29,6 +29,7 @@ class TaskRun:
 
 class TaskTool(BaseTool):
     name = "task"
+    category = "plan"
     description = "Spawn a subagent to work on a self-contained task; inspect or wait for results."
     parameters = {
         "type": "object",

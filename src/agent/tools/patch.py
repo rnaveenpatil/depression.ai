@@ -24,6 +24,7 @@ DIFF_SIZE_CAP = 50 * 1024
 class PatchTool(BaseTool):
     name = "patch"
     description = "Apply a unified diff or a structured find-replace patch."
+    category = "edit"
     parameters = {
         "type": "object",
         "properties": {
