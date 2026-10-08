@@ -18,6 +18,7 @@ class FakeRegistry:
                 name=name,
                 description=f"fake {name} tool",
                 parameters={"type": "object"},
+                category="misc",
             )
             for name in names
         }
@@ -29,6 +30,22 @@ class FakeRegistry:
     async def execute(self, name, params):
         self.executed.append((name, params))
         return {"success": True, "tool": name, "content": params.get("content", "ok")}
+
+    def get_schemas(self):
+        return [
+            {
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "description": f"fake {name} tool",
+                    "parameters": {"type": "object"},
+                },
+            }
+            for name in self.tools
+        ]
+
+    def select_for_task(self, intent):
+        return self.get_schemas()
 
 
 class FakeSession:
@@ -167,7 +184,7 @@ async def test_agent_loop_executes_tool_and_returns_final_response():
             content="",
             model="test/model",
             provider="test",
-            tool_calls=[ToolCall(id="1", name="write", arguments={"content": "ok"})],
+            tool_calls=[ToolCall(id="1", name="read", arguments={"filePath": "x.txt"})],
             usage={"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
         ),
         LLMResponse(content="finished", model="test/model", provider="test"),
@@ -185,7 +202,7 @@ async def test_agent_loop_executes_tool_and_returns_final_response():
     )
     agent.llm = llm
     agent.loop = loop
-    result = await loop.run("write something")
+    result = await loop.run("read something")
     assert result["success"] is True, result
     # Fast path: the tool's `content` ("ok") is returned directly.
     assert result["response"] == "ok"
