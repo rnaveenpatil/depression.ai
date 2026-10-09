@@ -108,6 +108,8 @@ _AUTH_STATUSES = {401, 403}
 # Updated: 2026-10-09
 _KNOWN_OPENAI_COMPATIBLE_MODELS: Dict[str, Tuple[int, int, bool, bool]] = {
     # TokenHarbor / DeepSeek
+    "deepseek-v4.1-flash:free": (1_048_576, 128_000, False, True),
+    "deepseek-v4.1-flash": (1_048_576, 128_000, False, True),
     "deepseek-v4-flash:free": (1_048_576, 128_000, False, True),
     "deepseek-v4-flash": (1_048_576, 128_000, False, True),
     "deepseek-v3": (128_000, 8_192, False, True),

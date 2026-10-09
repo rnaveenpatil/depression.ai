@@ -27,6 +27,15 @@ class FakeRegistry:
     def has_tool(self, name):
         return name in self.tools
 
+    def list_tools(self):
+        return list(self.tools.keys())
+
+    def is_read_only(self, name):
+        return name in ("read", "git", "filesystem")
+
+    def get_category(self, name):
+        return "misc"
+
     async def execute(self, name, params):
         self.executed.append((name, params))
         return {"success": True, "tool": name, "content": params.get("content", "ok")}
@@ -198,6 +207,7 @@ async def test_agent_loop_executes_tool_and_returns_final_response():
             "enable_planning": False,
             "enable_intent_classification": False,
             "enable_qa_verification": False,
+            "require_demo_offer": False,
         },
     )
     agent.llm = llm
@@ -245,6 +255,8 @@ async def test_agent_loop_continues_when_tool_output_has_no_readable_text():
             "enable_planning": False,
             "enable_intent_classification": False,
             "enable_qa_verification": False,
+            "require_demo_offer": False,
+            "require_verification": False,
         },
     )
     agent.llm = llm

@@ -10,14 +10,14 @@ Consistency guarantees enforced here:
     * Every assistant tool_call gets exactly one tool result before the next
       LLM turn (no orphan tool_call_ids).
     * Tool failures are injected back as structured guidance so the agent
-      can self-correct instead of stalling.
+      can self-correct instead of stalling. The guidance is preserved across
+      the API sanitizer (converted from system to user, not dropped).
     * Success is only reported when a tool output in this session proves it.
     * Cache is invalidated whenever a mutating tool runs.
     * System prompt is rebuilt when its fingerprint changes and is tagged
-      with metadata so the loop can detect it. [Bug 5]
+      with metadata so the loop can detect it.
     * The loop NEVER writes the final assistant turn — that is the caller's
       job so each user query produces exactly one assistant message.
-      [M2/N4/N10]
     * [Permission gate] Every tool call is dispatched through the AGENT's
       execute_tool(), which runs the permission manager. The registry's
       raw execute_safe is only used when the agent has no execute_tool
@@ -26,9 +26,23 @@ Consistency guarantees enforced here:
     * [Verification gate] Whenever a mutating tool succeeds, the mutation
       is recorded. The loop refuses to produce a final answer while any
       mutation is still unverified. A subsequent successful read-only
-      tool call (or an explicit UNVERIFIED statement from the model)
-      clears the pending set. This makes the reason -> modify -> verify
-      cycle a structural guarantee, not a prompt suggestion.
+      tool call (or an explicit UNVERIFIED statement at the START of the
+      response) clears the pending set.
+    * [API contract] Every request sent to the LLM is sanitized: it ends in
+      a `user` or `tool` message, and every assistant turn that carries
+      tool_calls has matching tool results. This prevents HTTP 400
+      "last message must have role = user" from ever reaching the wire.
+    * [Task completion] The agent is instructed to complete the whole task
+      before answering. It does not stop mid-task on a single tool error —
+      it adapts, tries a different approach, and only stops when the
+      requested work is done or a hard blocker is stated explicitly.
+    * [Demonstration] When the user asked to see the result (or the task
+      produced a runnable artifact), the agent offers to launch it and
+      shows the real output.
+    * [Token budget] The system prompt does NOT embed a human-readable
+      tool block — the schemas in `tools=[...]` are the single source.
+      State context and project context are trimmed to the minimum the
+      loop needs to make decisions.
 """
 from __future__ import annotations
 
@@ -41,10 +55,11 @@ import time
 from collections import deque
 from dataclasses import dataclass, field
 from enum import Enum
+from types import SimpleNamespace
 from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 from agent.agent.planner import Plan, Planner, TaskStatus
-from agent.llm.provider import Message, ToolCall
+from agent.llm.provider import Message, ToolCall, FinishReason
 from agent.llm.runtime import MODEL_METADATA, LLMProviderRegistry
 from agent.tools.registry import ToolRegistry, INTENT_CATEGORIES
 from agent.utils.errors import TimeoutError
@@ -63,13 +78,70 @@ _QUESTION_PREFIXES = (
     "explain", "describe", "tell me", "show me",
 )
 
-# Marker that identifies the real system prompt. Anything else that is a
-# pinned system message is NOT the prompt. [Bug 5]
 SYSTEM_PROMPT_MARKER = "system_prompt"
 
-# Marker the model can emit to explicitly declare something unverifiable.
-# Matches "UNVERIFIED: <reason>" anywhere on its own line.
-_UNVERIFIED_MARKER = re.compile(r"^\s*UNVERIFIED\s*:\s*(.+?)\s*$", re.MULTILINE)
+# ======================================================================
+# TOOL FALLBACK CONFIGURATION
+# ======================================================================
+# When a primary tool fails, these fallbacks are suggested/tried automatically.
+# Format: primary_tool -> list of (fallback_tool, arg_transformer_function)
+# The arg_transformer converts the failed tool's args to the fallback tool's args.
+
+def _bash_fallback_write(args: Dict[str, Any]) -> Dict[str, Any]:
+    """Convert filesystem write args to bash command."""
+    path = args.get("filePath") or args.get("path") or ""
+    content = args.get("content") or args.get("text") or ""
+    if not path:
+        return {}
+    # Use cat with heredoc for reliable writing
+    escaped = content.replace("'", "'\\''")
+    return {"command": f"cat > '{path}' << 'EOF'\n{escaped}\nEOF"}
+
+def _bash_fallback_read(args: Dict[str, Any]) -> Dict[str, Any]:
+    """Convert filesystem read args to bash command."""
+    path = args.get("filePath") or args.get("path") or ""
+    if not path:
+        return {}
+    return {"command": f"cat '{path}'"}
+
+def _bash_fallback_list(args: Dict[str, Any]) -> Dict[str, Any]:
+    """Convert filesystem list args to bash command."""
+    path = args.get("path") or "."
+    return {"command": f"ls -la '{path}'"}
+
+def _bash_fallback_edit(args: Dict[str, Any]) -> Dict[str, Any]:
+    """Convert filesystem edit args to bash sed command."""
+    path = args.get("filePath") or args.get("path") or ""
+    old_str = args.get("oldString") or args.get("old_text") or ""
+    new_str = args.get("newString") or args.get("new_text") or ""
+    if not path or not old_str:
+        return {}
+    # Escape for sed
+    old_escaped = old_str.replace("/", "\\/").replace("&", "\\&")
+    new_escaped = new_str.replace("/", "\\/").replace("&", "\\&")
+    return {"command": f"sed -i 's/{old_escaped}/{new_escaped}/g' '{path}'"}
+
+# Fallback mapping: primary tool -> list of (fallback_tool, arg_transformer)
+TOOL_FALLBACKS: Dict[str, List[tuple]] = {
+    "write": [("bash", _bash_fallback_write), ("terminal", _bash_fallback_write)],
+    "edit": [("bash", _bash_fallback_edit), ("terminal", _bash_fallback_edit)],
+    "apply_patch": [("bash", lambda a: {"command": f"patch -p1 < {a.get('patchFile', a.get('path', ''))}"})],
+    "read": [("bash", _bash_fallback_read), ("terminal", _bash_fallback_read)],
+    "list": [("bash", _bash_fallback_list), ("terminal", _bash_fallback_list)],
+    "glob": [("bash", lambda a: {"command": f"find {a.get('path', '.')} -name '{a.get('pattern', '*')}'"})],
+    "grep": [("bash", lambda a: {"command": f"grep -r '{a.get('pattern', '')}' {a.get('path', '.')}'"})],
+    "filesystem": [("bash", lambda a: {"command": f"ls -la {a.get('path', '.')}"})],
+    "patch": [("bash", lambda a: {"command": f"patch -p1 < {a.get('patchFile', a.get('path', ''))}"})],
+}
+
+# Maximum fallback attempts per tool call
+MAX_FALLBACK_ATTEMPTS = 2
+
+_UNVERIFIED_MARKER = re.compile(
+    r"^\s*UNVERIFIED\s*:\s*(.+?)\s*$",
+    re.MULTILINE,
+)
+_UNVERIFIED_MAX_POS = 200
 
 
 # ----------------------------------------------------------------------
@@ -112,13 +184,19 @@ _DESTRUCTIVE_SHELL_PATTERNS = (
     re.compile(r"wget\b.*\|\s*(?:ba)?sh\b"),
 )
 
-# Patterns that indicate the final response is offering to demonstrate work.
 _DEMO_OFFER_PATTERNS = (
     re.compile(r"\bwould you like me to\b", re.I),
     re.compile(r"\bwant me to (run|show|launch|demo|open|execute)\b", re.I),
     re.compile(r"\bshall i (run|show|launch|demo|open|execute)\b", re.I),
     re.compile(r"\bi can (run|show|launch|demo|open|execute)\b", re.I),
     re.compile(r"\bready (for me )?to (run|show|launch|demo)\b", re.I),
+)
+
+_USER_DECLINED_PATTERNS = (
+    re.compile(r"\bno\b\s*,?\s*(thanks|thank you|thx)\b", re.I),
+    re.compile(r"\bdon'?t\b.*\b(run|launch|show)\b", re.I),
+    re.compile(r"\bnot?\b.*\b(run|launch|show)\b", re.I),
+    re.compile(r"\bjust\b.*\b(explain|tell me|describe)\b", re.I),
 )
 
 
@@ -189,13 +267,10 @@ class LoopContext:
     hit_iteration_limit: bool = False
     intent: str = "unknown"
 
-    # [Verification gate] Successful mutating tool calls that have not yet
-    # been followed by a successful read-only tool call. The loop refuses
-    # to finish while this list is non-empty (unless the model explicitly
-    # emits an UNVERIFIED: line).
     unverified_mutations: List[Dict[str, Any]] = field(default_factory=list)
-    # Number of times the loop has nudged the model to verify this turn.
     verification_nudges: int = 0
+
+    user_declined_demo: bool = False
 
     def add_observation(self, observation: Dict[str, Any]) -> None:
         self.observations.append(observation)
@@ -216,14 +291,13 @@ class LoopContext:
             "output_tokens": self.output_tokens,
             "llm_calls": self.llm_calls,
             "cost": self.cost,
-            "errors": len(self.context_errors()) if False else len(self.errors),
+            "errors": len(self.errors),
             "duration": time.time() - self.start_time,
             "hit_iteration_limit": self.hit_iteration_limit,
             "intent": self.intent,
             "unverified_mutations": len(self.unverified_mutations),
         }
 
-    # Helper kept so get_summary stays readable across refactors.
     def context_errors(self) -> List[str]:
         return self.errors
 
@@ -259,11 +333,10 @@ class AgentLoop:
         )
         self.require_demo_offer = bool(config.get("require_demo_offer", True))
 
-        # [Verification gate] Master switch and budget.
         self.require_verification = bool(config.get("require_verification", True))
-        # How many times the loop may refuse a final answer and ask the
-        # model to verify before giving up and accepting the answer.
-        self.max_verification_nudges = int(config.get("max_verification_nudges", 3))
+        self.max_verification_nudges = int(config.get("max_verification_nudges", 1))
+
+        self.retry_tool_timeout = bool(config.get("retry_tool_timeout", False))
 
         self.state = LoopState.IDLE
         self.context = LoopContext()
@@ -292,6 +365,96 @@ class AgentLoop:
     @property
     def model_context(self):
         return self.agent.context_manager
+
+    # ------------------------------------------------------------------
+    # API CONTRACT: message sanitizer
+    # ------------------------------------------------------------------
+
+    def _sanitize_messages_for_api(
+        self,
+        messages: List[Message],
+    ) -> List[Message]:
+        if not messages:
+            return messages
+
+        out: List[Message] = []
+        i = 0
+        n = len(messages)
+
+        while i < n:
+            m = messages[i]
+            role = getattr(m, "role", None)
+
+            if role == "assistant":
+                tcs = getattr(m, "tool_calls", None) or []
+                if not tcs:
+                    out.append(m)
+                    i += 1
+                    continue
+
+                declared_ids: List[str] = []
+                for tc in tcs:
+                    if isinstance(tc, dict):
+                        cid = tc.get("id")
+                    else:
+                        cid = getattr(tc, "id", None)
+                    if cid:
+                        declared_ids.append(cid)
+
+                out.append(m)
+                j = i + 1
+                found: Dict[str, Message] = {}
+                while j < n and getattr(messages[j], "role", None) == "tool":
+                    cid = getattr(messages[j], "tool_call_id", None)
+                    if cid in declared_ids and cid not in found:
+                        found[cid] = messages[j]
+                    j += 1
+
+                for cid in declared_ids:
+                    if cid in found:
+                        out.append(found[cid])
+                    else:
+                        out.append(
+                            Message(
+                                role="tool",
+                                content=json.dumps({
+                                    "success": False,
+                                    "error": (
+                                        "tool result missing from history; "
+                                        "the previous attempt was interrupted"
+                                    ),
+                                }),
+                                tool_call_id=cid,
+                            )
+                        )
+
+                i = j
+                continue
+
+            if role == "tool":
+                i += 1
+                continue
+
+            out.append(m)
+            i += 1
+
+        if out and getattr(out[-1], "role", None) == "system":
+            last = out[-1]
+            out[-1] = Message(
+                role="user",
+                content=getattr(last, "content", "") or "Continue.",
+                metadata=getattr(last, "metadata", None),
+            )
+
+        if out and getattr(out[-1], "role", None) == "assistant":
+            out.append(
+                Message(
+                    role="user",
+                    content="Continue from here. Answer the user or call a tool.",
+                )
+            )
+
+        return out
 
     # ------------------------------------------------------------------
     # REGISTRY CAPABILITY PROBES
@@ -334,24 +497,6 @@ class AgentLoop:
             except Exception:
                 logger.debug("has_tool(%s) probe failed", name, exc_info=True)
         return name in self._registry_list_tools()
-
-    def _registry_describe_for_prompt(self, tools: Any) -> str:
-        probe = getattr(self.tool_registry, "describe_for_prompt", None)
-        if callable(probe):
-            try:
-                return str(probe(tools))
-            except Exception:
-                logger.debug("describe_for_prompt probe failed", exc_info=True)
-        lines: List[str] = []
-        for item in tools or []:
-            if not isinstance(item, dict):
-                continue
-            fn = item.get("function") if isinstance(item.get("function"), dict) else item
-            name = fn.get("name") or ""
-            desc = fn.get("description") or ""
-            if name:
-                lines.append(f"- {name}: {desc}".rstrip(": ").strip())
-        return "\n".join(lines) if lines else "(no tools available)"
 
     def _registry_get_schemas(self) -> List[Dict[str, Any]]:
         for attr, with_intent in (("select_for_task", True), ("get_schemas", False)):
@@ -398,7 +543,9 @@ class AgentLoop:
         )
 
     async def _execute_with_retry(self, fn: Callable, name: str, source: str) -> Any:
-        transient_errors = (asyncio.TimeoutError, ConnectionError, TimeoutError)
+        transient_errors: tuple = (ConnectionError,)
+        if self.retry_tool_timeout:
+            transient_errors = transient_errors + (asyncio.TimeoutError, TimeoutError)
 
         for attempt in range(2):
             try:
@@ -469,6 +616,10 @@ class AgentLoop:
             intent = await self._classify_intent(query)
             self.context.intent = intent
             logger.info("Classified intent: %s", intent)
+
+            self.context.user_declined_demo = any(
+                p.search(query) for p in _USER_DECLINED_PATTERNS
+            )
 
             if intent in ("question", "ambiguous"):
                 logger.info("Skipping planning (intent=%s)", intent)
@@ -544,7 +695,7 @@ class AgentLoop:
                     Message(role="user", content=query),
                 ],
                 temperature=0.0,
-                max_tokens=16,
+                max_tokens=32,
             )
             raw = (getattr(response, "content", "") or "").strip().lower()
             word = raw.split()[0].strip(".,:;!?") if raw else ""
@@ -593,11 +744,6 @@ class AgentLoop:
 
                 continue
 
-            # ------------------------------------------------------------------
-            # [Verification gate] The model produced a final answer with no
-            # tool call. If there are pending mutations that have not been
-            # verified, refuse to finish and ask the model to verify.
-            # ------------------------------------------------------------------
             response_text = (thought.get("response") or "").strip()
 
             if (
@@ -606,10 +752,7 @@ class AgentLoop:
                 and self.context.verification_nudges < self.max_verification_nudges
                 and self.context.iteration < self.max_iterations
             ):
-                # Allow the model to explicitly declare something unverifiable.
-                # Only accept the escape hatch once the model has had a chance
-                # to see the nudge — not on the first attempt.
-                if not _UNVERIFIED_MARKER.search(response_text):
+                if not self._declared_unverified(response_text):
                     self.context.verification_nudges += 1
                     logger.info(
                         "Refusing final answer: %d unverified mutation(s) "
@@ -621,7 +764,6 @@ class AgentLoop:
                     await self._inject_verification_guidance()
                     continue
 
-                # Model explicitly said UNVERIFIED: — accept but record it.
                 logger.info(
                     "Model declared UNVERIFIED — accepting answer without "
                     "verification: %s",
@@ -799,7 +941,7 @@ class AgentLoop:
             "evidence (command output or diff).\n"
             "If the task cannot be completed, respond with 'TASK FAILED: <reason>'.\n"
             "If the task cannot be verified for a concrete reason, respond "
-            "with 'UNVERIFIED: <reason>'.\n"
+            "with 'UNVERIFIED: <reason>' on its own first line.\n"
             "Do not describe the plan — execute this task."
         )
 
@@ -814,6 +956,9 @@ class AgentLoop:
 
         while local_turns < max_local_turns:
             local_turns += 1
+
+            messages = self._sanitize_messages_for_api(messages)
+
             try:
                 self.context.llm_calls += 1
                 response = await self.llm.complete_with_tools(
@@ -840,13 +985,10 @@ class AgentLoop:
                 if upper.startswith("TASK FAILED"):
                     return {"success": False, "retry": True, "error": content}
 
-                # [Verification gate] In plan mode, a task cannot be marked
-                # complete while it has unverified mutations, unless the
-                # model explicitly declares UNVERIFIED.
                 if (
                     self.require_verification
                     and local_unverified
-                    and not _UNVERIFIED_MARKER.search(content)
+                    and not self._declared_unverified(content)
                     and local_turns < max_local_turns
                 ):
                     names = [m["tool"] for m in local_unverified]
@@ -857,8 +999,8 @@ class AgentLoop:
                             f"You modified state via {names} but have not "
                             f"verified the result. Read the changed artifact "
                             f"back or rerun the affected command and quote "
-                            f"the output. If it cannot be verified, respond "
-                            f"with 'UNVERIFIED: <reason>'."
+                            f"the output. If it cannot be verified, start "
+                            f"your reply with 'UNVERIFIED: <reason>'."
                         ),
                     ))
                     continue
@@ -881,7 +1023,7 @@ class AgentLoop:
                 task.status = TaskStatus.COMPLETED
                 task.result = summary or task.description
                 task.actual_time = time.time() - task.created_at
-                if _UNVERIFIED_MARKER.search(content):
+                if self._declared_unverified(content):
                     task.metadata["unverified"] = True
                 self._update_todo_status(task, "done")
                 self._refresh_plan_metadata()
@@ -906,7 +1048,6 @@ class AgentLoop:
             await self._observe(results)
             self._maybe_invalidate_cache()
 
-            # Local mutation tracking for this task's turn budget.
             for x in results:
                 r = x.get("result") or {}
                 tool = x.get("tool", "")
@@ -988,11 +1129,9 @@ class AgentLoop:
             if upper.startswith("FAIL"):
                 reason = raw.split(":", 1)[1].strip() if ":" in raw else raw
                 return {"passed": False, "reason": reason}
-            # Unrecognized verdict is not proof of success — treat as failure.
             return {"passed": False, "reason": f"unrecognized verdict: {raw[:80]}"}
         except Exception as exc:
             logger.warning("QA verification failed for task %s: %s", task.id, exc)
-            # Fail closed: a verifier crash cannot be treated as success.
             return {"passed": False, "reason": f"verifier error: {exc}"}
 
     async def _summarize_plan(self, plan: Plan, system_prompt: str) -> str:
@@ -1029,9 +1168,9 @@ class AgentLoop:
                             "anything the user should know. Cite the concrete "
                             "evidence (command output, diff, or file content) "
                             "that proves each major step. End with a one-line "
-                            "offer to demonstrate the result (see DEMONSTRATE). "
-                            "Do not repeat the step list. Do not claim "
-                            "unverified success.\n\n"
+                            "offer to demonstrate the result if the task "
+                            "produced something runnable. Do not repeat the "
+                            "step list. Do not claim unverified success.\n\n"
                             f"Plan: {plan.goal}\n\n"
                             f"Task outcomes:\n{body}"
                         ),
@@ -1118,111 +1257,76 @@ class AgentLoop:
         aws_block = self._build_aws_guidance()
 
         base_prompt = """
-You are an advanced AI CLI agent (depression.ai). Complete the user's task; do not merely
-describe it. Inspect, modify, execute, test, and verify as needed.
+You are an AI CLI agent (depression.ai). Solve the user's task; do not describe it.
 
-## RULES
-1. Understand the goal, then inspect relevant files/code before acting.
-2. Prefer the most specific tool. Use bash only for short, terminating
-   commands and when no specialized tool fits. Never run long-lived
-   servers via bash — use the process tool.
-3. Make the smallest change that solves the problem.
-4. Never invent tool results, file contents, command output, or success.
-5. Never expose secrets, keys, tokens, or credentials.
+ACT WHEN YOU KNOW ENOUGH
+- Inspect only what blocks the next action.
+- After ~6 reads/greps: act, or state a concrete blocker.
+- A plan with no edits is not progress.
+- Do not re-read, re-plan, or narrate.
 
-## TOOL ERRORS
-A tool error is information, not a task failure. Read the full error,
-identify the cause, compare it with the tool schema, correct the arguments,
-retry once with the fix. Never repeat the exact same failing call. If the
-cause is unfixable, stop that operation and state the blocker.
+UNDERSTAND INTENT
+- Question → answer, do not edit.
+- Fix → reproduce, find cause, fix, rerun the failing command.
+- Build/Create → plan briefly, implement, test, show.
+- Show/Run/Launch → run it, show real output.
+- Analyze → inspect, report; do not modify unless asked.
 
-## VERIFY BEFORE CLAIMING
-After ANY change to state (write, edit, delete, move, execute), you MUST
-verify it before finishing:
-- files  → read the changed section back and quote it
-- bugs   → rerun the command that failed and quote the new output
-- APIs   → curl the endpoint and show the response
-- servers → start it, show startup log + URL
-- data   → show row counts / sample output
+TOOLS
+- Most specific tool first. bash only for short, terminating commands.
+- On error: read it, fix the argument, retry once. Never repeat the same
+  failing call. If it still fails, switch tool.
+  use terminal and bash if any other tools failing as defult tools
+- Never bypass permissions. If denied, stop and ask.
 
-The runtime enforces this: if you modify state and then try to answer
-without a read-back, the loop will reject your answer and ask you to
-verify. Do not fight it. Do the verification.
+VERIFY BEFORE CLAIMING
+- After any change: read it back or rerun the affected command.
+- Quote the actual output as evidence.
+- Never say "fixed" / "done" / "success" without evidence.
+- If truly unverifiable, start your reply with: UNVERIFIED: <reason>
 
-If verification is genuinely impossible (no tool exists, side effect is
-irreversible, environment unavailable), reply with a line:
-    UNVERIFIED: <concrete reason>
-That is the only accepted escape hatch.
+SHOW THE USER
+- If the task produced something runnable, run it and show the output.
+- End work tasks with one line: "Want me to run it and show you?"
+- Skip the offer if the user already asked, already declined, or the
+  result is a pure answer.
 
-Never say "fixed", "working", or "done" without evidence in this session.
+DON'T STOP MID-TASK
+- Finish the whole change, verify, then show.
+- Only stop for: destructive approval, real ambiguity, or a blocker only
+  the user can resolve.
 
-## DEMONSTRATE THE RESULT
-Finishing the change is not the end. After the work is verified, your
-default next step is to OFFER TO SHOW the user the actual artifact.
+FINAL RESPONSE
+1. WHAT changed  2. WHY  3. EVIDENCE  4. Anything unverified  5. Offer
+Short. No narration. No tool-by-tool log.
 
-Match the medium to the work:
-- script / CLI       → run it, show output
-- web UI / dev server→ start it, show URL + startup line
-- Flutter / desktop  → launch it, show startup status
-- generated file     → show path, size, first lines
-- refactor           → show the diff
-- API endpoint       → curl it, show response
-- bug fix            → rerun the failing command, show output
-- build              → show log tail + artifact path
-- data pipeline      → show row counts / sample output
+EXAMPLES
 
-End your response with ONE concrete offer, e.g.:
-  "I've implemented X. Want me to run it and show you the output?"
+User: "Fix the typo in README.md"
+Assistant: [reads README.md, finds typo, edits file, reads back to verify]
+Fixed typo in README.md line 42: "deployment" → "deployment"
+Evidence: `grep -n deployment README.md` shows corrected line.
+Want me to run it and show you?
 
-Do NOT ask when the user already asked you to run it, when running is
-required to complete the task, or when the only "result" is a pure
-information answer. If the user declines, stop — do not nag. When they
-say yes, actually launch it and present the real output verbatim.
+User: "Why is the build failing?"
+Assistant: [runs build command, reads error, inspects relevant files, explains cause]
+Build fails at src/main.py:15 — missing import 'requests'.
+Run `pip install requests` to fix.
+Want me to run it and show you?
 
-## WORKFLOW
-For multi-step tasks:
-  1 inspect → 2 identify → 3 plan minimum fix → 4 modify → 5 verify → 6 test
-Show a short checklist once before executing; mark items complete only with
-evidence. Skip the checklist for simple tasks. Do not repeat it.
-
-## EFFICIENCY
-Do not narrate every successful tool call. Do not repeat known facts.
-Do not quote large files/logs unless necessary. After a routine success,
-immediately continue. Explain only: key findings, failures, unexpected
-results, verification evidence, and decisions needing user input.
-
-## PERMISSIONS
-Never bypass permission checks. For destructive or high-risk operations
-(delete, overwrite, force-push, infra destroy, credential changes) use the
-configured permission mechanism. If a destructive call is denied, do not
-work around it (no alternate tools, no shell tricks) — explain the block
-and ask the user.
-
-## TOOL ARGUMENTS
-Use only parameters defined by the tool schema. Never invent parameter
-names. If a tool rejects arguments, read the error, fix them, retry.
-
-## STATE
-Track: cwd, files inspected, files changed, key errors, tests run,
-verification status. Never assume a prior step succeeded without its
-result confirming it.
-
-## FINAL RESPONSE
-Order:
-  1. WHAT changed (short list)
-  2. WHY (reasoning)
-  3. EVIDENCE (command output, diff, file content)
-  4. WHAT is still unverified or blocked
-  5. The one-line DEMONSTRATE offer
-Never claim success without evidence.
+User: "Add a new CLI command for export"
+Assistant: [reads cli.py to understand structure, creates new command function, adds to parser, tests]
+Added `export` command in cli.py:200-230 with --format and --output flags.
+Verified: `python -m cli export --help` shows new command.
+Want me to run it and show you?
 """
 
+        # [Token budget] The tool schemas travel in the request's `tools`
+        # parameter. Do NOT duplicate them here.
         self._system_prompt_cache = (
             base_prompt
             + env_block
             + aws_block
-            + "\n\n## Available Tools\n"
-            + self._registry_describe_for_prompt(self._get_available_tools())
             + "\n\n## Project\n"
             + json.dumps(project, indent=2, default=str)
             + "\n\n## Permissions\n"
@@ -1295,23 +1399,20 @@ Never claim success without evidence.
         workspace = getattr(self.agent, "workspace", None)
         if workspace is not None:
             try:
-                files = await workspace.list_files(max_files=20)
+                # [Token budget] 10 files, not 20. The model can list more
+                # with a glob/read call if it needs to.
+                files = await workspace.list_files(max_files=10)
             except Exception as exc:
                 logger.debug("list_files failed: %s", exc)
                 files = []
-            git_info = None
-            if hasattr(workspace, "get_git_info"):
-                try:
-                    git_info = await workspace.get_git_info()
-                except Exception as exc:
-                    logger.debug("get_git_info failed: %s", exc)
+            # [Token budget] git_info is omitted. The model can run
+            # `git status` / `git log` if it needs branch or commit info.
             ctx = {
                 "project_path": str(getattr(workspace, "project_dir", "")),
                 "files": files,
-                "git_info": git_info,
             }
         else:
-            ctx = {"project_path": "", "files": [], "git_info": None}
+            ctx = {"project_path": "", "files": []}
 
         self._project_ctx = ctx
         self._project_ctx_ts = now
@@ -1453,13 +1554,17 @@ Never claim success without evidence.
         except Exception:
             pass
         try:
-            from agent.llm.runtime import MODEL_METADATA, DEFAULT_CONTEXT_WINDOW
+            from agent.llm.runtime import MODEL_METADATA as _MM, DEFAULT_CONTEXT_WINDOW as _DCW
             model = self.llm.get_current_model()
-            meta = MODEL_METADATA.get(model, {}) if model else {}
+            meta = _MM.get(model, {}) if model else {}
             w = int(meta.get("context_window") or 0)
-            return w if w >= 2048 else DEFAULT_CONTEXT_WINDOW
+            return w if w >= 2048 else _DCW
         except Exception:
-            return 8000
+            try:
+                from agent.llm.runtime import DEFAULT_CONTEXT_WINDOW as _DCW
+                return _DCW
+            except Exception:
+                return 8000
 
     async def _maybe_compact_before_call(
         self,
@@ -1494,47 +1599,67 @@ Never claim success without evidence.
         system_prompt = await self._get_system_prompt()
         tool_schemas = self._get_available_tools()
 
+        # [Token budget] Only include plan context when there are pending
+        # tasks. A completed plan's context is pure overhead.
         state_parts: Dict[str, Any] = {"state": await self._get_state_context()}
-        if self.current_plan:
+        if self.current_plan and self.current_plan.get_pending_tasks():
             state_parts["plan"] = self._get_plan_context()
         state_block = json.dumps(state_parts, default=str)
 
         await self._maybe_compact_before_call(system_prompt, tool_schemas, state_block)
 
         messages = get_model_messages(self.model_context, self.max_history_length)
+        messages = self._sanitize_messages_for_api(messages)
         messages.append(Message(role="system", content="Execution state: " + state_block))
+        messages = self._sanitize_messages_for_api(messages)
 
         self.context.llm_calls += 1
         response = await self.llm.complete_with_tools(
             messages=messages,
             tools=tool_schemas,
-            temperature=0.7,
+            temperature=0.2,
             max_tokens=self.reserve_output_tokens,
         )
 
         calls = list(getattr(response, "tool_calls", []) or [])
         content = getattr(response, "content", None) or ""
+        finish_reason = getattr(response, "finish_reason", None) or FinishReason.STOP.value
 
-        if not calls and not content.strip():
-            logger.warning("LLM returned empty; retrying once")
-            retry_messages = list(messages) + [
+        # Retry on empty response OR non-STOP finish reason without tool calls.
+        # This catches truncation (LENGTH), provider errors (ERROR), and
+        # other incomplete turns that would otherwise be accepted as final.
+        should_retry = (
+            (not calls and not content.strip())
+            or (not calls and finish_reason not in (FinishReason.STOP.value, FinishReason.TOOL_CALLS.value))
+        )
+        if should_retry:
+            logger.warning(
+                "LLM returned incomplete turn (finish_reason=%s); retrying once",
+                finish_reason,
+            )
+            retry_messages = list(messages)
+            retry_messages.append(
                 Message(
                     role="user",
                     content=(
-                        "Please provide your answer now, or call a tool if you "
-                        "still need information."
+                        "The previous response was incomplete. Please provide "
+                        "your answer now, or call a tool if you still need "
+                        "information."
                     ),
                 )
-            ]
+            )
+            retry_messages = self._sanitize_messages_for_api(retry_messages)
+
             self.context.llm_calls += 1
             response = await self.llm.complete_with_tools(
                 messages=retry_messages,
                 tools=tool_schemas,
-                temperature=0.3,
-                max_tokens=self.reserve_output_tokens,
+                temperature=0.1,
+                max_tokens=self.reserve_output_tokens * 2,
             )
             calls = list(getattr(response, "tool_calls", []) or [])
             content = getattr(response, "content", None) or ""
+            finish_reason = getattr(response, "finish_reason", None) or FinishReason.STOP.value
 
         if len(calls) > self.max_tool_calls_per_iteration:
             logger.info(
@@ -1546,28 +1671,28 @@ Never claim success without evidence.
         self._record_usage(getattr(response, "usage", None))
 
         if content and not calls:
-            try:
-                from agent.tui.plan_parser import parse_plan_from_text
-                parsed = parse_plan_from_text(content)
-                if parsed and parsed.is_valid:
-                    signature = tuple(
-                        (e.content[:80], e.status) for e in parsed.entries
-                    )
-                    if signature != self._last_checklist_signature:
-                        self._last_checklist_signature = signature
-                        should_render = not self._checklist_rendered
-                        self._checklist_rendered = True
-                        await self._trigger_event(
-                            "on_plan_updated",
-                            {
-                                "entries": parsed.to_list(),
-                                "count": parsed.count,
-                                "raw": content,
-                                "render": should_render,
-                            },
+            if not self._checklist_rendered:
+                try:
+                    from agent.tui.plan_parser import parse_plan_from_text
+                    parsed = parse_plan_from_text(content)
+                    if parsed and parsed.is_valid:
+                        signature = tuple(
+                            (e.content[:80], e.status) for e in parsed.entries
                         )
-            except Exception as exc:
-                logger.debug("Plan parse failed: %s", exc)
+                        if signature != self._last_checklist_signature:
+                            self._last_checklist_signature = signature
+                            self._checklist_rendered = True
+                            await self._trigger_event(
+                                "on_plan_updated",
+                                {
+                                    "entries": parsed.to_list(),
+                                    "count": parsed.count,
+                                    "raw": content,
+                                    "render": True,
+                                },
+                            )
+                except Exception as exc:
+                    logger.debug("Plan parse failed: %s", exc)
 
         if calls:
             await add_tool_call(self.model_context, content, calls)
@@ -1649,15 +1774,12 @@ Never claim success without evidence.
         return self._registry_get_schemas()
 
     async def _get_state_context(self) -> Dict[str, Any]:
+        # [Token budget] Only the fields the loop needs to make decisions.
+        # iteration, intent, and pending unverified mutations.
         return {
             "iteration": self.context.iteration,
-            "max_iterations": self.max_iterations,
-            "actions_taken": len(self.context.actions_taken),
-            "observations": len(self.context.observations),
-            "completed_tool_calls": len(self.completed_tool_calls),
-            "pending_tool_calls": len(self.pending_tool_calls),
             "intent": self.context.intent,
-            "unverified_mutations": len(self.context.unverified_mutations),
+            "unverified": len(self.context.unverified_mutations),
         }
 
     def _get_plan_context(self) -> Dict[str, Any]:
@@ -1668,11 +1790,6 @@ Never claim success without evidence.
             "goal": self.current_plan.goal,
             "completion": self.current_plan.get_completion_percentage(),
             "pending_tasks": [t.to_dict() for t in self.current_plan.get_pending_tasks()],
-            "completed_tasks": [
-                t.to_dict()
-                for t in self.current_plan.tasks
-                if t.status == TaskStatus.COMPLETED
-            ],
         }
 
     # ==================================================================
@@ -1684,12 +1801,6 @@ Never claim success without evidence.
         thought: Dict[str, Any],
         results: List[Dict[str, Any]],
     ) -> Optional[str]:
-        """
-        Return a short answer directly when the very first turn was a
-        single trivial read-only tool call. Never fast-path when the
-        request implied user-facing work — those must go through the
-        normal closing response so the DEMONSTRATE offer can appear.
-        """
         if self.context.iteration != 1:
             return None
         calls = thought.get("tool_calls") or []
@@ -1702,11 +1813,9 @@ Never claim success without evidence.
         if tool_name in ("question",):
             return None
 
-        # Only allow fast-path for read-only tools.
         if not self._is_read_only(tool_name):
             return None
 
-        # Never fast-path when the request implied user-facing work.
         if self.context.intent in ("feature", "bugfix", "refactor", "analysis"):
             return None
 
@@ -1730,7 +1839,6 @@ Never claim success without evidence.
         if not (isinstance(out, str) and out.strip()):
             return None
 
-        # Only fast-path short outputs; long ones deserve a real summary.
         if len(out) > 4000:
             return None
 
@@ -1769,7 +1877,6 @@ Never claim success without evidence.
                 })
                 continue
 
-            # ---- Belt-and-braces permission guard --------------------
             if (
                 self.require_permission_for_destructive
                 and _looks_destructive_call(name, args)
@@ -1828,9 +1935,8 @@ Never claim success without evidence.
                     results.append({
                         "tool": name, "tool_call_id": call_id,
                         "result": result, "cached": True,
+                        "params": args,
                     })
-                    # A read that hits cache is still a read for the
-                    # verification gate.
                     if result.get("success", False) and self._is_read_only(name):
                         self._clear_unverified_mutations(name)
                     await self._trigger_event("on_tool_executed", {
@@ -1864,19 +1970,18 @@ Never claim success without evidence.
                 await self._safe_add_tool_result(call, result)
 
                 if result.get("success", False):
-                    # Clear any prior failure signature for this call.
                     self._clear_failure_signature(name, args)
                     if self.enable_caching and self._is_read_only(name):
                         self.tool_result_cache[key] = {
                             "result": result, "timestamp": time.time(),
                         }
-                    # [Verification gate] Track mutation vs. verification.
                     self._track_mutation_or_read(name, args, call_id, result)
 
                 self.completed_tool_calls.append(call)
                 results.append({
                     "tool": name, "tool_call_id": call_id,
                     "result": result, "execution_time": elapsed,
+                    "params": args,
                 })
                 await self._trigger_event("on_tool_executed", {
                     "tool": name, "tool_call_id": call_id,
@@ -1898,6 +2003,7 @@ Never claim success without evidence.
                 results.append({
                     "tool": name, "tool_call_id": call_id,
                     "result": result, "error": str(exc), "success": False,
+                    "params": args,
                 })
                 await self._trigger_event("on_tool_executed", {
                     "tool": name, "tool_call_id": call_id,
@@ -1917,18 +2023,13 @@ Never claim success without evidence.
         call_id: str,
         result: Dict[str, Any],
     ) -> None:
-        """Update the unverified_mutations list after a successful tool call."""
         if not self.require_verification:
             return
 
         if self._is_read_only(name):
-            # A successful read proves the current state of whatever it read.
-            # Clear the pending mutations — the model has now observed the
-            # post-mutation world (or at least part of it).
             self._clear_unverified_mutations(name)
             return
 
-        # Non-read-only → assume mutation. Record it.
         self.context.unverified_mutations.append({
             "tool": name,
             "args": args,
@@ -1950,7 +2051,6 @@ Never claim success without evidence.
         self.context.unverified_mutations.clear()
 
     async def _inject_verification_guidance(self) -> None:
-        """Tell the model to verify its pending mutations before answering."""
         pending = self.context.unverified_mutations
         if not pending:
             return
@@ -1964,7 +2064,7 @@ Never claim success without evidence.
             f"- if you ran a command, rerun the affected command\n"
             f"- if you changed config, read it back\n"
             f"Quote the actual output as evidence.\n"
-            f"If verification is genuinely impossible, reply with:\n"
+            f"If verification is genuinely impossible, begin your reply with:\n"
             f"    UNVERIFIED: <concrete reason>\n"
             f"That is the only accepted escape hatch."
         )
@@ -1972,6 +2072,14 @@ Never claim success without evidence.
             await self.model_context.add_system_message(msg)
         except Exception as exc:
             logger.debug("add_system_message (verification) failed: %s", exc)
+
+    def _declared_unverified(self, text: str) -> bool:
+        if not text:
+            return False
+        m = _UNVERIFIED_MARKER.search(text)
+        if not m:
+            return False
+        return m.start() < _UNVERIFIED_MAX_POS
 
     # ------------------------------------------------------------------
     # Failure signature bookkeeping
@@ -2026,6 +2134,40 @@ Never claim success without evidence.
                 getattr(call, "id", "?"), inner, exc_info=True,
             )
 
+    async def _execute_fallback(
+        self,
+        fallback_tool: str,
+        fallback_args: Dict[str, Any],
+        original_call: ToolCall,
+        failed_result: Dict[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        """Execute a fallback tool and return its result."""
+        try:
+            # Create a synthetic call ID for the fallback
+            fallback_call_id = f"{getattr(original_call, 'id', 'call')}_fallback_{fallback_tool}"
+            
+            # Execute through registry (which goes through agent's execute_tool for permissions)
+            result = await self._registry_execute(fallback_tool, fallback_args)
+            
+            if not isinstance(result, dict):
+                result = {"success": True, "result": result}
+            
+            try:
+                result = redact(result)
+            except Exception:
+                pass
+            
+            # Log fallback execution
+            logger.info(
+                "FALLBACK EXECUTED: %s -> %s | success=%s",
+                failed_result.get("tool", "?"), fallback_tool, result.get("success", False)
+            )
+            
+            return result
+        except Exception as exc:
+            logger.warning("Fallback %s failed: %s", fallback_tool, exc)
+            return {"success": False, "error": str(exc), "recoverable": True}
+
     async def _observe(self, results: List[Dict[str, Any]]) -> None:
         for x in results:
             r = x.get("result") or {}
@@ -2057,7 +2199,16 @@ Never claim success without evidence.
             invalid = r.get("invalid_arguments", False)
             permission_denied = bool(r.get("permission_denied"))
 
+            logger.warning(
+                "TOOL FAILURE: %s | args=%s | err=%s | recoverable=%s",
+                tool,
+                json.dumps(args, default=str)[:300],
+                str(err)[:300],
+                recoverable,
+            )
+
             guidance = "Do NOT retry with the same arguments."
+            fallback_info = ""
             if permission_denied:
                 guidance = (
                     "This call was DENIED by the permission system. Do not "
@@ -2071,6 +2222,59 @@ Never claim success without evidence.
                     "with these arguments. Choose a different approach or stop "
                     "and explain the blocker to the user."
                 )
+            else:
+                # Add fallback tool suggestions for recoverable failures
+                fallbacks = TOOL_FALLBACKS.get(tool, [])
+                if fallbacks:
+                    fallback_names = [f[0] for f in fallbacks[:2]]
+                    fallback_info = (
+                        f"\nFALLBACK TOOLS AVAILABLE: {', '.join(fallback_names)}. "
+                        f"Try using one of these instead with equivalent arguments."
+                    )
+                    # Auto-try fallbacks in sequence if we haven't exceeded max attempts
+                    fallback_state = self.context.metadata.setdefault("fallback_state", {}).get(tool, {"index": 0, "attempts": 0})
+                    while fallback_state["attempts"] < MAX_FALLBACK_ATTEMPTS and fallback_state["index"] < len(fallbacks):
+                        fallback_tool, transformer = fallbacks[fallback_state["index"]]
+                        fallback_args = transformer(args)
+                        if fallback_args and self.tool_registry.has_tool(fallback_tool):
+                            fallback_info += (
+                                f"\nAUTO-TRYING FALLBACK {fallback_state['attempts'] + 1}: {fallback_tool} with args: {json.dumps(fallback_args)}"
+                            )
+                            # Execute fallback immediately
+                            call_id = x.get("tool_call_id") or f"call_{len(self.completed_tool_calls)}"
+                            synthetic_call = SimpleNamespace(id=call_id, name=tool, arguments=args)
+                            fallback_result = await self._execute_fallback(fallback_tool, fallback_args, synthetic_call, x)
+                            if fallback_result and fallback_result.get("success"):
+                                fallback_info += f"\nFALLBACK SUCCEEDED: {fallback_tool}"
+                                # Replace the failed result with fallback success
+                                x["result"] = fallback_result
+                                x["tool"] = fallback_tool
+                                x["fallback_from"] = tool
+                                # Update observation
+                                self.context.observations[-1] = {
+                                    **self.context.observations[-1],
+                                    "tool": fallback_tool,
+                                    "success": True,
+                                    "result": fallback_result,
+                                }
+                                r = fallback_result
+                                recoverable = True
+                                err = ""
+                                guidance = "Fallback succeeded. Continue with the task."
+                                break
+                            else:
+                                fallback_info += f"\nFALLBACK FAILED: {fallback_tool}"
+                                # Move to next fallback
+                                fallback_state["index"] += 1
+                        else:
+                            # Fallback tool not available, try next
+                            fallback_state["index"] += 1
+                        fallback_state["attempts"] += 1
+                    
+                    # Save state for next failure
+                    self.context.metadata.setdefault("fallback_state", {})[tool] = fallback_state
+                    if fallback_state["attempts"] >= MAX_FALLBACK_ATTEMPTS or fallback_state["index"] >= len(fallbacks):
+                        fallback_info += f"\nAll fallbacks exhausted for {tool}."
 
             msg = (
                 f"Tool '{tool}' failed.\n"
@@ -2083,6 +2287,7 @@ Never claim success without evidence.
                 + f"Recoverable: {recoverable}\n"
                 + f"Suggestion: {suggestion}\n"
                 + guidance
+                + fallback_info
             )
             try:
                 await self.model_context.add_system_message(msg)
@@ -2138,12 +2343,13 @@ Never claim success without evidence.
     # ==================================================================
 
     def _response_offers_demo(self, text: str) -> bool:
-        """True if the response appears to offer to demonstrate the result."""
         if not text or not text.strip():
             return False
         if not self.completed_tool_calls:
             return True
         if self.context.intent == "question":
+            return True
+        if self.context.user_declined_demo:
             return True
         for pat in _DEMO_OFFER_PATTERNS:
             if pat.search(text):
@@ -2167,8 +2373,8 @@ Never claim success without evidence.
 
         if target:
             offer = (
-                f"\n\nI've finished the changes. Want me to run it and show you "
-                f"the output?"
+                "\n\nI've finished the changes. Want me to run it and show "
+                "you the output?"
             )
         else:
             offer = (
@@ -2182,17 +2388,8 @@ Never claim success without evidence.
     # ==================================================================
 
     async def _generate_final_response(self) -> str:
-        """
-        Generate a closing summary text.
-
-        [M2/N4/N10] This method does NOT persist the assistant turn. The
-        caller is the single writer of the final assistant message.
-
-        [Verification gate] If the loop is calling this while mutations are
-        still pending (e.g. iteration limit hit, or the model refused to
-        verify), the prompt tells the model to declare UNVERIFIED.
-        """
         messages = get_model_messages(self.model_context, self.max_history_length)
+        messages = self._sanitize_messages_for_api(messages)
         if not any(getattr(m, "role", None) == "system" for m in messages):
             messages.insert(0, Message(role="system",
                                        content=await self._get_system_prompt()))
@@ -2215,13 +2412,14 @@ Never claim success without evidence.
                 content=(
                     "Provide the final response to the user. Structure it as: "
                     "1) WHAT changed, 2) WHY, 3) EVIDENCE (concrete command "
-                    "output, diff, or file content), 4) anything still "
-                    "unverified or blocked, 5) a one-line offer to demonstrate "
-                    "the result (see DEMONSTRATE in your instructions). "
+                    "output, diff, or file content — only what proves the "
+                    "result), 4) anything still unverified or blocked, 5) a "
+                    "one-line offer to run/show the result when applicable. "
                     "Do not claim unverified success." + extra
                 ),
             )
         )
+        messages = self._sanitize_messages_for_api(messages)
 
         try:
             self.context.llm_calls += 1

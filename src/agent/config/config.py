@@ -509,7 +509,7 @@ class SubAgentConfig:
 
 @dataclass
 class LoopConfig:
-    max_iterations: int = 50
+    max_iterations: int = 15
     max_tool_calls_per_iteration: int = 5
     max_history_length: int = 20
     enable_planning: bool = True

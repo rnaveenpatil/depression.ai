@@ -14,6 +14,11 @@ Invariants enforced here (all required by OpenAI/Anthropic-compatible APIs):
     * Trimming and grouping operate on whole, valid groups atomically.
     * The newest conversational turn is never dropped, even if it exceeds
       the requested window. [Bug 2]
+    * [R5] A tool-call group is never sliced. Slicing it would separate
+      the assistant tool_calls from their tool results and the provider
+      would reject the request with HTTP 400 "last message must have
+      role = user". If the newest group is larger than the count cap, the
+      entire group is kept.
 """
 from __future__ import annotations
 
@@ -33,7 +38,7 @@ def _calculate_tool_result_cap(context_window: int) -> int:
     """Calculate dynamic tool result byte cap based on model's context window."""
     if context_window <= 0:
         return DEFAULT_TOOL_RESULT_BYTE_CAP
-    
+
     if context_window < 32_768:
         return 8 * 1024      # 8 KB
     elif context_window < 131_072:
@@ -91,11 +96,25 @@ def _truncate_payload(payload: Any, cap: int = DEFAULT_TOOL_RESULT_BYTE_CAP) -> 
         key=lambda k: len(trimmed[k]),
         reverse=True,
     )
+    # Target half the cap per field, so a few big fields together still fit.
+    target_bytes = max(256, cap // 2)
+
     for k in big_keys:
         s = trimmed[k]
-        if len(s.encode("utf-8")) <= cap // 2:
+        if len(s.encode("utf-8")) <= target_bytes:
             continue
-        trimmed[k] = s.encode("utf-8")[-(cap // 2):].decode("utf-8", errors="replace")
+
+        # [R7] Slice by CHARACTERS, never bytes. A byte slice can land in
+        # the middle of a multi-byte UTF-8 sequence and errors="replace"
+        # would insert U+FFFD into the text the model reads. Work in
+        # characters and shrink from the front until the byte length fits.
+        max_chars = max(64, target_bytes // 4)  # conservative: ≤ 4 bytes/char
+        tail = s[-max_chars:] if len(s) > max_chars else s
+        while len(tail.encode("utf-8")) > target_bytes and len(tail) > 1:
+            # Drop 1/8 of the front each pass; converges quickly.
+            drop = max(1, len(tail) // 8)
+            tail = tail[drop:]
+        trimmed[k] = tail
         trimmed["_truncated"] = True
         try:
             if len(json.dumps(trimmed, default=str).encode("utf-8")) <= cap:
@@ -273,6 +292,7 @@ def _to_provider_message(cm: Any) -> Message:
     kwargs: dict[str, Any] = {"role": cm.role, "content": cm.content}
     if cm.role == "assistant" and metadata.get("tool_calls"):
         kwargs["tool_calls"] = metadata["tool_calls"]
+        # OpenAI-compatible APIs want content=None for tool-call-only turns.
         kwargs["content"] = None
     if cm.role == "tool":
         kwargs["name"] = metadata.get("name")
@@ -301,7 +321,6 @@ def _interleave_systems_and_selected(
     """
     combined = list(messages) + list(selected)
     combined.sort(key=lambda m: getattr(m, "timestamp", 0))
-    # Deduplicate by identity, preserving order.
     seen = set()
     out: List[Any] = []
     for m in combined:
@@ -317,8 +336,11 @@ def get_model_messages(context_manager: Any, limit: int = 40_000) -> List[Messag
     Build provider messages from a token-budgeted tail of the conversation.
 
     [Bug 2] The count branch (limit < 500) never drops the newest turn.
-    If the newest group alone exceeds the limit, it is TRUNCATED to fit
-    rather than skipped.
+    [R5]    It also never SLICES the newest group. Slicing a tool-call
+            group separates the assistant tool_calls from their tool
+            results, and the provider rejects the resulting array with
+            HTTP 400 "last message must have role = user". If the newest
+            group exceeds the count cap, the whole group is kept.
     """
     repair_context(context_manager, fill_missing=True)
     messages = list(getattr(context_manager, "messages", []) or [])
@@ -336,8 +358,11 @@ def get_model_messages(context_manager: Any, limit: int = 40_000) -> List[Messag
             if len(selected) + len(g) > cap:
                 if selected:
                     break
-                # Never drop the newest turn: truncate it to fit.
-                selected[0:0] = g[-cap:]
+                # [R5] Never drop the newest turn AND never slice a group.
+                # Keep the entire newest group even if it exceeds cap. The
+                # provider's context window is the real limit; the loop
+                # has a compaction path for genuine overflow.
+                selected[0:0] = list(g)
                 break
             selected[0:0] = g
         return [
@@ -354,18 +379,11 @@ def get_model_messages(context_manager: Any, limit: int = 40_000) -> List[Messag
         cost = sum(_estimate_msg_tokens(m) for m in g)
         if used + cost > budget:
             if not selected:
-                # Truncate the newest group to fit.
-                running = 0
-                keep: List[Any] = []
-                for m in reversed(g):
-                    mc = _estimate_msg_tokens(m)
-                    if running + mc > budget:
-                        break
-                    keep.insert(0, m)
-                    running += mc
-                if keep:
-                    selected[0:0] = keep
-                    used += running
+                # Same rule as above: keep the whole newest group. If it
+                # does not fit the budget, the provider's own context
+                # window will trim on its side, but at least the group
+                # arrives intact.
+                selected[0:0] = list(g)
             break
         selected[0:0] = g
         used += cost

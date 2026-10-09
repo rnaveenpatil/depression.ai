@@ -28,20 +28,40 @@ def test_runtime_provider_fails_fast():
     assert provider.max_retries == 2
 
 
+class MockToolRegistry:
+    """Minimal ToolRegistry mock with all methods AgentLoop expects."""
+    
+    def __init__(self, tools=None):
+        self.tools = tools or {}
+    
+    def get_schemas(self):
+        return []
+    
+    def select_for_task(self, intent):
+        return []
+    
+    def list_tools(self):
+        return list(self.tools.keys())
+    
+    def has_tool(self, name):
+        return name in self.tools
+    
+    def is_read_only(self, name):
+        return True
+    
+    def get_category(self, name):
+        return "inspect"
+
+
 @pytest.mark.asyncio
 async def test_project_context_is_cached():
     class WS:
         project_dir = Path(".")
         list_count = 0
-        git_count = 0
 
         async def list_files(self, max_files=200):
             self.list_count += 1
             return []
-
-        async def get_git_info(self):
-            self.git_count += 1
-            return {"is_git_repo": False}
 
     class Agent:
         workspace = WS()
@@ -51,12 +71,11 @@ async def test_project_context_is_cached():
         def get_current_model(self):
             return "test/model"
 
-    loop = AgentLoop(Agent(), LLM(), SimpleNamespace(tools={}), None, {})
+    loop = AgentLoop(Agent(), LLM(), MockToolRegistry(), None, {})
     first = await loop._get_project_context()
     second = await loop._get_project_context()
     assert first == second
     assert Agent.workspace.list_count == 1
-    assert Agent.workspace.git_count == 1
 
 
 class ReadLLM:
@@ -123,8 +142,8 @@ class ExecAgent:
 async def test_single_read_tool_uses_fast_path():
     llm = ReadLLM()
     loop = AgentLoop(
-        ExecAgent(), llm, SimpleNamespace(tools={}), None,
-        {"enable_intent_classification": False, "enable_planning": False},
+        ExecAgent(), llm, MockToolRegistry({"read": object()}), None,
+        {"enable_intent_classification": False, "enable_planning": False, "require_demo_offer": False},
     )
     result = await loop.run("read a.txt")
     assert result["success"] is True, result
@@ -142,8 +161,8 @@ async def test_read_with_intermediate_content_continues():
     """
     llm = ReadLLM(with_content=True)
     loop = AgentLoop(
-        ExecAgent(), llm, SimpleNamespace(tools={}), None,
-        {"enable_intent_classification": False, "enable_planning": False},
+        ExecAgent(), llm, MockToolRegistry({"read": object()}), None,
+        {"enable_intent_classification": False, "enable_planning": False, "require_demo_offer": False},
     )
     result = await loop.run("read a.txt")
     assert result["success"] is True, result

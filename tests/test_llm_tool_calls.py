@@ -271,7 +271,8 @@ class ExecAgent:
 class FakeToolRegistry:
     """Supplies the schema the loop forwards to the provider."""
 
-    tools = {"note_tool": object()}
+    def __init__(self):
+        self.tools = {"note_tool": object()}
 
     def get_schemas(self):
         return [{
@@ -286,6 +287,15 @@ class FakeToolRegistry:
                 },
             },
         }]
+
+    def select_for_task(self, intent):
+        return self.get_schemas()
+
+    def list_tools(self):
+        return list(self.tools.keys())
+
+    def has_tool(self, name):
+        return name in self.tools
 
     def is_read_only(self, name):
         return True
@@ -303,7 +313,7 @@ async def test_loop_executes_tool_call_through_registry():
     agent = ExecAgent()
     loop = AgentLoop(
         agent, registry, FakeToolRegistry(), None,
-        {"enable_intent_classification": False, "enable_planning": False},
+        {"enable_intent_classification": False, "enable_planning": False, "require_demo_offer": False},
     )
     result = await loop.run("store a note")
 

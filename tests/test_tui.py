@@ -1,13 +1,11 @@
 """Tests for the current Textual TUI behavior."""
 from __future__ import annotations
 
-import asyncio
-
 import pytest
 
 from agent.permissions.manager import PermissionRequest, PermissionVerdict, RiskLevel
-from agent.tui.app import DepressionApp, PermissionModal
-from textual.widgets import Button, Input
+from agent.tui.app import DepressionApp, PermissionModal, PromptArea
+from textual.widgets import Button
 
 
 @pytest.mark.asyncio
@@ -15,10 +13,10 @@ async def test_prompt_accepts_typed_characters():
     app = DepressionApp(coordinator=None)
     async with app.run_test() as pilot:
         await pilot.pause()
-        inp = app.query_one("#prompt", Input)
+        inp = app.query_one("#prompt", PromptArea)
         assert inp.has_focus
         await pilot.press("h", "e", "l", "l", "o")
-        assert inp.value == "hello"
+        assert inp.text == "hello"
 
 
 @pytest.mark.asyncio
@@ -58,15 +56,13 @@ async def test_busy_visual_restores():
     app = DepressionApp(coordinator=None)
     async with app.run_test() as pilot:
         await pilot.pause()
-        inp = app.query_one("#prompt", Input)
+        inp = app.query_one("#prompt", PromptArea)
         app._set_busy_visual(True)
         await pilot.pause()
         assert inp.has_class("busy")
-        assert inp.placeholder == app._BUSY_PLACEHOLDER
         app._set_busy_visual(False)
         await pilot.pause()
         assert not inp.has_class("busy")
-        assert inp.placeholder == "ask the agent…"
 
 
 @pytest.mark.asyncio
@@ -125,7 +121,7 @@ def _plain(markup: str) -> str:
     return re.sub(r"\[/?[^\]]*\]", "", markup)
 
 
-def _search_widget(n_matches: int, count: int | None = None) -> "ToolCallWidget":
+def _search_widget(n_matches: int, count: int | None = None) -> ToolCallWidget:
     from agent.tui.widgets.tool_call import ToolCallWidget
 
     widget = ToolCallWidget("grep", {"pattern": "loop"})

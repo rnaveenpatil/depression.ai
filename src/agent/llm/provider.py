@@ -37,6 +37,10 @@ Design notes
       callers can react without string matching.
     * Lifecycle is explicit: `start()` / `close()` are awaited, both are
       idempotent, and neither is required to do anything.
+    * `Message.metadata` exists for agent-side bookkeeping (e.g. keeping
+      a `system_prompt` marker on the pinned prompt, or tagging a message
+      as synthetic). It is NEVER serialized to the provider — see
+      `to_dict()`. The wire format is exactly the fields the API accepts.
 """
 
 from __future__ import annotations
@@ -107,6 +111,13 @@ class Message:
 
     `content` is `Optional[str]` because a tool-calling assistant turn may
     carry no text at all — only `tool_calls`.
+
+    `metadata` is agent-side bookkeeping. It is NEVER serialized to the
+    provider. Provider serialization happens through `to_dict()`, which
+    emits exactly the fields the OpenAI-compatible API accepts. Use
+    metadata to tag a message with a marker (e.g. `{"system_prompt": True}`)
+    or to carry a synthetic flag; the caller that builds the message is
+    the only one who reads it.
     """
     role: str
     content: Optional[str] = None
@@ -115,6 +126,8 @@ class Message:
     # ToolCall objects, or the dict forms the context layer and the loop
     # serialize into message metadata. Canonicalized in __post_init__.
     tool_calls: Optional[List[Any]] = None
+    # Agent-side annotations. NOT serialized — see to_dict().
+    metadata: Optional[Dict[str, Any]] = None
 
     def __post_init__(self) -> None:
         if not self.tool_calls:
@@ -142,28 +155,47 @@ class Message:
                 }
                 for tc in self.tool_calls
             ]
+        # NOTE: metadata is intentionally NOT included. The wire format
+        # contains only the fields the API accepts.
         return d
 
     @classmethod
-    def system(cls, content: str) -> "Message":
-        return cls(role=Role.SYSTEM.value, content=content)
+    def system(cls, content: str, **kwargs: Any) -> "Message":
+        return cls(role=Role.SYSTEM.value, content=content, **kwargs)
 
     @classmethod
-    def user(cls, content: str) -> "Message":
-        return cls(role=Role.USER.value, content=content)
+    def user(cls, content: str, **kwargs: Any) -> "Message":
+        return cls(role=Role.USER.value, content=content, **kwargs)
 
     @classmethod
     def assistant(
         cls,
         content: Optional[str] = None,
         tool_calls: Optional[List[ToolCall]] = None,
+        **kwargs: Any,
     ) -> "Message":
-        return cls(role=Role.ASSISTANT.value, content=content, tool_calls=tool_calls)
+        return cls(
+            role=Role.ASSISTANT.value,
+            content=content,
+            tool_calls=tool_calls,
+            **kwargs,
+        )
 
     @classmethod
-    def tool(cls, content: str, tool_call_id: str, name: Optional[str] = None) -> "Message":
-        return cls(role=Role.TOOL.value, content=content,
-                   tool_call_id=tool_call_id, name=name)
+    def tool(
+        cls,
+        content: str,
+        tool_call_id: str,
+        name: Optional[str] = None,
+        **kwargs: Any,
+    ) -> "Message":
+        return cls(
+            role=Role.TOOL.value,
+            content=content,
+            tool_call_id=tool_call_id,
+            name=name,
+            **kwargs,
+        )
 
 
 @dataclass

@@ -13,6 +13,16 @@ Single authoritative source for:
 
 Rule: whatever `get_schemas()` returns is EXACTLY what the loop advertises
 to the model and EXACTLY what `execute_safe()` can dispatch.
+
+[G1] Every tool execution is bounded by a positive timeout. A tool whose
+`timeout` attribute is None or non-positive falls back to 60s so that
+`asyncio.wait_for` can never block forever.
+
+[Token budget] The tool schema list is the single largest per-request
+cost. `select_for_task()` narrows it by intent, caps the total at
+`MAX_SCHEMAS_PER_CALL`, and — when the category filter would leave
+nothing — falls back to the most-used tools rather than sending every
+schema in the registry.
 """
 
 from __future__ import annotations
@@ -32,6 +42,18 @@ from agent.utils.redact import redact
 logger = get_logger(__name__)
 
 
+DEFAULT_TOOL_TIMEOUT = 60.0
+
+# Hard cap on the number of tool schemas sent to the model in a single
+# request. Every schema is 60-150 tokens; 25 schemas is ~2500 tokens, which
+# is the point where the schema block starts to dominate the prompt.
+MAX_SCHEMAS_PER_CALL = 25
+
+# When narrowing leaves nothing, fall back to this many most-used tools.
+# Never send the full registry as a fallback — that defeats the purpose.
+FALLBACK_SCHEMA_COUNT = 20
+
+
 # ======================================================================
 # BASE TOOL
 # ======================================================================
@@ -42,7 +64,7 @@ class BaseTool(ABC):
     name: str = "base"
     description: str = ""
     parameters: Dict[str, Any] = {}
-    timeout: float = 60.0
+    timeout: float = DEFAULT_TOOL_TIMEOUT
     enabled: bool = True
 
     # Metadata used for task routing and cache invalidation.
@@ -153,13 +175,32 @@ INTENT_CATEGORIES: Dict[str, Set[str]] = {
     "bugfix":    {"inspect", "edit", "run", "proc", "vcs"},
     "refactor":  {"inspect", "edit", "vcs"},
     "analysis":  {"inspect", "run", "vcs"},
-    "question":  {"inspect", "net"},
+    "question":  {"inspect", "edit", "run", "net"},
     "unknown":   {"inspect", "edit", "run", "proc", "vcs", "cloud", "net", "plan", "ui", "misc"},
 }
 
 # Fallback: when an intent's category set would leave out a tool that
 # should always be visible (plan updates, todo).
 ALWAYS_VISIBLE_CATEGORIES: Set[str] = {"plan", "ui"}
+
+
+def _coerce_timeout(value: Any, fallback: float = DEFAULT_TOOL_TIMEOUT) -> float:
+    """
+    [G1] Turn any timeout value into a positive float.
+
+    `asyncio.wait_for(..., timeout=None)` blocks forever, and a tool with
+    a stray None/0/negative timeout would hang the loop. Coerce every
+    invalid value to the fallback so the tool always has a real deadline.
+    """
+    if value is None:
+        return fallback
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return fallback
+    if v <= 0:
+        return fallback
+    return v
 
 
 # ======================================================================
@@ -280,23 +321,86 @@ class ToolRegistry:
             })
         return out
 
+    def _most_used_tools(self, k: int) -> List[str]:
+        """
+        Return up to `k` tool names ranked by call count (descending),
+        with success rate as a tiebreaker. Tools with zero calls are
+        ranked by category priority so the fallback still shows the
+        basic inspect/edit/run set.
+        """
+        def _score(name: str) -> tuple:
+            s = self.stats.get(name) or ToolStats()
+            cat = self.get_category(name)
+            # Priority: plan/ui first (always visible), then inspect/edit/run.
+            cat_rank = {
+                "plan": 0, "ui": 0,
+                "inspect": 1, "edit": 2, "run": 3, "proc": 4,
+                "vcs": 5, "net": 6, "cloud": 7, "misc": 8,
+            }.get(cat, 9)
+            return (-s.calls, -s.successes, cat_rank)
+
+        names = sorted(self.list_tools(), key=_score)
+        return names[:k]
+
     def select_for_task(self, intent: str) -> List[Dict[str, Any]]:
         """
         Return a narrowed tool list based on intent.
 
-        Used by the loop to cut down the schema size (and improve local-
-        model tool selection) without ever hiding a tool the runtime can
-        still dispatch.
+        Behaviour:
+          1. Filter schemas by the intent's categories (plus always-visible).
+          2. If the filter leaves nothing, fall back to the most-used tools
+             (up to FALLBACK_SCHEMA_COUNT) — never the full registry.
+          3. Cap the result at MAX_SCHEMAS_PER_CALL regardless of source.
+
+        The cap keeps the tool-schema block bounded. The model sees a
+        focused, high-signal tool list on every request, and `execute_safe`
+        still dispatches any tool the runtime registered.
         """
         cats = set(INTENT_CATEGORIES.get(intent or "unknown", INTENT_CATEGORIES["unknown"]))
         cats |= ALWAYS_VISIBLE_CATEGORIES
 
-        out: List[Dict[str, Any]] = []
-        for schema in self.get_schemas():
+        all_schemas = self.get_schemas()
+        by_name = {s["function"]["name"]: s for s in all_schemas}
+
+        narrowed: List[Dict[str, Any]] = []
+        for schema in all_schemas:
             name = schema["function"]["name"]
             if self.get_category(name) in cats:
-                out.append(schema)
-        return out or self.get_schemas()
+                narrowed.append(schema)
+
+        if narrowed:
+            # Already narrowed by intent. Cap the count.
+            if len(narrowed) > MAX_SCHEMAS_PER_CALL:
+                # Keep the ALWAYS_VISIBLE tools plus the highest-ranked
+                # tools within the intent. This preserves plan/ui and the
+                # most-used inspect/edit/run tools.
+                always_names = [
+                    n for n in self.list_tools()
+                    if self.get_category(n) in ALWAYS_VISIBLE_CATEGORIES
+                ]
+                keep_names = list(always_names)
+                # Fill remaining slots with the most-used from the narrowed set.
+                narrowed_names = [s["function"]["name"] for s in narrowed]
+                ranked = sorted(
+                    (n for n in narrowed_names if n not in keep_names),
+                    key=lambda n: (
+                        -(self.stats.get(n).calls if self.stats.get(n) else 0),
+                        self.get_category(n),
+                    ),
+                )
+                for n in ranked:
+                    if len(keep_names) >= MAX_SCHEMAS_PER_CALL:
+                        break
+                    keep_names.append(n)
+                narrowed = [by_name[n] for n in keep_names if n in by_name]
+            return narrowed
+
+        # Fallback: the intent filter matched nothing. Send a bounded
+        # list of the most-used tools rather than the entire registry.
+        fallback_names = self._most_used_tools(FALLBACK_SCHEMA_COUNT)
+        fallback = [by_name[n] for n in fallback_names if n in by_name]
+        # Final safety: never exceed the hard cap.
+        return fallback[:MAX_SCHEMAS_PER_CALL]
 
     def estimate_schema_tokens(self, schemas: Optional[List[Dict[str, Any]]] = None) -> int:
         """
@@ -315,7 +419,14 @@ class ToolRegistry:
     def describe_for_prompt(
         self, schemas: Optional[List[Dict[str, Any]]] = None
     ) -> str:
-        """Human-readable tool block for the system prompt."""
+        """
+        Human-readable tool block for the system prompt.
+
+        NOTE: This duplicates the schemas that already go in the `tools=[...]`
+        parameter of the request. The loop should NOT include this block in
+        the system prompt — see `_get_system_prompt` in loop.py. Kept here
+        for callers that want a text-only listing (CLI help, tests).
+        """
         schemas = schemas if schemas is not None else self.get_schemas()
         lines = []
         for schema in schemas:
@@ -400,19 +511,24 @@ class ToolRegistry:
                 "recoverable": False,
             }
 
+        # [G1] Coerce to a positive float so wait_for never blocks forever.
+        effective_timeout = _coerce_timeout(
+            timeout if timeout is not None else getattr(tool, "timeout", None),
+            fallback=DEFAULT_TOOL_TIMEOUT,
+        )
+
         t0 = time.time()
         try:
             result = await asyncio.wait_for(
                 tool.execute(params),
-                timeout=timeout or getattr(tool, "timeout", 60.0),
+                timeout=effective_timeout,
             )
         except asyncio.TimeoutError:
             self._bump(name, success=False, elapsed=time.time() - t0,
-                       error=f"timeout after {timeout or getattr(tool, 'timeout', 60.0)}s")
+                       error=f"timeout after {effective_timeout}s")
             return {
                 "success": False,
-                "error": f"Tool '{name}' timed out after "
-                         f"{timeout or getattr(tool, 'timeout', 60.0)}s",
+                "error": f"Tool '{name}' timed out after {effective_timeout}s",
                 "recoverable": True,
                 "suggestion": "Reduce the scope of the request or raise the timeout.",
             }
@@ -453,13 +569,21 @@ class ToolRegistry:
     ) -> Dict[str, Any]:
         info = self._external[name]
         handler = info["handler"]
+        # [G1] Same coercion as execute_safe.
+        effective_timeout = _coerce_timeout(timeout, fallback=DEFAULT_TOOL_TIMEOUT)
         t0 = time.time()
         try:
-            result = await asyncio.wait_for(handler(**params), timeout=timeout or 60.0)
+            result = await asyncio.wait_for(
+                handler(**params),
+                timeout=effective_timeout,
+            )
         except asyncio.TimeoutError:
             self._bump(name, False, time.time() - t0, "timeout")
-            return {"success": False, "error": f"Tool '{name}' timed out",
-                    "recoverable": True}
+            return {
+                "success": False,
+                "error": f"Tool '{name}' timed out after {effective_timeout}s",
+                "recoverable": True,
+            }
         except TypeError as e:
             self._bump(name, False, time.time() - t0, str(e))
             return {
@@ -537,4 +661,11 @@ class ToolRegistry:
         }
 
 
-__all__ = ["BaseTool", "ToolRegistry", "ToolStats", "INTENT_CATEGORIES"]
+__all__ = [
+    "BaseTool",
+    "ToolRegistry",
+    "ToolStats",
+    "INTENT_CATEGORIES",
+    "MAX_SCHEMAS_PER_CALL",
+    "FALLBACK_SCHEMA_COUNT",
+]

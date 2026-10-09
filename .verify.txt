@@ -1,0 +1,2 @@
+.index_launch_light.png (2560, 1806)
+.index_launch_dark.png (2560, 1806)

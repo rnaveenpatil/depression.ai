@@ -33,6 +33,31 @@ def clean_runtime(monkeypatch, tmp_path):
     reset_llm_registry()
 
 
+class MockToolRegistry:
+    """Minimal ToolRegistry mock with all methods AgentLoop expects."""
+
+    def __init__(self, tools=None):
+        self.tools = tools or {}
+
+    def get_schemas(self):
+        return []
+
+    def select_for_task(self, intent):
+        return []
+
+    def list_tools(self):
+        return list(self.tools.keys())
+
+    def has_tool(self, name):
+        return name in self.tools
+
+    def is_read_only(self, name):
+        return True
+
+    def get_category(self, name):
+        return "inspect"
+
+
 class ReadContextManager:
     """Minimal fake of the real ContextManager (see test_loop_speedups)."""
 
@@ -117,7 +142,7 @@ def _loop(llm):
     return AgentLoop(
         ExecAgent(),
         llm,
-        SimpleNamespace(tools={}),
+        MockToolRegistry({"read": object()}),
         None,
         {"enable_intent_classification": False, "enable_planning": False},
     )
