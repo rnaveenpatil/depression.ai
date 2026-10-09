@@ -1,5 +1,4 @@
 """Regression tests for safe command construction in tool fallbacks."""
-import os
 import shlex
 import subprocess
 from pathlib import Path
@@ -14,21 +13,20 @@ from agent.agent.loop import (
 )
 
 
-def _run_command(command: str) -> subprocess.CompletedProcess:
+def _run_command(command: str, cwd: Path) -> subprocess.CompletedProcess:
     return subprocess.run(
-        command,
-        shell=True,
-        check=False,
-        capture_output=True,
-        text=True,
-        timeout=10,
+        command, shell=True, check=False, capture_output=True,
+        text=True, timeout=10, cwd=cwd,
     )
 
 
 def test_write_fallback_preserves_content_including_heredoc_marker(tmp_path: Path) -> None:
     target = tmp_path / "written.txt"
     content = "first line\nEOF\nsecond line\n$(touch should_not_exist)\n"
-    result = _run_command(_bash_fallback_write({"path": str(target), "content": content})["command"])
+    result = _run_command(
+        _bash_fallback_write({"path": str(target), "content": content})["command"],
+        tmp_path,
+    )
     assert result.returncode == 0, result.stderr
     assert target.read_text(encoding="utf-8") == content
     assert not (tmp_path / "should_not_exist").exists()
@@ -36,11 +34,14 @@ def test_write_fallback_preserves_content_including_heredoc_marker(tmp_path: Pat
 
 def test_write_fallback_does_not_interpret_shell_metacharacters_in_path(tmp_path: Path) -> None:
     marker = tmp_path / "INJECTED"
-    target = tmp_path / ("odd'; touch " + str(marker) + "; #.txt")
-    content = "safe content"
-    result = _run_command(_bash_fallback_write({"path": str(target), "content": content})["command"])
+    target_name = "odd'; touch INJECTED; #.txt"
+    target = tmp_path / target_name
+    result = _run_command(
+        _bash_fallback_write({"path": target_name, "content": "safe content"})["command"],
+        tmp_path,
+    )
     assert result.returncode == 0, result.stderr
-    assert target.read_text(encoding="utf-8") == content
+    assert target.read_text(encoding="utf-8") == "safe content"
     assert not marker.exists()
 
 
@@ -53,7 +54,8 @@ def test_edit_fallback_replaces_exact_text_and_preserves_special_characters(tmp_
             "path": str(target),
             "oldString": "OLD",
             "newString": replacement,
-        })["command"]
+        })["command"],
+        tmp_path,
     )
     assert result.returncode == 0, result.stderr
     assert target.read_text(encoding="utf-8") == "before " + replacement + " after\n"
@@ -62,15 +64,15 @@ def test_edit_fallback_replaces_exact_text_and_preserves_special_characters(tmp_
 
 def test_read_list_glob_and_grep_quote_untrusted_arguments(tmp_path: Path) -> None:
     marker = tmp_path / "INJECTED"
-    strange = "name'; touch " + str(marker) + "; #"
+    strange = "name'; touch INJECTED; #"
     commands = [
         _bash_fallback_read({"path": strange})["command"],
         _bash_fallback_list({"path": strange})["command"],
-        _bash_fallback_glob({"path": strange, "pattern": "*'; touch " + str(marker) + "; #"})["command"],
-        _bash_fallback_grep({"path": strange, "pattern": "x'; touch " + str(marker) + "; #"})["command"],
+        _bash_fallback_glob({"path": strange, "pattern": "*'; touch INJECTED; #"})["command"],
+        _bash_fallback_grep({"path": strange, "pattern": "x'; touch INJECTED; #"})["command"],
     ]
     for command in commands:
-        # All user-controlled argument data must be shell-quoted as one argument.
         assert command
         shlex.split(command)
+        _run_command(command, tmp_path)
     assert not marker.exists()
