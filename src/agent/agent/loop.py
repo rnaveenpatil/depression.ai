@@ -87,51 +87,123 @@ SYSTEM_PROMPT_MARKER = "system_prompt"
 # Format: primary_tool -> list of (fallback_tool, arg_transformer_function)
 # The arg_transformer converts the failed tool's args to the fallback tool's args.
 
+def _fallback_python_command(payload: Dict[str, str], operation: str) -> Dict[str, Any]:
+    """Build a shell-safe Python command for filesystem fallback operations."""
+    import base64
+    import shlex
+
+    encoded = base64.b64encode(
+        json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    ).decode("ascii")
+    scripts = {
+        "write": (
+            "import base64,json,pathlib,sys; "
+            "d=json.loads(base64.b64decode(sys.argv[1])); "
+            "pathlib.Path(d['path']).write_text(d['content'], encoding='utf-8')"
+        ),
+        "edit": (
+            "import base64,json,pathlib,sys; "
+            "d=json.loads(base64.b64decode(sys.argv[1])); "
+            "p=pathlib.Path(d['path']); "
+            "s=p.read_text(encoding='utf-8'); "
+            "old=d['old']; "
+            "(_ for _ in ()).throw(SystemExit('old text not found')) if old not in s else None; "
+            "p.write_text(s.replace(old,d['new']), encoding='utf-8')"
+        ),
+    }
+    return {"command": "python -c " + shlex.quote(scripts[operation]) + " " + shlex.quote(encoded)}
+
+
 def _bash_fallback_write(args: Dict[str, Any]) -> Dict[str, Any]:
-    """Convert filesystem write args to bash command."""
+    """Convert filesystem write args to a shell-safe Python write command."""
     path = args.get("filePath") or args.get("path") or ""
-    content = args.get("content") or args.get("text") or ""
-    if not path:
+    content = args.get("content")
+    if content is None:
+        content = args.get("text", "")
+    if not isinstance(path, str) or not path or not isinstance(content, str):
         return {}
-    # Use cat with heredoc for reliable writing
-    escaped = content.replace("'", "'\\''")
-    return {"command": f"cat > '{path}' << 'EOF'\n{escaped}\nEOF"}
+    return _fallback_python_command({"path": path, "content": content}, "write")
+
 
 def _bash_fallback_read(args: Dict[str, Any]) -> Dict[str, Any]:
-    """Convert filesystem read args to bash command."""
+    """Convert filesystem read args to a safely quoted command."""
+    import shlex
     path = args.get("filePath") or args.get("path") or ""
-    if not path:
+    if not isinstance(path, str) or not path:
         return {}
-    return {"command": f"cat '{path}'"}
+    return {"command": "cat -- " + shlex.quote(path)}
+
 
 def _bash_fallback_list(args: Dict[str, Any]) -> Dict[str, Any]:
-    """Convert filesystem list args to bash command."""
+    """Convert filesystem list args to a safely quoted command."""
+    import shlex
     path = args.get("path") or "."
-    return {"command": f"ls -la '{path}'"}
+    if not isinstance(path, str) or not path:
+        return {}
+    return {"command": "ls -la -- " + shlex.quote(path)}
+
 
 def _bash_fallback_edit(args: Dict[str, Any]) -> Dict[str, Any]:
-    """Convert filesystem edit args to bash sed command."""
+    """Convert filesystem edit args to an exact-text, shell-safe edit command."""
     path = args.get("filePath") or args.get("path") or ""
     old_str = args.get("oldString") or args.get("old_text") or ""
-    new_str = args.get("newString") or args.get("new_text") or ""
-    if not path or not old_str:
+    new_str = args.get("newString")
+    if new_str is None:
+        new_str = args.get("new_text", "")
+    if not isinstance(path, str) or not path or not isinstance(old_str, str) or not old_str:
         return {}
-    # Escape for sed
-    old_escaped = old_str.replace("/", "\\/").replace("&", "\\&")
-    new_escaped = new_str.replace("/", "\\/").replace("&", "\\&")
-    return {"command": f"sed -i 's/{old_escaped}/{new_escaped}/g' '{path}'"}
+    if not isinstance(new_str, str):
+        return {}
+    return _fallback_python_command(
+        {"path": path, "old": old_str, "new": new_str}, "edit"
+    )
+
+
+def _bash_fallback_glob(args: Dict[str, Any]) -> Dict[str, Any]:
+    """Convert glob args to a safely quoted find command."""
+    import shlex
+    path = args.get("path") or "."
+    pattern = args.get("pattern") or "*"
+    if not isinstance(path, str) or not isinstance(pattern, str):
+        return {}
+    return {"command": "find -- " + shlex.quote(path) + " -name " + shlex.quote(pattern)}
+
+
+def _bash_fallback_grep(args: Dict[str, Any]) -> Dict[str, Any]:
+    """Convert grep args to a correctly formed, safely quoted command."""
+    import shlex
+    path = args.get("path") or "."
+    pattern = args.get("pattern") or ""
+    if not isinstance(path, str) or not isinstance(pattern, str) or not pattern:
+        return {}
+    return {"command": "grep -r -- " + shlex.quote(pattern) + " " + shlex.quote(path)}
+
+
+def _bash_fallback_ls(args: Dict[str, Any]) -> Dict[str, Any]:
+    """Convert filesystem args to a safely quoted listing command."""
+    return _bash_fallback_list(args)
+
+
+def _patch_fallback(args: Dict[str, Any]) -> Dict[str, Any]:
+    """Convert patch args to a safely quoted patch command."""
+    import shlex
+    path = args.get("patchFile") or args.get("path") or ""
+    if not isinstance(path, str) or not path:
+        return {}
+    return {"command": "patch -p1 < " + shlex.quote(path)}
+
 
 # Fallback mapping: primary tool -> list of (fallback_tool, arg_transformer)
 TOOL_FALLBACKS: Dict[str, List[tuple]] = {
     "write": [("bash", _bash_fallback_write), ("terminal", _bash_fallback_write)],
     "edit": [("bash", _bash_fallback_edit), ("terminal", _bash_fallback_edit)],
-    "apply_patch": [("bash", lambda a: {"command": f"patch -p1 < {a.get('patchFile', a.get('path', ''))}"})],
+    "apply_patch": [("bash", lambda a: _patch_fallback(a))],
     "read": [("bash", _bash_fallback_read), ("terminal", _bash_fallback_read)],
     "list": [("bash", _bash_fallback_list), ("terminal", _bash_fallback_list)],
-    "glob": [("bash", lambda a: {"command": f"find {a.get('path', '.')} -name '{a.get('pattern', '*')}'"})],
-    "grep": [("bash", lambda a: {"command": f"grep -r '{a.get('pattern', '')}' {a.get('path', '.')}'"})],
-    "filesystem": [("bash", lambda a: {"command": f"ls -la {a.get('path', '.')}"})],
-    "patch": [("bash", lambda a: {"command": f"patch -p1 < {a.get('patchFile', a.get('path', ''))}"})],
+    "glob": [("bash", _bash_fallback_glob)],
+    "grep": [("bash", _bash_fallback_grep)],
+    "filesystem": [("bash", _bash_fallback_ls)],
+    "patch": [("bash", lambda a: _patch_fallback(a))],
 }
 
 # Maximum fallback attempts per tool call
@@ -2232,7 +2304,9 @@ Want me to run it and show you?
                         f"Try using one of these instead with equivalent arguments."
                     )
                     # Auto-try fallbacks in sequence if we haven't exceeded max attempts
-                    fallback_state = self.context.metadata.setdefault("fallback_state", {}).get(tool, {"index": 0, "attempts": 0})
+                    # Retry bookkeeping belongs to this failure, not the tool name.
+                    # Persisting it poisoned unrelated later calls after a fallback failed.
+                    fallback_state = {"index": 0, "attempts": 0}
                     while fallback_state["attempts"] < MAX_FALLBACK_ATTEMPTS and fallback_state["index"] < len(fallbacks):
                         fallback_tool, transformer = fallbacks[fallback_state["index"]]
                         fallback_args = transformer(args)
@@ -2271,8 +2345,6 @@ Want me to run it and show you?
                             fallback_state["index"] += 1
                         fallback_state["attempts"] += 1
                     
-                    # Save state for next failure
-                    self.context.metadata.setdefault("fallback_state", {})[tool] = fallback_state
                     if fallback_state["attempts"] >= MAX_FALLBACK_ATTEMPTS or fallback_state["index"] >= len(fallbacks):
                         fallback_info += f"\nAll fallbacks exhausted for {tool}."
 
