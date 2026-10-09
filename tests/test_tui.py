@@ -7,7 +7,7 @@ import pytest
 
 from agent.permissions.manager import PermissionRequest, PermissionVerdict, RiskLevel
 from agent.tui.app import DepressionApp, PermissionModal
-from textual.widgets import Button, Input
+from textual.widgets import Button, TextArea
 
 
 @pytest.mark.asyncio
@@ -15,10 +15,10 @@ async def test_prompt_accepts_typed_characters():
     app = DepressionApp(coordinator=None)
     async with app.run_test() as pilot:
         await pilot.pause()
-        inp = app.query_one("#prompt", Input)
+        inp = app.query_one("#prompt", TextArea)
         assert inp.has_focus
         await pilot.press("h", "e", "l", "l", "o")
-        assert inp.value == "hello"
+        assert inp.text == "hello"
 
 
 @pytest.mark.asyncio
@@ -58,15 +58,13 @@ async def test_busy_visual_restores():
     app = DepressionApp(coordinator=None)
     async with app.run_test() as pilot:
         await pilot.pause()
-        inp = app.query_one("#prompt", Input)
+        inp = app.query_one("#prompt", TextArea)
         app._set_busy_visual(True)
         await pilot.pause()
         assert inp.has_class("busy")
-        assert inp.placeholder == app._BUSY_PLACEHOLDER
         app._set_busy_visual(False)
         await pilot.pause()
         assert not inp.has_class("busy")
-        assert inp.placeholder == "ask the agent…"
 
 
 @pytest.mark.asyncio

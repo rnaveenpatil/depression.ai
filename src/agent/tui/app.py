@@ -14,7 +14,7 @@ from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.reactive import reactive
 from textual.screen import ModalScreen
-from textual.widgets import Button, Footer, Input, Select, Static
+from textual.widgets import Button, Footer, Input, Static, TextArea
 
 from agent.agent.dual_agent import AgentCoordinator
 from agent.llm.runtime import (
@@ -57,6 +57,9 @@ _PANEL_NAMES = ("llm", "aws", "profile", "context", "llmcost", "help")
 # Tools whose calls should be diff-aware in the transcript.
 _DIFF_TOOLS = {"write", "edit", "apply_patch", "filesystem", "patch"}
 
+_PROMPT_MIN_ROWS = 1
+_PROMPT_MAX_ROWS = 10
+
 
 def _esc(text: Any) -> str:
     if text is None:
@@ -86,6 +89,107 @@ def _shorten_path(path: str, max_len: int = 32) -> str:
     head_len = max(4, max_len - 24)
     tail_len = max_len - head_len - 1
     return f"{path[:head_len]}…{path[-tail_len:]}"
+
+
+# ======================================================================
+# MULTILINE PROMPT
+# ======================================================================
+
+class PromptArea(TextArea):
+    """
+    Soft-wrapping, auto-growing multiline prompt.
+
+    Textual's Input is single-line only. TextArea with `soft_wrap=True`
+    and `wrap_mode="none"` gives terminal-repl behaviour: text wraps,
+    the box grows up to _PROMPT_MAX_ROWS, Enter submits, Shift+Enter
+    (or Ctrl+J) inserts a newline.
+    """
+
+    DEFAULT_CSS = f"""
+    PromptArea {{
+        height: auto;
+        min-height: {_PROMPT_MIN_ROWS};
+        max-height: {_PROMPT_MAX_ROWS + 2};
+        width: 1fr;
+        background: {BG};
+        color: {TEXT};
+        border: none;
+        padding: 0;
+        scrollbar-size-vertical: 1;
+        scrollbar-background: {BG};
+        scrollbar-color: {BORDER};
+    }}
+    PromptArea:focus {{
+        border: none;
+    }}
+    PromptArea .text-area--cursor {{
+        background: {GREEN};
+        color: {BG};
+    }}
+    PromptArea.busy {{
+        color: {AMBER};
+    }}
+    """
+
+    def __init__(self, **kwargs: Any) -> None:
+        super().__init__(
+            "",
+            soft_wrap=True,
+            show_line_numbers=False,
+            tab_behavior="focus",
+            **kwargs,
+        )
+
+    def on_mount(self) -> None:
+        try:
+            self.wrap_mode = "none"
+        except Exception:
+            pass
+        self._resize()
+
+    def _resize(self) -> None:
+        try:
+            text = self.text
+            width = max(1, self.content_size.width)
+            wrapped = 0
+            for raw in text.split("\n"):
+                if not raw:
+                    wrapped += 1
+                    continue
+                wrapped += max(1, (len(raw) + width - 1) // width)
+            rows = max(_PROMPT_MIN_ROWS, min(_PROMPT_MAX_ROWS, wrapped))
+            self.styles.height = rows
+        except Exception:
+            pass
+
+    def on_text_area_changed(self, event: TextArea.Changed) -> None:
+        self._resize()
+
+    async def _on_key(self, event) -> None:
+        # Textual's Key event has no `.shift` attribute — modifiers are
+        # encoded into the `key` string. Compare against the full chord.
+        key = event.key
+
+        if key in ("shift+enter", "ctrl+j"):
+            event.stop()
+            event.prevent_default()
+            self.insert("\n")
+            self._resize()
+            return
+
+        if key == "enter":
+            event.stop()
+            event.prevent_default()
+            text = self.text
+            self.text = ""
+            self._resize()
+            try:
+                handler = getattr(self.app, "submit_prompt_text", None)
+                if handler is not None:
+                    handler(text)
+            except Exception:
+                pass
+            return
 
 
 # ======================================================================
@@ -446,6 +550,14 @@ class LLMCostPanel(Vertical):
 # ======================================================================
 
 class HelpPanel(Vertical):
+    """
+    Static help panel.
+
+    Takes no app reference — its content is fixed. Passing the app as a
+    positional argument would forward it to Vertical.__init__ as a child
+    widget and raise TypeError. Only `id=` should be passed.
+    """
+
     DEFAULT_CSS = f"""
     HelpPanel {{
         width: 100%; height: auto;
@@ -455,6 +567,9 @@ class HelpPanel(Vertical):
     HelpPanel .help-section {{ color: {GREEN}; text-style: bold; margin: 1 0 0 0; }}
     HelpPanel .help-row     {{ color: {TEXT}; }}
     """
+
+    def __init__(self, **kwargs: Any):
+        super().__init__(**kwargs)
 
     def compose(self) -> ComposeResult:
         yield Static(f"[bold {GREEN}]▌ HELP[/]", markup=True)
@@ -471,6 +586,9 @@ class HelpPanel(Vertical):
         yield Static("/clear     clear transcript", classes="help-row")
         yield Static("/quit      exit", classes="help-row")
         yield Static("Keys", classes="help-section")
+        yield Static("Enter      submit prompt", classes="help-row")
+        yield Static("Shift+Ent  newline inside the prompt", classes="help-row")
+        yield Static("Ctrl+J     newline (fallback)", classes="help-row")
         yield Static("Tab        focus prompt / cycle mode", classes="help-row")
         yield Static("Ctrl+B     show / hide the sidebar", classes="help-row")
         yield Static("Esc        interrupt running agent (also denies modal)", classes="help-row")
@@ -640,13 +758,15 @@ class DepressionApp(App):
         border-left: thick {GREEN};
         padding: 1 0 0 2; margin: 0 0 0 2;
     }}
-    #prompt-row {{ height: 3; layout: horizontal; }}
+    #prompt-row {{ height: auto; layout: horizontal; }}
     #prompt-sign {{
-        width: 2; height: 3; color: {GREEN};
-        content-align: left middle; text-style: bold;
+        width: 2; height: auto;
+        color: {GREEN};
+        content-align: left top; text-style: bold;
     }}
     #prompt {{
-        width: 1fr; height: 3;
+        width: 1fr;
+        height: auto;
         background: {BG}; border: none; color: {TEXT}; padding: 0;
     }}
     #prompt:focus {{ border: none; }}
@@ -664,8 +784,6 @@ class DepressionApp(App):
         Binding("escape", "interrupt", "Interrupt", priority=False),
         Binding("ctrl+l", "clear", "Clear", priority=True),
         Binding("ctrl+b", "toggle_sidebar", "Sidebar", priority=True),
-        # Tab is context-aware: if the prompt lost focus, it returns focus
-        # to the prompt instead of switching mode. See action_tab_or_mode.
         Binding("tab", "tab_or_mode", "Mode", priority=True),
         Binding("e", "toggle_expand_tool", "Expand", priority=False),
     ]
@@ -703,6 +821,7 @@ class DepressionApp(App):
 
         # One PlanView per conversation; re-rendered in place.
         self._plan_view: Optional[PlanView] = None
+        self._plan_signature: Optional[tuple] = None
 
         try:
             self.turn_timeout = float(
@@ -715,7 +834,6 @@ class DepressionApp(App):
         self._event_handlers_registered = False
         self._active_tool_widget: Optional[ToolCallWidget] = None
 
-        # Guard so the on_key focus-reclaim doesn't fire during compose.
         self._mounted = False
 
     # ------------------------------------------------------------------
@@ -737,6 +855,7 @@ class DepressionApp(App):
                     ("profile", ProfilePanel(id="panel-profile")),
                     ("context", ContextPanel(self, id="panel-context")),
                     ("llmcost", LLMCostPanel(self, id="panel-llmcost")),
+                    # HelpPanel is static — do NOT pass `self`.
                     ("help", HelpPanel(id="panel-help")),
                 ],
                 id="sidebar",
@@ -745,11 +864,11 @@ class DepressionApp(App):
         with Vertical(id="prompt-wrap"):
             with Horizontal(id="prompt-row"):
                 yield Static("›", id="prompt-sign")
-                yield Input(placeholder="ask the agent…", id="prompt")
+                yield PromptArea(id="prompt")
             yield Static(self._mode_chip(), id="mode-chip", markup=True)
             yield Static(
-                f"[{DIM}]tab focus/mode  ·  ctrl+b sidebar  ·  esc interrupt  ·  "
-                f"e expand  ·  ctrl+q quit[/]",
+                f"[{DIM}]enter submit  ·  shift+enter newline  ·  tab focus/mode  ·  "
+                f"ctrl+b sidebar  ·  esc interrupt  ·  e expand  ·  ctrl+q quit[/]",
                 id="hint", markup=True,
             )
             yield Static(self._token_bar(), id="token-bar", markup=True)
@@ -790,12 +909,15 @@ class DepressionApp(App):
 
         self._load_identity_from_env()
 
-        self.query_one("#prompt", Input).focus()
+        try:
+            self.query_one("#prompt", PromptArea).focus()
+        except Exception:
+            pass
+
         self._refresh_aws_status()
         self._refresh_token_bar()
         self._refresh_llmcost_panel()
 
-        # Mark mounted; from here on, the on_key safety net is live.
         self._mounted = True
 
         self.call_later(self._maybe_onboard)
@@ -830,9 +952,8 @@ class DepressionApp(App):
 
         prompt = None
         try:
-            prompt = self.query_one("#prompt", Input)
+            prompt = self.query_one("#prompt", PromptArea)
             prompt.disabled = True
-            prompt.placeholder = "sign in to continue…"
         except Exception:
             prompt = None
 
@@ -846,12 +967,8 @@ class DepressionApp(App):
             if prompt is not None:
                 try:
                     prompt.disabled = False
-                    prompt.placeholder = "ask the agent…"
                 except Exception:
                     pass
-            # Robust refocus: the first attempt runs before Textual finishes
-            # recomposing after the modal dismisses; the delayed one catches
-            # the case where the first landed mid-rebuild.
             self._refocus_prompt()
 
     def _context_manager(self) -> Any:
@@ -912,7 +1029,11 @@ class DepressionApp(App):
             self._events.set_ui_loop(asyncio.get_running_loop())
             self._events.attach(self.coordinator)
             self._events.subscribe("on_tool_executed", self._on_tool_event)
+            # loop.py fires both on_plan_created and on_plan_updated.
+            # Subscribe to both so the checklist renders from the structured
+            # payload.
             self._events.subscribe("on_plan_updated", self._on_plan_updated)
+            self._events.subscribe("on_plan_created", self._on_plan_created)
             self._event_handlers_registered = True
         except Exception as exc:
             self._error(f"event wiring failed: {exc}")
@@ -922,14 +1043,9 @@ class DepressionApp(App):
     # ------------------------------------------------------------------
 
     def _refocus_prompt(self) -> None:
-        """
-        Bring focus back to the prompt. Textual can silently drop a focus()
-        call that lands mid-recompose, so we schedule it for after the next
-        refresh and try again shortly afterwards.
-        """
         def _do() -> None:
             try:
-                prompt = self.query_one("#prompt", Input)
+                prompt = self.query_one("#prompt", PromptArea)
                 if not prompt.disabled and not prompt.has_focus:
                     prompt.focus()
             except Exception:
@@ -942,11 +1058,6 @@ class DepressionApp(App):
             _do()
 
     def on_key(self, event) -> None:
-        """
-        Safety net: if the user types a printable character while focus is
-        not on the prompt (and no modal is up), send it to the prompt
-        instead of dropping it — matches terminal behaviour.
-        """
         if not self._mounted:
             return
         try:
@@ -954,7 +1065,7 @@ class DepressionApp(App):
                 return
             if self._is_shutting_down:
                 return
-            prompt = self.query_one("#prompt", Input)
+            prompt = self.query_one("#prompt", PromptArea)
             if prompt.disabled or prompt.has_focus:
                 return
 
@@ -962,21 +1073,18 @@ class DepressionApp(App):
             if key is None:
                 return
 
-            # Single printable character.
             if len(key) == 1 and key.isprintable() and key != " ":
                 prompt.focus()
-                prompt.insert_text_at_cursor(key)
+                prompt.insert(key)
                 event.stop()
                 return
-            # Space is a named key.
             if key == "space":
                 prompt.focus()
-                prompt.insert_text_at_cursor(" ")
+                prompt.insert(" ")
                 event.stop()
                 return
-            # Navigation / editing keys: just focus and let the next event
-            # reach the now-focused input.
-            if key in ("backspace", "delete", "left", "right", "home", "end"):
+            if key in ("backspace", "delete", "left", "right", "home", "end",
+                       "up", "down"):
                 prompt.focus()
                 event.stop()
                 return
@@ -1000,10 +1108,6 @@ class DepressionApp(App):
         cached = bool(data.get("cached"))
         duration = data.get("execution_time")
 
-        # Snapshot the file before the tool ran, in case the tool doesn't
-        # return a `before` — lets the tool card render a real diff.
-        before_snapshot = self._snapshot_before(tool, params)
-
         try:
             transcript = self.query_one("#transcript", VerticalScroll)
         except Exception:
@@ -1015,34 +1119,10 @@ class DepressionApp(App):
         await transcript.mount(widget)
         widget.set_running(execution_time=duration)
 
-        # Inject before/after into the result so _render_diff fires.
+        # [Diff honesty] Do NOT read from disk here — the tool has already
+        # run, so a read-back would return the post-mutation content.
         if isinstance(result, dict) and tool in _DIFF_TOOLS:
-            r = dict(result)
-            if not (r.get("before") or r.get("content_before")):
-                if before_snapshot:
-                    r["before"] = before_snapshot
-            if not (r.get("after") or r.get("content_after") or r.get("new_content")):
-                for key in ("content", "new_content", "text", "output"):
-                    v = r.get(key)
-                    if isinstance(v, str) and v:
-                        r["after"] = v
-                        break
-                if not r.get("after"):
-                    try:
-                        from pathlib import Path
-                        path = (
-                            params.get("path") or params.get("filePath")
-                            or params.get("file") or params.get("filename")
-                        )
-                        if path:
-                            p = Path(str(path)).expanduser()
-                            if p.is_file():
-                                r["after"] = p.read_text(
-                                    encoding="utf-8", errors="replace"
-                                )
-                    except Exception:
-                        pass
-            result = r
+            result = self._shape_diff_payload(tool, params, result)
 
         widget.set_result(
             result if isinstance(result, dict) else {"success": True, "result": result},
@@ -1067,28 +1147,75 @@ class DepressionApp(App):
             pass
 
     @staticmethod
-    def _snapshot_before(tool: str, params: dict) -> str:
-        """Read the file the tool is about to write, so we can show a diff."""
-        try:
-            if tool not in _DIFF_TOOLS:
-                return ""
-            path = (
-                params.get("path") or params.get("filePath")
-                or params.get("file") or params.get("filename")
-            )
-            if not path:
-                return ""
-            from pathlib import Path
-            p = Path(str(path)).expanduser()
-            if not p.is_file():
-                return ""
-            return p.read_text(encoding="utf-8", errors="replace")
-        except Exception:
-            return ""
+    def _shape_diff_payload(tool: str, params: dict, result: dict) -> dict:
+        """
+        Build a diff payload ONLY from the tool's own report.
+        Never reads disk. Never invents a side. If either side is missing,
+        no diff will be rendered.
+        """
+        r = dict(result)
+
+        before = None
+        for key in ("before", "content_before", "old_content"):
+            v = r.get(key)
+            if isinstance(v, str):
+                before = v
+                break
+
+        after = None
+        for key in ("after", "content", "new_content", "text", "output"):
+            v = r.get(key)
+            if isinstance(v, str):
+                after = v
+                break
+
+        if before is not None:
+            r["before"] = before
+        if after is not None:
+            r["after"] = after
+
+        if before is None and after is not None:
+            r["diff_source"] = "tool:add-only"
+        elif before is None and after is None:
+            r["diff_source"] = "tool:none"
+        else:
+            r["diff_source"] = "tool"
+        return r
 
     # ------------------------------------------------------------------
     # PLAN
     # ------------------------------------------------------------------
+
+    async def _on_plan_created(self, event: AgentEvent) -> None:
+        """
+        loop.py fires this when the planner produces a multi-step plan,
+        before any task runs. Render the initial checklist here.
+        """
+        if self._is_shutting_down:
+            return
+        data = event.payload or {}
+        tasks = data.get("tasks") or []
+        if not tasks:
+            return
+
+        entries = []
+        for idx, t in enumerate(tasks):
+            if not isinstance(t, dict):
+                continue
+            desc = t.get("description") or t.get("content") or ""
+            if not desc:
+                continue
+            entries.append({
+                "content": str(desc)[:200],
+                "status": "in_progress" if idx == 0 else "pending",
+                "priority": t.get("priority"),
+            })
+
+        if not entries:
+            return
+
+        self._show_transcript()
+        await self._upsert_plan(entries)
 
     async def _on_plan_updated(self, event: AgentEvent) -> None:
         if self._is_shutting_down:
@@ -1112,33 +1239,82 @@ class DepressionApp(App):
     def _normalise_plan_entries(entries: list) -> list:
         out = []
         for e in entries:
+            if not isinstance(e, dict):
+                continue
             status = str(e.get("status") or "pending").lower()
             if status == "done":
                 status = "completed"
+            content = (
+                e.get("content") or e.get("description") or e.get("title") or ""
+            )
+            content = str(content)[:200]
+            if not content:
+                continue
             out.append({
-                "content": str(e.get("content") or "")[:160],
+                "content": content,
                 "status": status,
                 "priority": e.get("priority"),
             })
         return out
 
     async def _upsert_plan(self, normalised: list) -> None:
+        """
+        Mount a PlanView once, then mutate it in place. Signature guard
+        prevents re-renders when nothing has changed.
+        """
+        sig = tuple((e["content"][:80], e["status"]) for e in normalised)
+        if sig == self._plan_signature:
+            return
+        self._plan_signature = sig
+
         try:
             transcript = self.query_one("#transcript", VerticalScroll)
         except Exception:
             return
+
         if self._plan_view is None:
-            self._plan_view = PlanView(entries=normalised)
-            await transcript.mount(self._plan_view)
+            try:
+                self._plan_view = PlanView(entries=normalised)
+                await transcript.mount(self._plan_view)
+            except Exception:
+                self._plan_view = None
+                try:
+                    await transcript.mount(
+                        Static(self._render_plan_fallback(normalised),
+                               classes="agent", markup=True)
+                    )
+                except Exception:
+                    pass
         else:
             try:
                 self._plan_view.set_entries(normalised)
             except Exception:
                 pass
+
         self.call_after_refresh(lambda: transcript.scroll_end(animate=False))
 
+    @staticmethod
+    def _render_plan_fallback(entries: list) -> str:
+        icons = {
+            "completed": f"[{GREEN}]✓[/]",
+            "in_progress": f"[{AMBER}]▸[/]",
+            "pending": f"[{DIM}]○[/]",
+            "failed": f"[{ERROR}]✗[/]",
+            "skipped": f"[{DIM}]—[/]",
+        }
+        lines = [f"[bold {GREEN}]◇ PLAN[/]"]
+        for e in entries:
+            icon = icons.get(e["status"], f"[{DIM}]○[/]")
+            content = _esc(e["content"])
+            if e["status"] == "completed":
+                lines.append(f"  {icon} [{MUTED}]{content}[/]")
+            elif e["status"] == "in_progress":
+                lines.append(f"  {icon} [bold {TEXT}]{content}[/]")
+            else:
+                lines.append(f"  {icon} [{TEXT}]{content}[/]")
+        return "\n".join(lines)
+
     def _plan_from_text(self, text: str) -> list:
-        """Extract a checklist from the assistant's reply, if any."""
         try:
             from agent.tui.onboarding.plan_parser import (
                 parse_plan_from_text, looks_like_plan,
@@ -1277,16 +1453,12 @@ class DepressionApp(App):
             f"[{DIM}]·[/]  {ctx}{welcome}{queue}"
         )
 
-    _BUSY_PLACEHOLDER = "agent running… type to queue · esc to interrupt"
-
     def _set_busy_visual(self, busy: bool) -> None:
         try:
-            inp = self.query_one("#prompt", Input)
+            inp = self.query_one("#prompt", PromptArea)
             if busy:
-                inp.placeholder = self._BUSY_PLACEHOLDER
                 inp.add_class("busy")
             else:
-                inp.placeholder = "ask the agent…"
                 inp.remove_class("busy")
         except Exception:
             pass
@@ -1423,12 +1595,11 @@ class DepressionApp(App):
     # INPUT / COMMANDS
     # ------------------------------------------------------------------
 
-    @on(Input.Submitted, "#prompt")
-    def submit_prompt(self, event: Input.Submitted) -> None:
-        text = event.value.strip()
+    # Called by PromptArea when Enter is pressed without Shift.
+    def submit_prompt_text(self, text: str) -> None:
+        text = (text or "").strip()
         if not text:
             return
-        event.input.value = ""
 
         if text.startswith("/"):
             self._slash(text)
@@ -1485,6 +1656,7 @@ class DepressionApp(App):
             except Exception:
                 pass
             self._plan_view = None
+            self._plan_signature = None
             self._has_messages = False
             try:
                 self.query_one("#empty-banner", EmptyBanner).display = True
@@ -1539,6 +1711,10 @@ class DepressionApp(App):
             self._schedule_drain()
             return
 
+        # Reset the plan so a new query starts a fresh checklist.
+        self._plan_view = None
+        self._plan_signature = None
+
         started = time.time()
         try:
             result = await asyncio.wait_for(
@@ -1560,9 +1736,6 @@ class DepressionApp(App):
                 )
                 await self._render_output(str(output), started)
 
-                # If the reply itself contained a checklist, mirror it into
-                # the same inline PlanView so the block grows instead of
-                # duplicating.
                 try:
                     text_plan = self._plan_from_text(str(output))
                     if text_plan:
@@ -1702,8 +1875,6 @@ class DepressionApp(App):
             status.update("enter a base URL first")
             return
         try:
-            # Same adaptation the connect button uses: pasted "/v1",
-            # missing "/v1", or a bare host all resolve to one root.
             base = plan_runtime(url, key, "").base_url or url
             async with httpx.AsyncClient(timeout=20) as client:
                 headers = ({"Authorization": f"Bearer {key}"} if key else {})
@@ -1812,13 +1983,8 @@ class DepressionApp(App):
     # ------------------------------------------------------------------
 
     def action_tab_or_mode(self) -> None:
-        """
-        Tab returns focus to the prompt if it lost it; otherwise it cycles
-        the mode. This keeps Tab usable for getting back to the chat bar
-        even when the prompt isn't focused.
-        """
         try:
-            prompt = self.query_one("#prompt", Input)
+            prompt = self.query_one("#prompt", PromptArea)
             if not prompt.disabled and not prompt.has_focus:
                 prompt.focus()
                 return
@@ -1878,6 +2044,7 @@ class DepressionApp(App):
         except Exception:
             pass
         self._plan_view = None
+        self._plan_signature = None
         self._has_messages = False
         try:
             self.query_one("#empty-banner", EmptyBanner).display = True
@@ -1911,4 +2078,4 @@ class DepressionApp(App):
         self._switch_mode(MODE_ORDER[(i + 1) % len(MODE_ORDER)])
 
 
-__all__ = ["DepressionApp", "PermissionModal"]
+__all__ = ["DepressionApp", "PermissionModal", "PromptArea"]
