@@ -91,6 +91,7 @@ def _fallback_python_command(payload: Dict[str, str], operation: str) -> Dict[st
     """Build a shell-safe Python command for filesystem fallback operations."""
     import base64
     import shlex
+    import sys
 
     encoded = base64.b64encode(
         json.dumps(payload, ensure_ascii=False).encode("utf-8")
@@ -111,7 +112,7 @@ def _fallback_python_command(payload: Dict[str, str], operation: str) -> Dict[st
             "p.write_text(s.replace(old,d['new']), encoding='utf-8')"
         ),
     }
-    return {"command": "python -c " + shlex.quote(scripts[operation]) + " " + shlex.quote(encoded)}
+    return {"command": shlex.quote(sys.executable) + " -c " + shlex.quote(scripts[operation]) + " " + shlex.quote(encoded)}
 
 
 def _bash_fallback_write(args: Dict[str, Any]) -> Dict[str, Any]:
