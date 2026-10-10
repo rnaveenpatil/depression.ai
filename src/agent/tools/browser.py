@@ -34,7 +34,7 @@ class BrowserTool(BaseTool):
         },
         "required": ["action"],
     }
-    timeout = 120.0
+    timeout = 999999.0
 
     def __init__(self, config: Optional[Dict[str, Any]] = None):
         cfg = config or {}

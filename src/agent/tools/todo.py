@@ -44,7 +44,7 @@ class TodoTool(BaseTool):
         },
         "required": ["action"],
     }
-    timeout = 10.0
+    timeout = 999999.0
 
     # Shared store per session so `todo`, `todowrite`, and `todoread` see the
     # same data. Plain dict — session-scoped cleanup is handled by

@@ -283,7 +283,7 @@ class ProviderConfig:
     api_key: Optional[str] = None
     base_url: Optional[str] = None
     organization: Optional[str] = None
-    timeout: float = 120.0
+    timeout: float = 999999.0
     max_retries: int = 2
     default_model: Optional[str] = None
     extra: Dict[str, Any] = field(default_factory=dict)

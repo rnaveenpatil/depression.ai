@@ -108,7 +108,7 @@ class ProcessTool(BaseTool):
         },
         "required": ["action"],
     }
-    timeout = 300.0
+    timeout = 999999.0
 
     read_only = False
     mutating = True

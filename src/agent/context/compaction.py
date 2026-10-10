@@ -101,8 +101,10 @@ def _is_summary(message: Any) -> bool:
 def _drop_old_summaries(groups: List[List[Any]]) -> List[List[Any]]:
     """
     [Bug 4] Keep at most the newest compaction summary across the groups.
-    Older summaries describe turns that are no longer in the window and
-    must not accumulate.
+
+    Caller must pass *validated* groups — a group containing an assistant
+    tool_call and its tool results must not be broken by dropping the
+    summary out of the middle.
     """
     flat: List[Any] = [m for g in groups for m in g]
     summaries = [m for m in flat if _is_summary(m)]
@@ -113,10 +115,7 @@ def _drop_old_summaries(groups: List[List[Any]]) -> List[List[Any]]:
 
     out: List[List[Any]] = []
     for g in groups:
-        kept = [
-            m for m in g
-            if (not _is_summary(m)) or m is newest
-        ]
+        kept = [m for m in g if (not _is_summary(m)) or m is newest]
         if kept:
             out.append(kept)
     return out
@@ -221,9 +220,12 @@ class Compactor:
         if len(tool_outputs) > self.max_tool_outputs_keep:
             stages.append("tool_output_trim")
 
+        # [Bug fix] Sanitize first, then dedupe summaries. Previously the
+        # order was reversed, and a summary sharing a group with a tool
+        # result could cause validate_group to drop the whole group.
         raw_groups = group_messages(working)
-        raw_groups = _drop_old_summaries(raw_groups)
         sanitized_groups = _sanitize_groups(raw_groups)
+        sanitized_groups = _drop_old_summaries(sanitized_groups)
         working = [m for g in sanitized_groups for m in g]
 
         effective_target = max(1, target_tokens - max(0, extra_tokens))
@@ -296,19 +298,17 @@ class Compactor:
         )
         summary_tokens = max(1, len(summary_text) // 4) + 20
 
+        # [Bug fix] The summary is a system message but NOT pinned. It is
+        # a compaction artifact, not protected state. Pinning it let it
+        # outlive real conversation and outrank the actual pinned prompt.
         summary_msg: Any
         if ContextMessage is not None:
             try:
                 summary_msg = ContextMessage(
-                    # Deliberately a *user* message, not a system one. The
-                    # summary is derived from untrusted tool/web output, and
-                    # re-injecting it as role="system" with pinned=True let a
-                    # hostile web page plant permanent system-level
-                    # instructions that also survived truncation.
-                    role="user",
+                    role="system",
                     content=summary_content,
                     tokens=summary_tokens,
-                    pinned=True,
+                    pinned=False,
                     metadata={"compacted": True, "summary_of": len(old_flat)},
                 )
             except Exception as e:
@@ -323,10 +323,10 @@ class Compactor:
             class _SummaryMessage:
                 __slots__ = ("role", "content", "tokens", "pinned", "metadata", "timestamp")
                 def __init__(self) -> None:
-                    self.role = "user"
+                    self.role = "system"
                     self.content = summary_content
                     self.tokens = summary_tokens
-                    self.pinned = True
+                    self.pinned = False
                     self.metadata: Dict[str, Any] = {
                         "compacted": True,
                         "summary_of": len(old_flat),
@@ -337,7 +337,6 @@ class Compactor:
         # [Bug 4] Do NOT carry previous summaries forward.
         combined: List[Any] = []
         for g in protected_groups:
-            # Skip stale summaries even among pinned groups.
             kept = [m for m in g if not _is_summary(m)]
             if kept:
                 combined.extend(kept)
@@ -378,12 +377,20 @@ class Compactor:
             return self._heuristic_summary(transcript)
 
     def _hard_truncate(self, messages: List[Any], target_tokens: int) -> List[Any]:
-        groups = group_messages(messages)
-        groups = _drop_old_summaries(groups)
+        """
+        Drop the oldest non-protected groups until the target fits.
+
+        Walks `candidate_groups` from newest to oldest. For each group, if
+        it fits in the remaining budget, prepend it to `kept`. On the first
+        overflow, stop — everything older is dropped as a block.
+        """
+        raw = group_messages(messages)
+        sanitized = _sanitize_groups(raw)
+        sanitized = _drop_old_summaries(sanitized)
 
         protected_groups: List[List[Any]] = []
         unpinned_groups: List[List[Any]] = []
-        for g in groups:
+        for g in sanitized:
             if all(_is_protected(m) for m in g):
                 protected_groups.append(g)
             else:
@@ -395,24 +402,24 @@ class Compactor:
             unpinned_groups[:-must_keep_count] if must_keep_count else list(unpinned_groups)
         )
 
-        base: List[Any] = [m for g in protected_groups for m in g] + [
+        base = [m for g in protected_groups for m in g] + [
             m for g in must_keep_groups for m in g
         ]
         budget = target_tokens - self._estimate_tokens(base)
 
-        added_groups: List[List[Any]] = []
+        # Walk newest → oldest, prepend each group that fits.
+        kept: List[List[Any]] = []
         for g in reversed(candidate_groups):
             cost = _estimate_group_tokens(g)
             if cost <= budget:
-                added_groups.append(g)
+                kept.insert(0, g)
                 budget -= cost
             else:
                 break
 
-        added_groups.reverse()
         return (
             [m for g in protected_groups for m in g]
-            + [m for g in added_groups for m in g]
+            + [m for g in kept for m in g]
             + [m for g in must_keep_groups for m in g]
         )
 

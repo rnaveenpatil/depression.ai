@@ -42,7 +42,7 @@ class TaskTool(BaseTool):
         },
         "required": ["action"],
     }
-    timeout = 600.0
+    timeout = 999999.0
 
     def __init__(self, agent: Any = None):
         self.agent = agent

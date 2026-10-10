@@ -86,7 +86,7 @@ class GitProject:
         self,
         project_dir: str | Path,
         git_binary: str = "git",
-        timeout: float = 30.0,
+        timeout: float = 999999.0,
     ):
         self.project_dir = Path(project_dir).resolve()
         self.git_binary = git_binary

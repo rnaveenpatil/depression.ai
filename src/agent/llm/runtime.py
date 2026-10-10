@@ -90,7 +90,7 @@ _MODEL_HINTS: Tuple[Tuple[str, str], ...] = (
 # that doesn't exist.
 _FAMILY_FALLBACKS: Dict[str, Dict[str, Any]] = {
     FAMILY_OPENAI: {
-        "context_window": 8_192,
+        "context_window": 1_000_000,
         "max_output": 4_096,
         "supports_tools": True,       # most OpenAI-compatible gateways do
         "supports_streaming": True,
@@ -125,7 +125,7 @@ _FAMILY_FALLBACKS: Dict[str, Dict[str, Any]] = {
 
 # Fail fast: one hung request should not stall the whole turn for two
 # minutes. Matches the documented "30s x 2 retries" behaviour.
-_DEFAULT_TIMEOUT = 30.0
+_DEFAULT_TIMEOUT = 999999.0
 _DEFAULT_MAX_RETRIES = 2
 
 
@@ -139,7 +139,7 @@ _DEFAULT_MAX_RETRIES = 2
 # reads it. Until then those callers simply see empty/zero values.
 
 #: Context window assumed when the connected model's is unknown or tiny.
-DEFAULT_CONTEXT_WINDOW = 8_192
+DEFAULT_CONTEXT_WINDOW = 500_000
 
 #: model id -> metadata (context_window, cost_input, capabilities, ...)
 MODEL_METADATA: Dict[str, Dict[str, Any]] = {}

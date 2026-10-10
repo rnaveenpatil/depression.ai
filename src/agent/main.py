@@ -197,7 +197,7 @@ Examples:
         # Limits
         parser.add_argument("--max-turns", type=int, default=50, help="Max iterations per query (agent loop)")
         parser.add_argument("--max-iterations", type=int, default=3, help="Max plan-execute iterations (coordinator)")
-        parser.add_argument("--timeout", type=int, default=300, help="Timeout in seconds")
+        parser.add_argument("--timeout", type=int, default=999999, help="Timeout in seconds")
 
         # TUI options
         parser.add_argument("--no-sidebar", action="store_true", help="Hide sidebar in TUI")
@@ -534,7 +534,7 @@ Examples:
                     auto_execute=True,  # Execute plan automatically in auto mode
                     max_iterations=self.args.max_iterations,
                 ),
-                timeout=120,  # Reduced timeout: 2 minutes instead of 5
+                timeout=self.args.timeout,
             )
         except asyncio.TimeoutError:
             if spinner:

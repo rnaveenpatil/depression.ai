@@ -393,7 +393,7 @@ class LLMConfig:
     api_key: Optional[str] = None
     base_url: Optional[str] = None
     organization: Optional[str] = None
-    timeout: float = 120.0
+    timeout: float = 999999.0
     max_retries: int = 3
     retry_delay: float = 1.0
     params: LLMParamsConfig = field(default_factory=LLMParamsConfig)
@@ -474,10 +474,10 @@ class ToolsConfig:
         "lsp", "bash", "process", "patch", "browser", "task",
     ])
     disabled: List[str] = field(default_factory=list)
-    timeout: float = 60.0
+    timeout: float = 999999.0
     max_output_size: int = 100_000
     shell: str = "/bin/bash"
-    shell_timeout: float = 60.0
+    shell_timeout: float = 999999.0
     allow_network: bool = True
     allow_git_write: bool = True
     max_file_size: int = 10 * 1024 * 1024
@@ -501,7 +501,7 @@ class SubAgentConfig:
     enabled: bool = True
     max_subagents: int = 10
     max_depth: int = 3
-    default_timeout: float = 60.0
+    default_timeout: float = 999999.0
     enable_parallel: bool = True
     enable_communication: bool = True
     subagent_model: Optional[str] = None
@@ -514,7 +514,7 @@ class LoopConfig:
     max_history_length: int = 20
     enable_planning: bool = True
     enable_caching: bool = True
-    timeout: float = 300.0
+    timeout: float = 999999.0
     enable_self_reflection: bool = True
     enable_auto_retry: bool = True
 
@@ -576,7 +576,7 @@ class LoggingConfig:
 class MCPConfig:
     enabled: bool = False
     servers: List[Dict[str, Any]] = field(default_factory=list)
-    timeout: float = 30.0
+    timeout: float = 999999.0
 
 
 @dataclass

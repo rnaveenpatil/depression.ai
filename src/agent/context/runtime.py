@@ -14,10 +14,18 @@ Invariants enforced here (all required by OpenAI/Anthropic-compatible APIs):
     * Trimming and grouping operate on whole, valid groups atomically.
     * The newest conversational turn is never dropped, even if it exceeds
       the requested window. [Bug 2]
+    * [Stable ids] An assistant turn's tool_call ids are persisted into
+      metadata at write time and reused verbatim by every tool result, so
+      a result can never be classified as an orphan due to a regenerated
+      id.
+    * [Size cap] Tool result payloads are capped by a model-scaled byte
+      budget. Truncation keeps head + tail, never a byte slice that can
+      land mid-UTF-8.
 """
 from __future__ import annotations
 
 import json
+import uuid
 from typing import Any, List
 
 from agent.llm.provider import Message
@@ -26,7 +34,30 @@ from agent.utils.logging import get_logger
 logger = get_logger(__name__)
 
 
-TOOL_RESULT_BYTE_CAP = 8 * 1024
+DEFAULT_TOOL_RESULT_BYTE_CAP = 8 * 1024
+
+
+def _calculate_tool_result_cap(context_window: int) -> int:
+    """
+    Byte cap for one tool result, scaled by the model's context window.
+
+    The cap targets roughly 2% of a 1M-token model (~128 KB). Smaller
+    models get proportionally smaller caps so the context budget stays
+    usable when several tool results are in flight.
+    """
+    if context_window <= 0:
+        return DEFAULT_TOOL_RESULT_BYTE_CAP
+    if context_window < 32_768:
+        return 8 * 1024
+    if context_window < 131_072:
+        return 16 * 1024
+    if context_window < 500_000:
+        return 64 * 1024
+    if context_window < 1_000_000:
+        return 128 * 1024
+    # 1M+ tokens: cap at 512 KB, floor at 128 KB.
+    cap = int(context_window * 4 * 0.02)
+    return min(512 * 1024, max(128 * 1024, cap))
 
 
 # ----------------------------------------------------------------------
@@ -54,36 +85,81 @@ def _tool_result_id(m: Any) -> str:
     return str((getattr(m, "metadata", {}) or {}).get("tool_call_id") or "")
 
 
-def _truncate_payload(payload: Any, cap: int = TOOL_RESULT_BYTE_CAP) -> Any:
+def _truncate_payload(payload: Any, cap: int = DEFAULT_TOOL_RESULT_BYTE_CAP) -> Any:
+    """
+    Cap a tool result payload to `cap` bytes of JSON.
+
+    Preserves the head AND the tail of every long string field, so the
+    model sees the beginning (imports, signatures) and the end (output,
+    trace) of the value. Adds a `_truncated` marker and a hint so the
+    model knows it is looking at a partial payload.
+    """
     if not isinstance(payload, dict):
         try:
             payload = {"success": True, "result": payload}
         except Exception:
             return {"success": False, "error": "unserializable tool result"}
+
     try:
         encoded = json.dumps(payload, default=str)
     except Exception:
         return {"success": False, "error": "tool result not JSON-serializable"}
-    if len(encoded.encode("utf-8")) <= cap:
+
+    original_bytes = len(encoded.encode("utf-8"))
+    if original_bytes <= cap:
         return payload
 
     trimmed = dict(payload)
+
+    # Preserve small non-string fields verbatim (success, exit_code, ...).
+    # Only the string payloads are candidates for trimming.
     big_keys = sorted(
         (k for k, v in trimmed.items() if isinstance(v, str)),
         key=lambda k: len(trimmed[k]),
         reverse=True,
     )
+
+    # Reserve half the cap for the biggest fields; if there are several,
+    # the loop will re-try with a smaller budget per field.
+    target = max(512, cap // 2)
+
     for k in big_keys:
         s = trimmed[k]
-        if len(s.encode("utf-8")) <= cap // 2:
+        s_bytes = len(s.encode("utf-8"))
+        if s_bytes <= target:
             continue
-        trimmed[k] = s.encode("utf-8")[-(cap // 2):].decode("utf-8", errors="replace")
+
+        # Slice by CHARACTERS to avoid cutting a UTF-8 sequence.
+        # Assume ≤ 4 bytes per char as a safe lower bound on chars.
+        max_chars = max(128, target // 4)
+        head_chars = max_chars // 2
+        tail_chars = max_chars - head_chars
+
+        head = s[:head_chars]
+        tail = s[-tail_chars:] if len(s) > head_chars + tail_chars else ""
+
+        # Shrink head/tail until the byte length fits the target.
+        while len((head + tail).encode("utf-8")) > target and (len(head) > 1 or len(tail) > 1):
+            if len(head) > len(tail):
+                head = head[: max(1, len(head) // 2)]
+            else:
+                tail = tail[len(tail) // 4 :] if len(tail) > 1 else ""
+
+        marker = "\n… [truncated] …\n"
+        trimmed[k] = head + marker + tail
         trimmed["_truncated"] = True
+        trimmed["_truncated_hint"] = (
+            f"Original field '{k}' was {s_bytes} bytes; only the first and "
+            f"last portions are shown. Re-read with a byte range or use "
+            f"grep/find to locate the specific section if you need the "
+            f"middle."
+        )
         try:
             if len(json.dumps(trimmed, default=str).encode("utf-8")) <= cap:
                 return trimmed
         except Exception:
             pass
+
     return trimmed
 
 
@@ -274,16 +350,8 @@ def _estimate_msg_tokens(cm: Any) -> int:
 def _interleave_systems_and_selected(
     messages: List[Any], selected: List[Any]
 ) -> List[Any]:
-    """
-    Return messages in the correct order for the provider.
-
-    [M1] System messages are interleaved by timestamp with the selected
-    tail, not hoisted to the front. Hoisting made stale plan-guidance
-    system messages read like they were current framing.
-    """
     combined = list(messages) + list(selected)
     combined.sort(key=lambda m: getattr(m, "timestamp", 0))
-    # Deduplicate by identity, preserving order.
     seen = set()
     out: List[Any] = []
     for m in combined:
@@ -299,8 +367,9 @@ def get_model_messages(context_manager: Any, limit: int = 40_000) -> List[Messag
     Build provider messages from a token-budgeted tail of the conversation.
 
     [Bug 2] The count branch (limit < 500) never drops the newest turn.
-    If the newest group alone exceeds the limit, it is TRUNCATED to fit
-    rather than skipped.
+    [R5]    It also never SLICES the newest group. Slicing a tool-call
+            group separates the assistant tool_calls from their tool
+            results, and the provider rejects the resulting array.
     """
     repair_context(context_manager, fill_missing=True)
     messages = list(getattr(context_manager, "messages", []) or [])
@@ -318,8 +387,8 @@ def get_model_messages(context_manager: Any, limit: int = 40_000) -> List[Messag
             if len(selected) + len(g) > cap:
                 if selected:
                     break
-                # Never drop the newest turn: truncate it to fit.
-                selected[0:0] = g[-cap:]
+                # [R5] Never drop the newest turn AND never slice a group.
+                selected[0:0] = list(g)
                 break
             selected[0:0] = g
         return [
@@ -330,24 +399,14 @@ def get_model_messages(context_manager: Any, limit: int = 40_000) -> List[Messag
     # Token-budget walk.
     system_tokens = sum(_estimate_msg_tokens(m) for m in system)
     budget = max(0, limit - system_tokens)
-    selected = []
+    selected: List[Any] = []
     used = 0
     for g in reversed(groups):
         cost = sum(_estimate_msg_tokens(m) for m in g)
         if used + cost > budget:
             if not selected:
-                # Truncate the newest group to fit.
-                running = 0
-                keep: List[Any] = []
-                for m in reversed(g):
-                    mc = _estimate_msg_tokens(m)
-                    if running + mc > budget:
-                        break
-                    keep.insert(0, m)
-                    running += mc
-                if keep:
-                    selected[0:0] = keep
-                    used += running
+                # [R5] Keep the whole newest group intact.
+                selected[0:0] = list(g)
             break
         selected[0:0] = g
         used += cost
@@ -360,17 +419,34 @@ def get_model_messages(context_manager: Any, limit: int = 40_000) -> List[Messag
     ]
 
 
+# ----------------------------------------------------------------------
+# Writers
+# ----------------------------------------------------------------------
+
 async def add_tool_call(
     context_manager: Any, content: str | None, tool_calls: List[Any]
 ) -> None:
+    """
+    Persist an assistant turn with tool_calls.
+
+    Every tool_call id is guaranteed non-empty before it is written to
+    metadata, and the SAME id is written back onto the ToolCall object so
+    the matching `add_tool_result` uses the identical string.
+    """
     payload = []
     for call in tool_calls:
+        cid = getattr(call, "id", None) or f"call_{uuid.uuid4().hex[:12]}"
+        try:
+            call.id = cid
+        except Exception:
+            pass
+        args = getattr(call, "arguments", {}) or {}
         payload.append({
-            "id": call.id,
+            "id": cid,
             "type": "function",
             "function": {
-                "name": call.name,
-                "arguments": json.dumps(call.arguments, default=str),
+                "name": getattr(call, "name", "") or "",
+                "arguments": json.dumps(args, default=str),
             },
         })
     await context_manager.add_message(
@@ -380,10 +456,54 @@ async def add_tool_call(
     )
 
 
-async def add_tool_result(context_manager: Any, call: Any, result: Any) -> None:
-    payload = _truncate_payload(result)
+async def add_tool_result(
+    context_manager: Any,
+    call: Any,
+    result: Any,
+    context_window: int = 0,
+) -> None:
+    """
+    Persist a tool result.
+
+    The `tool_call_id` is taken from the call object as-is. If it is
+    missing (should not happen after `add_tool_call`), a fresh id is
+    generated so the message is still valid JSON — but the pairing with
+    the assistant turn will fail and `repair_context` will synthesize a
+    placeholder on the next read.
+
+    The size cap is computed from `context_window` so a 1M-token model
+    can receive payloads that are far larger than the 8 KB floor.
+    """
+    cid = getattr(call, "id", None)
+    if not cid:
+        cid = f"call_{uuid.uuid4().hex[:12]}"
+
+    cap = (
+        _calculate_tool_result_cap(context_window)
+        if context_window and context_window > 0
+        else DEFAULT_TOOL_RESULT_BYTE_CAP
+    )
+    payload = _truncate_payload(result, cap=cap)
+
     await context_manager.add_message(
         role="tool",
         content=json.dumps(payload, default=str),
-        metadata={"tool_call_id": call.id, "name": call.name},
+        metadata={
+            "tool_call_id": cid,
+            "name": getattr(call, "name", None),
+            "byte_cap": cap,
+        },
     )
+
+
+__all__ = [
+    "add_tool_call",
+    "add_tool_result",
+    "get_model_messages",
+    "repair_context",
+    "normalize_messages",
+    "group_messages",
+    "validate_group",
+    "DEFAULT_TOOL_RESULT_BYTE_CAP",
+    "_calculate_tool_result_cap",
+]

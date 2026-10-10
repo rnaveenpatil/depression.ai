@@ -3,14 +3,18 @@
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-<title>depression.ai — Terminal-native agentic AI</title>
-<meta name="description" content="depression.ai — agentic AI for developers: code, systems, analysis, and cloud deployment." />
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%23c3ccdd'/%3E%3Ctext x='16' y='22' font-family='monospace' font-size='18' font-weight='700' text-anchor='middle' fill='%230a0b0f'%3Ed%3C/text%3E%3C/svg%3E" />
+<title>DEPRESSION.AI</title>
+<meta name="description" content="DEPRESSION.AI — a terminal-native agentic AI harness that runs entirely on your own machine, uses the model of your choice (including a fully local one), executes real tasks end to end, and puts security and permissions first." />
+<meta property="og:title" content="DEPRESSION.AI" />
+<meta property="og:description" content="An agentic AI harness that reasons, plans and acts on real projects, tools and cloud infrastructure." />
 <style>
 :root{
   --bg:#07080d;--bg-soft:#0d0f18;--card:#12141f;
   --line:rgba(255,255,255,.08);--txt:#e8eaf2;--muted:#9aa0b5;
-  --brand:#7c5cff;--brand-2:#22d3ee;--brand-3:#f472b6;
-  --glow:0 0 60px rgba(124,92,255,.35);--radius:18px;
+  --brand:#dfe4ea;--brand-2:#a8b2bd;--brand-3:#6d7580;--lead:#c3ccdd;
+  --ok:#4ade80;
+  --glow:0 0 70px rgba(0,0,0,.55);--radius:18px;
   --mono:"SF Mono",ui-monospace,"JetBrains Mono",Menlo,Consolas,monospace;
   --sans:"Inter",-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
 }
@@ -18,9 +22,9 @@
 html{scroll-behavior:smooth}
 body{font-family:var(--sans);background:var(--bg);color:var(--txt);line-height:1.6;overflow-x:hidden;-webkit-font-smoothing:antialiased}
 body::before{content:"";position:fixed;inset:-30%;z-index:-2;filter:blur(30px);
-  background:radial-gradient(40% 40% at 20% 15%,rgba(124,92,255,.28),transparent 60%),
-             radial-gradient(35% 35% at 85% 20%,rgba(34,211,238,.20),transparent 60%),
-             radial-gradient(45% 45% at 60% 90%,rgba(244,114,182,.18),transparent 60%);
+  background:radial-gradient(45% 45% at 22% 12%,rgba(255,255,255,.06),transparent 62%),
+             radial-gradient(40% 40% at 82% 22%,rgba(255,255,255,.035),transparent 62%),
+             radial-gradient(55% 55% at 55% 92%,rgba(195,204,221,.055),transparent 66%);
   animation:drift 22s ease-in-out infinite alternate}
 body::after{content:"";position:fixed;inset:0;z-index:-1;pointer-events:none;
   background-image:linear-gradient(rgba(255,255,255,.035) 1px,transparent 1px),
@@ -33,24 +37,24 @@ body::after{content:"";position:fixed;inset:0;z-index:-1;pointer-events:none;
 header.nav{position:sticky;top:0;z-index:50;backdrop-filter:blur(14px);background:rgba(7,8,13,.6);border-bottom:1px solid var(--line)}
 .nav-inner{display:flex;align-items:center;justify-content:space-between;height:66px}
 .logo{display:flex;align-items:center;gap:10px;font-weight:700}
-.logo .dot{width:26px;height:26px;border-radius:8px;box-shadow:var(--glow);
-  background:conic-gradient(from 140deg,var(--brand),var(--brand-2),var(--brand-3),var(--brand))}
+.logo .dot{width:26px;height:26px;border-radius:8px;box-shadow:0 0 22px rgba(195,204,221,.45);
+  background:linear-gradient(135deg,#e6eaf2,#7b8496)}
 .logo span{font-family:var(--mono);font-size:15px}
 nav ul{display:flex;gap:26px;list-style:none}
 nav a{color:var(--muted);text-decoration:none;font-size:14px;transition:color .2s}
 nav a:hover{color:var(--txt)}
 .btn{display:inline-flex;align-items:center;gap:8px;padding:10px 18px;border-radius:12px;font-size:14px;font-weight:600;text-decoration:none;border:1px solid transparent;cursor:pointer;transition:transform .15s,box-shadow .2s,background .2s}
-.btn-primary{color:#fff;background:linear-gradient(135deg,var(--brand),#5b8cff);box-shadow:0 8px 30px rgba(124,92,255,.4)}
-.btn-primary:hover{transform:translateY(-2px);box-shadow:0 12px 40px rgba(124,92,255,.55)}
+.btn-primary{color:#0b0d13;background:linear-gradient(135deg,#f4f7fa,#c6cdd7);box-shadow:0 10px 34px rgba(0,0,0,.6)}
+.btn-primary:hover{transform:translateY(-2px);box-shadow:0 16px 46px rgba(0,0,0,.72)}
 .btn-ghost{color:var(--txt);border-color:var(--line);background:rgba(255,255,255,.03)}
 .btn-ghost:hover{background:rgba(255,255,255,.07)}
 .hero{padding:96px 0 70px;text-align:center}
 .badge{display:inline-flex;align-items:center;gap:8px;font-size:12.5px;font-family:var(--mono);color:var(--muted);border:1px solid var(--line);border-radius:999px;padding:7px 14px;margin-bottom:26px;background:rgba(255,255,255,.03)}
-.badge .pulse{width:8px;height:8px;border-radius:50%;background:#4ade80;animation:pulse 2s infinite}
+.badge .pulse{width:8px;height:8px;border-radius:50%;background:var(--ok);animation:pulse 2s infinite}
 @keyframes pulse{0%{box-shadow:0 0 0 0 rgba(74,222,128,.55)}70%{box-shadow:0 0 0 10px rgba(74,222,128,0)}100%{box-shadow:0 0 0 0 rgba(74,222,128,0)}}
 h1{font-size:clamp(2.4rem,6vw,4.3rem);line-height:1.05;font-weight:800;letter-spacing:-.03em}
-h1 .grad{background:linear-gradient(120deg,var(--brand-2),var(--brand),var(--brand-3));-webkit-background-clip:text;background-clip:text;color:transparent}
-.sub{max-width:660px;margin:22px auto 0;color:var(--muted);font-size:clamp(1rem,2vw,1.2rem)}
+h1 .grad{background:linear-gradient(120deg,#ffffff,#a7b0bd);-webkit-background-clip:text;background-clip:text;color:transparent}
+.sub{max-width:680px;margin:22px auto 0;color:var(--muted);font-size:clamp(1rem,2vw,1.2rem)}
 .cta{display:flex;gap:14px;justify-content:center;flex-wrap:wrap;margin-top:36px}
 .term{max-width:820px;margin:64px auto 0;border:1px solid var(--line);border-radius:var(--radius);
   background:linear-gradient(180deg,var(--card),var(--bg-soft));
@@ -60,34 +64,121 @@ h1 .grad{background:linear-gradient(120deg,var(--brand-2),var(--brand),var(--bra
 .r{background:#ff5f57}.y{background:#febc2e}.g{background:#28c840}
 .term-bar .title{margin-left:10px;font-family:var(--mono);font-size:12px;color:var(--muted)}
 .term-body{padding:20px 22px;font-family:var(--mono);font-size:13.5px;line-height:1.95;white-space:pre-wrap}
-.prompt{color:var(--brand-2)}.cmd{color:#fff}.ok{color:#4ade80}.dim{color:var(--muted)}
+.prompt{color:var(--brand-2)}.cmd{color:#fff}.ok{color:var(--ok)}.dim{color:var(--muted)}
 .cursor{display:inline-block;width:8px;height:15px;background:var(--brand-2);vertical-align:-2px;animation:blink 1.1s step-end infinite}
 @keyframes blink{50%{opacity:0}}
+/* stats strip */
+.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:1px;margin-top:56px;
+  border:1px solid var(--line);border-radius:var(--radius);overflow:hidden;background:var(--line)}
+.stat{background:rgba(255,255,255,.02);padding:22px 18px;text-align:center}
+.stat b{display:block;font-size:1.6rem;font-weight:800;letter-spacing:-.02em;
+  background:linear-gradient(120deg,#ffffff,#98a2b0);-webkit-background-clip:text;background-clip:text;color:transparent}
+.stat span{font-family:var(--mono);font-size:11.5px;letter-spacing:.08em;text-transform:uppercase;color:var(--muted)}
 section{padding:90px 0}
 .eyebrow{font-family:var(--mono);font-size:12.5px;letter-spacing:.18em;text-transform:uppercase;color:var(--brand-2);margin-bottom:14px}
 h2{font-size:clamp(1.8rem,4vw,2.6rem);font-weight:800;letter-spacing:-.02em;line-height:1.15}
-.lead{color:var(--muted);max-width:620px;margin-top:14px}
+.lead{color:var(--muted);max-width:640px;margin-top:14px}
 .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(250px,1fr));gap:20px;margin-top:44px}
 .card{position:relative;border:1px solid var(--line);border-radius:var(--radius);padding:26px;background:linear-gradient(180deg,var(--card),rgba(13,15,24,.6));transition:transform .25s,border-color .25s,box-shadow .25s}
-.card:hover{transform:translateY(-6px);border-color:rgba(124,92,255,.5);box-shadow:0 20px 50px rgba(0,0,0,.5)}
+.card:hover{transform:translateY(-6px);border-color:rgba(255,255,255,.22);box-shadow:0 24px 56px rgba(0,0,0,.68)}
 .card .ic{width:42px;height:42px;border-radius:12px;display:grid;place-items:center;font-size:20px;margin-bottom:16px;
-  background:linear-gradient(135deg,rgba(124,92,255,.25),rgba(34,211,238,.18));border:1px solid var(--line)}
+  background:linear-gradient(135deg,rgba(255,255,255,.09),rgba(255,255,255,.03));border:1px solid var(--line)}
 .card h3{font-size:1.05rem;margin-bottom:8px}
 .card p{color:var(--muted);font-size:14.5px}
+.card code{font-family:var(--mono);font-size:12.5px;color:var(--lead);background:rgba(195,204,221,.09);border:1px solid var(--line);border-radius:6px;padding:1px 5px}
 .steps{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:18px;margin-top:44px;counter-reset:s}
 .step{border:1px solid var(--line);border-radius:var(--radius);padding:24px;background:rgba(255,255,255,.02)}
 .step::before{counter-increment:s;content:"0" counter(s);font-family:var(--mono);font-size:13px;color:var(--brand-2);display:block;margin-bottom:12px}
 .step h3{font-size:1rem;margin-bottom:6px}.step p{color:var(--muted);font-size:14px}
+/* tool table */
+.tools{margin-top:40px;border:1px solid var(--line);border-radius:var(--radius);overflow:hidden}
+.tools table{width:100%;border-collapse:collapse;font-size:14px}
+.tools th{text-align:left;font-family:var(--mono);font-size:11.5px;letter-spacing:.1em;text-transform:uppercase;color:var(--muted);padding:14px 18px;background:rgba(255,255,255,.03);border-bottom:1px solid var(--line)}
+.tools td{padding:12px 18px;border-bottom:1px solid var(--line);vertical-align:top}
+.tools tr:last-child td{border-bottom:none}
+.tools tr:hover td{background:rgba(255,255,255,.045)}
+.tools td:first-child{font-family:var(--mono);color:var(--brand-2);white-space:nowrap;width:1%}
+.tools td:last-child{color:var(--muted)}
 .chips{display:flex;flex-wrap:wrap;gap:10px;margin-top:30px}
 .chip{font-family:var(--mono);font-size:12.5px;color:var(--muted);border:1px solid var(--line);border-radius:999px;padding:7px 14px;background:rgba(255,255,255,.02)}
-.chip:hover{color:var(--txt);border-color:rgba(124,92,255,.5)}
+.chip:hover{color:var(--txt);border-color:rgba(255,255,255,.3)}
+.cmds{display:flex;flex-wrap:wrap;gap:8px;margin-top:26px}
+kbd{font-family:var(--mono);font-size:12.5px;color:var(--txt);border:1px solid var(--line);border-radius:8px;padding:6px 10px;background:rgba(255,255,255,.03)}
+/* architecture flow */
+.flow{margin-top:44px;border:1px solid var(--line);border-radius:var(--radius);padding:28px;background:rgba(255,255,255,.02);font-family:var(--mono);font-size:13px;color:var(--muted);line-height:2;white-space:pre-wrap;overflow-x:auto}
+.flow b{color:var(--txt)}
+/* team */
+.team{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:28px;margin-top:48px}
+.member{position:relative;overflow:hidden;border:1px solid var(--line);border-radius:var(--radius);padding:38px 30px 32px;
+  background:linear-gradient(180deg,var(--card),rgba(13,15,24,.6));text-align:center;
+  transition:transform .25s ease,border-color .25s ease,box-shadow .25s ease}
+.member::before{content:"";position:absolute;inset:0 0 auto 0;height:3px;background:linear-gradient(90deg,rgba(255,255,255,.3),rgba(255,255,255,.03));opacity:.9}
+.member::after{content:"";position:absolute;width:240px;height:240px;top:-100px;right:-70px;border-radius:50%;
+  background:radial-gradient(circle,rgba(255,255,255,.055),transparent 68%);pointer-events:none}
+.member:hover{transform:translateY(-6px);border-color:rgba(255,255,255,.24);box-shadow:0 28px 64px rgba(0,0,0,.65)}
+.member .av{width:112px;height:112px;border-radius:50%;padding:3px;margin:0 auto 20px;display:grid;place-items:center;
+  background:conic-gradient(from 200deg,#e8ecf2,#939cad,#5b636f,#e8ecf2);box-shadow:0 14px 40px rgba(0,0,0,.6)}
+.member .av img{width:100%;height:100%;border-radius:50%;object-fit:cover;display:block;border:3px solid var(--card)}
+.member .av img+span{display:none}
+.member h3{font-size:1.24rem;margin-bottom:9px}
+/* leader card — dominant */
+.member.lead{grid-column:1/-1;justify-self:center;width:100%;max-width:840px;display:grid;grid-template-columns:auto 1fr;column-gap:42px;row-gap:8px;
+  text-align:left;align-items:center;padding:46px 50px;border-color:rgba(195,204,221,.34);
+  background:linear-gradient(135deg,rgba(195,204,221,.09),rgba(255,255,255,.02) 55%,var(--card));
+  box-shadow:0 30px 80px rgba(0,0,0,.6),inset 0 1px 0 rgba(255,255,255,.05)}
+.member.lead::before{background:linear-gradient(90deg,var(--lead),rgba(195,204,221,0));height:4px}
+.member.lead::after{width:460px;height:460px;top:-200px;right:-120px;background:radial-gradient(circle,rgba(195,204,221,.13),transparent 66%)}
+.member.lead:hover{border-color:rgba(195,204,221,.55);box-shadow:0 38px 96px rgba(0,0,0,.7)}
+.member.lead .av{grid-row:1/8;width:168px;height:168px;margin:0;align-self:center;
+  background:conic-gradient(from 160deg,#e4e9f2,var(--lead),#5b6472,#e4e9f2);box-shadow:0 22px 60px rgba(195,204,221,.3)}
+.member.lead .av img{border-width:4px}
+.member.lead h3{font-size:clamp(1.7rem,3vw,2.15rem);letter-spacing:-.02em;margin-bottom:6px}
+.member.lead .role{font-size:12.5px;color:var(--lead);letter-spacing:.14em;margin-bottom:12px}
+.member.lead p{max-width:640px;font-size:15.5px}
+.member.lead .links{justify-content:flex-start;border-top-color:rgba(195,204,221,.2)}
+.ribbon{position:absolute;top:22px;right:22px;font-family:var(--mono);font-size:11px;letter-spacing:.18em;
+  text-transform:uppercase;color:#0b0d13;background:linear-gradient(135deg,#eef1f6,var(--lead));
+  border-radius:999px;padding:6px 14px;box-shadow:0 10px 26px rgba(195,204,221,.28)}
+@media(max-width:760px){.member.lead{grid-template-columns:1fr;text-align:center;padding:38px 26px}
+  .member.lead .av{grid-row:auto;margin:0 auto 18px}.member.lead .links{justify-content:center}.ribbon{position:static;display:inline-block;margin-bottom:16px}}
+.member .role{font-family:var(--mono);font-size:11.5px;letter-spacing:.06em;text-transform:uppercase;color:var(--brand-2);margin-bottom:14px}
+.member p{color:var(--muted);font-size:14px}
+.member .links{display:flex;flex-wrap:wrap;justify-content:center;gap:10px;margin-top:20px;padding-top:18px;border-top:1px solid var(--line)}
+.member a{color:var(--txt);text-decoration:none;font-size:12.5px;font-family:var(--mono);border:1px solid var(--line);border-radius:999px;padding:7px 14px;background:rgba(255,255,255,.03);transition:color .2s,border-color .2s,background .2s}
+.member a:hover{text-decoration:none;color:var(--lead);border-color:rgba(195,204,221,.5);background:rgba(195,204,221,.08)}
+/* media / screenshots */
+.shot{max-width:1000px;margin:46px auto 0;border:1px solid var(--line);border-radius:var(--radius);overflow:hidden;
+  background:linear-gradient(180deg,var(--card),var(--bg-soft));box-shadow:0 30px 70px rgba(0,0,0,.55)}
+.shot img{display:block;width:100%;height:auto;aspect-ratio:1366/768;object-fit:contain;background:#0a0c12}
+.shot figcaption{font-family:var(--mono);font-size:12px;color:var(--muted);padding:13px 18px;border-top:1px solid var(--line)}
+.two{display:grid;grid-template-columns:repeat(auto-fit,minmax(310px,1fr));gap:22px;margin-top:44px;align-items:start}
+.det{border:1px solid var(--line);border-radius:var(--radius);padding:26px;background:rgba(255,255,255,.02)}
+.det h3{font-size:1rem;margin-bottom:14px}
+.det ul{list-style:none;display:grid;gap:10px}
+.det li{color:var(--muted);font-size:14px;padding-left:20px;position:relative}
+.det li::before{content:"\25B8";position:absolute;left:0;color:var(--brand-2)}
+.det li b{color:var(--txt);font-weight:600}
+.mit-logo{position:relative;overflow:hidden;display:flex;align-items:center;gap:42px;margin:40px 0 6px;padding:46px 52px;border:1px solid rgba(195,204,221,.26);border-radius:24px;
+  background:linear-gradient(135deg,rgba(195,204,221,.10),rgba(255,255,255,.025) 58%,var(--card));
+  box-shadow:0 34px 90px rgba(0,0,0,.62),inset 0 1px 0 rgba(255,255,255,.05);transition:border-color .25s,box-shadow .25s,transform .25s}
+.mit-logo::after{content:"";position:absolute;inset:0 0 auto 0;height:4px;background:linear-gradient(90deg,var(--lead),rgba(195,204,221,0))}
+.mit-logo:hover{transform:translateY(-3px);border-color:rgba(195,204,221,.45);box-shadow:0 40px 100px rgba(0,0,0,.7)}
+.mit-logo img{height:150px;width:auto;display:block;filter:drop-shadow(0 14px 34px rgba(0,0,0,.6))}
+.mit-logo div{display:grid;gap:10px}
+.mit-logo strong{font-size:clamp(1.4rem,2.6vw,2rem);line-height:1.24;letter-spacing:-.02em}
+.mit-logo span{font-family:var(--mono);font-size:13.5px;color:var(--muted);line-height:1.65}
+.mit-link{font-family:var(--mono);font-size:12.5px;color:var(--lead);text-decoration:none;border-bottom:1px dashed rgba(195,204,221,.45);width:max-content}
+.mit-link:hover{color:var(--txt);border-bottom-color:rgba(255,255,255,.45)}
+@media(max-width:720px){.mit-logo{flex-direction:column;text-align:center;gap:20px;padding:30px 22px}.mit-logo img{height:104px}.mit-logo .mit-link{width:auto}}
 .final{text-align:center;border-top:1px solid var(--line);padding:100px 0}
 .final h2{max-width:720px;margin:0 auto}
 footer{border-top:1px solid var(--line);padding:34px 0;color:var(--muted);font-size:13.5px}
 .foot-inner{display:flex;justify-content:space-between;gap:16px;flex-wrap:wrap;align-items:center}
 .reveal{opacity:0;transform:translateY(24px);transition:opacity .7s ease,transform .7s ease}
 .reveal.in{opacity:1;transform:none}
-@media(max-width:640px){nav ul{display:none}}
+@media(max-width:640px){nav ul{display:none}.tools table{font-size:13px}}
+.pypi a{color:var(--brand-2);text-decoration:underline;text-underline-offset:3px}
+.pypi a:hover{color:#fff}
 </style>
 </head>
 <body>
@@ -95,8 +186,14 @@ footer{border-top:1px solid var(--line);padding:34px 0;color:var(--muted);font-s
   <div class="wrap nav-inner">
     <div class="logo"><span class="dot"></span><span>depression.ai</span></div>
     <nav><ul>
+      <li><a href="#why">Why</a></li>
+      <li><a href="#tasks">What it does</a></li>
       <li><a href="#capabilities">Capabilities</a></li>
-      <li><a href="#how">How it works</a></li>
+      <li><a href="#aws">AWS</a></li>
+      <li><a href="#security">Security</a></li>
+      <li><a href="#sovereign">Self-hosted</a></li>
+      <li><a href="#architecture">Architecture</a></li>
+      <li><a href="#team">Team</a></li>
       <li><a href="#start">Get started</a></li>
     </ul></nav>
     <a class="btn btn-primary" href="#start">Install CLI</a>
@@ -104,9 +201,9 @@ footer{border-top:1px solid var(--line);padding:34px 0;color:var(--muted);font-s
 </header>
 
 <div class="wrap hero">
-  <div class="badge"><span class="pulse"></span> v0.1 · agent runtime online</div>
+  <div class="badge"><span class="pulse"></span> v1.1.0 · agent runtime online · MIT license</div>
   <h1>Agentic AI that <span class="grad">gets work done</span><br/>in your terminal.</h1>
-  <p class="sub">depression.ai is a terminal-native agent for developers and technical operators. It reasons, plans, and acts on real projects — reading code, running tools, inspecting cloud infrastructure, and shipping changes.</p>
+  <p class="sub">depression.ai is a terminal-native agentic AI harness for developers, system operators and cloud engineers. It reasons, plans and acts on real projects — reading code, running tools, managing AWS infrastructure and shipping verified changes.</p>
   <div class="cta">
     <a class="btn btn-primary" href="#start">Get started →</a>
     <a class="btn btn-ghost" href="#capabilities">Explore capabilities</a>
@@ -116,46 +213,357 @@ footer{border-top:1px solid var(--line);padding:34px 0;color:var(--muted);font-s
     <div class="term-bar"><i class="r"></i><i class="y"></i><i class="g"></i><span class="title">~/depression.ai — zsh</span></div>
     <div class="term-body"><span class="prompt">$</span> <span class="cmd">depression "analyze the repo and fix the failing tests"</span>
 <span class="dim">→ scanning project context…</span>
-<span class="ok">✓</span> 42 files indexed · 3 failing tests found
-<span class="dim">→ planning fix…</span>
+<span class="ok">✓</span> project indexed · source tree mapped
+<span class="dim">→ plan: search → terminal(pytest) → patch → terminal(pytest)</span>
 <span class="ok">✓</span> patched src/agent/context/manager.py
-<span class="ok">✓</span> all tests passing (18/18)
+<span class="ok">✓</span> pytest tests/ — suite passing
+<span class="prompt">$</span> <span class="cmd">/tools</span>
+<span class="dim">→ terminal · filesystem · git · patch · search · web · aws · mcp · todo · process</span>
 <span class="prompt">$</span> <span class="cursor"></span></div>
   </div>
+
+  <figure class="shot reveal">
+    <img src="https://raw.githubusercontent.com/rnaveenpatil/depression.ai/main/assets/tui.png" alt="depression.ai TUI" />
+    <figcaption>depression.ai — agent runtime for a software engineer and technical operator.</figcaption>
+  </figure>
+
+  <div class="stats">
+    <div class="stat"><b>v1.1.0</b><span>current release</span></div>
+    <div class="stat"><b>~49k</b><span>lines of Python</span></div>
+    <div class="stat"><b>13</b><span>core subsystems</span></div>
+    <div class="stat"><b>28+</b><span>built-in tools</span></div>
+    <div class="stat"><b>201</b><span>test functions</span></div>
+  </div>
 </div>
+
+<section id="why">
+  <div class="wrap">
+    <div class="reveal">
+      <div class="eyebrow">Why depression.ai</div>
+      <h2>Most AI tools give you answers.<br/>This one does the work &mdash; safely.</h2>
+      <p class="lead">An <b style="color:var(--txt)">agentic AI harness</b> is the layer that lets a language model actually <i>do</i> things: read your files, run commands, edit code, talk to cloud APIs and then check its own work. depression.ai is that layer. Everything else on the internet stops at a chat box; this one is built to be trusted inside a real company or a locked-down government network.</p>
+    </div>
+    <div class="grid">
+      <div class="card reveal"><div class="ic">&#128274;</div><h3>Security comes first, not last</h3><p>Every action the agent wants to take is classified by risk before it runs. You approve what matters. Nothing sensitive happens behind your back.</p></div>
+      <div class="card reveal"><div class="ic">&#127968;</div><h3>Runs entirely on your machine</h3><p>The agent, the tools, the sessions and the logs all live on your computer. Your code and your data never have to leave your network.</p></div>
+      <div class="card reveal"><div class="ic">&#129513;</div><h3>Any model &mdash; even a local one</h3><p>Use a cloud API, your company's private endpoint, or a model running on your own GPU. Same harness, your choice, swap any time with <code>/provider</code>.</p></div>
+      <div class="card reveal"><div class="ic">&#128065;</div><h3>You stay in control</h3><p>Two clear modes: <code>PLAN</code> reads and thinks, <code>BUILD</code> changes things. You choose when the agent is allowed to touch your system.</p></div>
+      <div class="card reveal"><div class="ic">&#128269;</div><h3>It proves its work</h3><p>The agent re-reads every change, re-runs the affected command and shows you the real output. No "done!" without evidence.</p></div>
+      <div class="card reveal"><div class="ic">&#8634;</div><h3>Mistakes are undoable</h3><p>Snapshots before risky steps, plus <code>/undo</code>, and sessions saved to SQLite so an interrupted run is never lost.</p></div>
+    </div>
+    <div class="det reveal" style="margin-top:34px">
+      <h3>Why this is different from a chatbot</h3>
+      <p style="color:var(--muted);font-size:14.5px;margin:0">A chatbot can only talk. It cannot open your repo, run your tests, or look at your AWS account. depression.ai wraps the model in a real working environment &mdash; tools, permissions, memory and recovery &mdash; so it can finish a job and hand you something verifiable. That combination of <b style="color:var(--txt)">reasoning + real tools + hard security rules</b> is what makes it genuinely useful instead of just impressive in a demo.</p>
+    </div>
+  </div>
+</section>
+
+<section id="tasks">
+  <div class="wrap">
+    <div class="reveal">
+      <div class="eyebrow">What it can do</div>
+      <h2>You describe the task in plain English.<br/>It does the job.</h2>
+      <p class="lead">There is no special syntax to learn. Write it the way you would ask a colleague &mdash; the agent works out the steps, picks the right tools and reports back with the evidence.</p>
+    </div>
+
+    <div class="term reveal" style="max-width:900px">
+      <div class="term-bar"><i class="r"></i><i class="y"></i><i class="g"></i><span class="title">real tasks, real work</span></div>
+      <div class="term-body"><span class="prompt">$</span> <span class="cmd">depression "why is the payments service returning 500s since yesterday's deploy?"</span>
+<span class="dim">&#8594; reading logs, recent commits and config&#8230;</span>
+<span class="ok">&#10003;</span> found it: DB pool size lowered in commit a91f2c &#183; patched config, tests pass
+<span class="prompt">$</span> <span class="cmd">depression "add pagination to the users API and write tests for it"</span>
+<span class="ok">&#10003;</span> 3 files changed &#183; 6 new tests added &#183; suite green (48 passed)
+<span class="prompt">$</span> <span class="cmd">depression "our S3 bucket is public &mdash; lock it down and tell me what changed"</span>
+<span class="ok">&#10003;</span> block-public-access enabled &#183; policy updated &#183; before/after shown
+<span class="prompt">$</span> <span class="cmd">depression "scan this CSV for anomalies and summarise the top 5"</span>
+<span class="ok">&#10003;</span> analysed 120,480 rows &#183; report written to ./report.md
+<span class="prompt">$</span> <span class="cmd">depression "write the docs for the auth module and update the README"</span>
+<span class="ok">&#10003;</span> docs/auth.md created &#183; README section updated
+<span class="prompt">$</span> <span class="cmd">depression "run the app, click through signup and tell me where it breaks"</span>
+<span class="ok">&#10003;</span> browser opened &#183; 4 steps automated &#183; bug found at step 3 with screenshot
+<span class="prompt">$</span> <span class="cursor"></span></div>
+    </div>
+
+    <div class="two reveal">
+      <div class="det">
+        <h3>For developers</h3>
+        <ul>
+          <li>Understand a codebase you have never seen before</li>
+          <li>Find the cause of a failing test or a production error</li>
+          <li>Write a change, run the tests, fix what breaks, repeat</li>
+          <li>Refactor safely and review the diff before it lands</li>
+          <li>Write docs, README sections and release notes</li>
+          <li>Open a pull request and check the Git history for context</li>
+        </ul>
+      </div>
+      <div class="det">
+        <h3>For operators, analysts &amp; everyone else</h3>
+        <ul>
+          <li>Check infrastructure health and report what changed</li>
+          <li>Investigate a log file and explain the root cause in plain words</li>
+          <li>Clean, merge or analyse spreadsheets and CSV exports</li>
+          <li>Automate a repetitive task in the browser, end to end</li>
+          <li>Summarise long documents, tickets or email threads</li>
+          <li>Run the same verified procedure every time, with the same result</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+</section>
 
 <section id="capabilities">
   <div class="wrap">
     <div class="reveal">
       <div class="eyebrow">Capabilities</div>
       <h2>Built for real work, not demos.</h2>
-      <p class="lead">Every action is grounded in your actual project — files, tools, and infrastructure. No hand-waving, just results you can verify.</p>
+      <p class="lead">Every action is grounded in your actual project — files, tools and infrastructure. No hand-waving, just results you can verify.</p>
     </div>
     <div class="grid">
-      <div class="card reveal"><div class="ic">🧠</div><h3>Context-aware reasoning</h3><p>Understands your repo structure, dependencies, and conventions before it touches a single line.</p></div>
-      <div class="card reveal"><div class="ic">🛠️</div><h3>Tool use & execution</h3><p>Runs builds, tests, linters, and shell commands — then reads the output and adapts.</p></div>
-      <div class="card reveal"><div class="ic">☁️</div><h3>Cloud operations</h3><p>Inspects and manages AWS infrastructure directly, with credentials handled safely.</p></div>
-      <div class="card reveal"><div class="ic">📦</div><h3>Multi-step planning</h3><p>Decomposes complex goals into ordered actions and finishes the whole task, not just step one.</p></div>
-      <div class="card reveal"><div class="ic">🔍</div><h3>Verification-first</h3><p>Reads back every change and reruns affected commands before claiming success.</p></div>
-      <div class="card reveal"><div class="ic">⚡</div><h3>Terminal-native</h3><p>Lives where you work. No browser, no context switching, no friction.</p></div>
+      <div class="card reveal"><div class="ic">🧠</div><h3>Context-aware reasoning</h3><p>Understands your repo structure, dependencies and conventions before it touches a single line. Context compaction keeps long sessions coherent.</p></div>
+      <div class="card reveal"><div class="ic">🛠️</div><h3>Tool use &amp; execution</h3><p>Runs builds, tests, linters and shell commands — then reads the output and adapts. Terminal, patch and process tools included.</p></div>
+      <div class="card reveal"><div class="ic">☁️</div><h3>AWS operations</h3><p>Inspects and manages AWS infrastructure directly. Credentials are resolved from profiles, the <code>/aws</code> panel, or standard env vars — never printed.</p></div>
+      <div class="card reveal"><div class="ic">📦</div><h3>Multi-step planning</h3><p>Ships two explicit modes — <code>PLAN</code> and <code>BUILD</code> (toggle with Ctrl+P) — so the agent can design before it acts.</p></div>
+      <div class="card reveal"><div class="ic">🔐</div><h3>Permission system</h3><p>Risk-classified tool actions (safe / medium / dangerous) with per-category rules, auto-approve for low-risk work and an AWS read-only guard.</p></div>
+      <div class="card reveal"><div class="ic">🔍</div><h3>Verification-first</h3><p>Reads back every change and reruns affected commands before claiming success. Snapshots and <code>/undo</code> make changes reversible.</p></div>
+      <div class="card reveal"><div class="ic">🧩</div><h3>Plugins &amp; MCP</h3><p>Extend the runtime with plugins (project-local, user-global or built-in) and Model Context Protocol tool servers without touching the core.</p></div>
+      <div class="card reveal"><div class="ic">🏠</div><h3>Local &amp; self-hosted LLMs</h3><p>Bring your own model. OpenAI-compatible endpoints, custom base URLs and GPU-backed local inference are all supported.</p></div>
     </div>
   </div>
 </section>
 
-<section id="how">
+<section id="tools">
   <div class="wrap">
     <div class="reveal">
-      <div class="eyebrow">How it works</div>
+      <div class="eyebrow">Tool system</div>
+      <h2>One runtime, many capabilities.</h2>
+      <p class="lead">The LLM chooses which tools are relevant to the task, so a single agent architecture covers development, systems, analysis and the cloud.</p>
+    </div>
+    <div class="tools reveal">
+      <table>
+        <thead><tr><th>Tool</th><th>What it does</th></tr></thead>
+        <tbody>
+          <tr><td>terminal</td><td>Runs short-lived shell commands and captures stdout/stderr.</td></tr>
+          <tr><td>process</td><td>Starts and manages long-running processes and servers.</td></tr>
+          <tr><td>filesystem</td><td>Read, write, edit, list, move and stat files with structured results.</td></tr>
+          <tr><td>patch</td><td>Applies precise, reviewable edits to source files.</td></tr>
+          <tr><td>search</td><td>Content and pattern search across the workspace.</td></tr>
+          <tr><td>git</td><td>Inspects repository state, history and diffs.</td></tr>
+          <tr><td>web</td><td>Fetches pages and searches the web for current information.</td></tr>
+          <tr><td>browser</td><td>Drives a real browser (Playwright) for interactive pages.</td></tr>
+          <tr><td>aws</td><td>Inspects and manages AWS services via CLI and MCP presets.</td></tr>
+          <tr><td>mcp</td><td>Connects external Model Context Protocol tool servers.</td></tr>
+          <tr><td>task</td><td>Delegates work to sub-agents and roles.</td></tr>
+          <tr><td>todo</td><td>Tracks multi-step task state across a session.</td></tr>
+          <tr><td>diagnostics</td><td>Collects runtime health and environment information.</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <div class="chips reveal">
+      <span class="chip">Python 3.10+</span><span class="chip">Textual TUI</span><span class="chip">MCP</span>
+      <span class="chip">AWS</span><span class="chip">Git</span><span class="chip">Playwright</span>
+      <span class="chip">SQLite sessions</span><span class="chip">OpenAI-compatible</span><span class="chip">Local LLMs</span>
+      <span class="chip">macOS · Linux</span>
+    </div>
+  </div>
+</section>
+
+<section id="aws">
+  <div class="wrap">
+    <div class="reveal">
+      <div class="eyebrow">AWS, in plain English</div>
+      <h2>It can look at your cloud<br/>and tell you what is going on.</h2>
+      <p class="lead">Most people have no easy way to check what is running in their AWS account. depression.ai can log in with your existing credentials and answer real questions about it &mdash; then make a change if you ask.</p>
+    </div>
+    <div class="grid">
+      <div class="card reveal"><div class="ic">&#128202;</div><h3>See what you have</h3><p>List servers, databases, storage buckets and running jobs. Get a plain summary instead of clicking through five consoles.</p></div>
+      <div class="card reveal"><div class="ic">&#128176;</div><h3>Find what is wasting money</h3><p>Spot idle instances, oversized volumes and forgotten resources so you can shut them down and cut the bill.</p></div>
+      <div class="card reveal"><div class="ic">&#9888;&#65039;</div><h3>Spot security risks</h3><p>Notice a storage bucket left open to the world, a key older than it should be, or a setting that should never have been turned on.</p></div>
+      <div class="card reveal"><div class="ic">&#128295;</div><h3>Make the change</h3><p>Fix the problem, then show you exactly what changed before and after &mdash; with the command output as proof.</p></div>
+      <div class="card reveal"><div class="ic">&#128221;</div><h3>Understand logs &amp; errors</h3><p>Read your logs and explain a failure in normal words instead of a wall of timestamps and stack traces.</p></div>
+      <div class="card reveal"><div class="ic">&#128273;</div><h3>Uses your existing access</h3><p>Works through the credentials you already have &mdash; a profile, the <code>/aws</code> panel or standard environment variables. Keys are never printed.</p></div>
+    </div>
+    <div class="term reveal" style="max-width:900px">
+      <div class="term-bar"><i class="r"></i><i class="y"></i><i class="g"></i><span class="title">talking to your cloud</span></div>
+      <div class="term-body"><span class="prompt">$</span> <span class="cmd">depression "what is running in my AWS account right now?"</span>
+<span class="dim">&#8594; reading EC2, RDS, S3, Lambda&#8230;</span>
+<span class="ok">&#10003;</span> 4 servers (2 idle), 1 database, 3 buckets, 6 functions &mdash; summary below
+<span class="prompt">$</span> <span class="cmd">depression "which of my resources are costing the most?"</span>
+<span class="ok">&#10003;</span> top 3 found &#183; one idle server has been running for 41 days
+<span class="prompt">$</span> <span class="cmd">depression "is anything in my account publicly exposed?"</span>
+<span class="ok">&#10003;</span> 1 bucket is public &#183; suggested fix ready &#183; nothing changed yet
+<span class="prompt">$</span> <span class="cmd">depression "apply that fix and show me the change"</span>
+<span class="ok">&#10003;</span> applied &#183; before/after shown &#183; 0 other resources affected
+<span class="prompt">$</span> <span class="cursor"></span></div>
+    </div>
+    <p class="lead reveal" style="margin-top:22px">Under the hood the agent drives the AWS CLI and MCP-based AWS presets, so every action is a real, auditable API call &mdash; not a guess. Read-only checks run freely; anything that changes your account asks you first.</p>
+  </div>
+</section>
+
+<section id="security">
+  <div class="wrap">
+    <div class="reveal">
+      <div class="eyebrow">Security, by design</div>
+      <h2>Built to be trusted with<br/>things that actually matter.</h2>
+      <p class="lead">Giving an AI the ability to run commands on your machine is a serious decision. depression.ai is built around that fact: it assumes the agent should have to earn permission, and it is designed so a person stays in the loop for anything risky.</p>
+    </div>
+    <div class="two reveal">
+      <div class="det">
+        <h3>How it protects you</h3>
+        <ul>
+          <li><b>Risk classes</b> &mdash; every tool action is labelled safe, medium or dangerous before it runs</li>
+          <li><b>Approval prompts</b> &mdash; medium and dangerous actions ask you first; you can review before saying yes</li>
+          <li><b>Per-category rules</b> &mdash; set what the agent may do to files, the terminal and AWS, separately</li>
+          <li><b>Read-only AWS guard</b> &mdash; a setting that lets the agent inspect your cloud but never change it</li>
+          <li><b>No hidden secrets</b> &mdash; credentials are used, not displayed; API keys and tokens are never printed to the screen</li>
+          <li><b>Snapshots &amp; undo</b> &mdash; changes are reversible, so a bad step is not permanent</li>
+          <li><b>Nothing leaves your machine</b> unless you point it at a cloud model on purpose</li>
+        </ul>
+      </div>
+      <div class="det">
+        <h3>Who this is for</h3>
+        <ul>
+          <li><b>Companies</b> with private code that must not be uploaded to a public AI service</li>
+          <li><b>Government &amp; defence</b> teams working on networks with no outside internet access</li>
+          <li><b>Banks, healthcare &amp; other regulated industries</b> where data has to stay inside the building</li>
+          <li><b>Research &amp; labs</b> handling sensitive or unpublished data</li>
+          <li><b>Any team</b> that needs an audit trail of what the agent did and why</li>
+        </ul>
+      </div>
+    </div>
+    <div class="det reveal" style="margin-top:34px">
+      <h3>A harness you can justify</h3>
+      <p style="color:var(--muted);font-size:14.5px;margin:0">A plain chatbot gives you no control over what it does with your data and no record of what happened. depression.ai is the opposite: a <b style="color:var(--txt)">self-contained harness</b> where the model, the tools, the permissions and the session history all sit on your side of the fence. You decide which model it uses, which actions it may take, and you can see every step it took in the saved session. That is what makes it usable in an environment where "just trust it" is not an acceptable answer.</p>
+    </div>
+  </div>
+</section>
+
+<section id="sovereign">
+  <div class="wrap">
+    <div class="reveal">
+      <div class="eyebrow">Runs on your own machine</div>
+      <h2>Your code stays yours.<br/>Your model can be local too.</h2>
+      <p class="lead">depression.ai is not a website you log into. It is a program that runs on your own computer, inside your own network. If you want, the language model itself can run on your hardware as well &mdash; so the whole system works with the network cable unplugged.</p>
+    </div>
+    <div class="steps">
+      <div class="step reveal"><h3>Install locally</h3><p>One command installs the harness on your machine. There is no account to create and no data to hand over.</p></div>
+      <div class="step reveal"><h3>Pick your model</h3><p>Use a cloud provider, your company's private endpoint, or a model running on your own GPU. Swap any time with <code>/provider</code> and <code>/model</code>.</p></div>
+      <div class="step reveal"><h3>Keep everything in-house</h3><p>Your files, your sessions and your logs never leave your machine unless you deliberately choose a cloud model. Even then, only what the task needs is sent.</p></div>
+    </div>
+    <div class="chips reveal">
+      <span class="chip">Self-hosted</span><span class="chip">Offline-capable</span><span class="chip">Local / GPU models</span>
+      <span class="chip">OpenAI-compatible endpoints</span><span class="chip">Custom base URL</span><span class="chip">MIT licensed</span>
+    </div>
+  </div>
+</section>
+
+<section id="architecture">
+  <div class="wrap">
+    <div class="reveal">
+      <div class="eyebrow">Architecture</div>
       <h2>From intent to outcome in three moves.</h2>
+      <p class="lead">A clean separation between the agent loop, context management, model providers, permissions and the tool runtime.</p>
     </div>
     <div class="steps">
       <div class="step reveal"><h3>Understand</h3><p>The agent inspects your project and gathers exactly the context it needs.</p></div>
-      <div class="step reveal"><h3>Plan & act</h3><p>It decides the next concrete action and executes it with real tools.</p></div>
-      <div class="step reveal"><h3>Verify & report</h3><p>Results are checked against reality, then summarized with evidence.</p></div>
+      <div class="step reveal"><h3>Plan &amp; act</h3><p>It decides the next concrete action and executes it with real tools.</p></div>
+      <div class="step reveal"><h3>Verify &amp; report</h3><p>Results are checked against reality, then summarized with evidence.</p></div>
     </div>
-    <div class="chips reveal">
-      <span class="chip">Python</span><span class="chip">MCP</span><span class="chip">AWS</span>
-      <span class="chip">Git</span><span class="chip">npm · pip</span><span class="chip">macOS · Linux</span>
+    <div class="flow reveal"><b>src/agent/</b>
+├── main.py          entry point + CLI flags
+├── agent/           core reasoning loop
+├── context/         context assembly, runtime &amp; compaction
+├── llm/             provider adapters + runtime
+├── tools/           tool implementations + registry
+├── permissions/     risk rules, terminal / fs / aws guards
+├── mcp/             Model Context Protocol client + AWS presets
+├── plugins/         plugin discovery, loading &amp; registry
+├── session/         session lifecycle &amp; recovery
+├── storage/         SQLite persistence (sessions, messages, plans…)
+├── tui/             Textual terminal UI (widgets, themes, onboarding)
+├── cli/             command handling, input &amp; printing
+├── config/          layered configuration
+└── utils/           shared helpers</div>
+    <p class="lead reveal" style="margin-top:22px">Sessions, messages, plans, tool outputs and key/value state are persisted to SQLite, so a run survives interruptions and can be resumed with <code style="font-family:var(--mono);color:var(--brand-2)">--session &lt;id&gt;</code>.</p>
+
+    <div class="two reveal">
+      <div class="det">
+        <h3>PLAN agent vs BUILD agent</h3>
+        <ul>
+          <li><b>PLAN agent</b> &mdash; read &amp; analyze, plan tasks. Designs the approach without mutating anything.</li>
+          <li><b>BUILD agent</b> &mdash; execute tools, modify system. Carries the plan out against real files and infrastructure.</li>
+          <li>Both share one <b>tool system</b>: terminal, filesystem, git, patch, search, web, browser, AWS, MCP, todo &amp; process.</li>
+          <li>Toggle between the two at any time with <kbd>Ctrl + P</kbd>.</li>
+        </ul>
+      </div>
+      <div class="det">
+        <h3>What the agent actually does</h3>
+        <ul>
+          <li>Understand an unfamiliar codebase</li>
+          <li>Analyze bugs and failures</li>
+          <li>Plan implementation changes</li>
+          <li>Create and modify files</li>
+          <li>Run commands and tests, then debug failures</li>
+          <li>Review Git changes</li>
+          <li>Use browser automation and search the web</li>
+          <li>Work with MCP tools and tool servers</li>
+          <li>Inspect and operate supported AWS environments</li>
+          <li>Prepare applications for deployment, then verify the result</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="det reveal" style="margin-top:22px">
+      <h3>The execution loop</h3>
+      <div class="cmds" style="margin-top:0">
+        <kbd>Understand</kbd><kbd>Inspect</kbd><kbd>Plan</kbd><kbd>Choose tool</kbd><kbd>Execute</kbd>
+        <kbd>Observe result</kbd><kbd>Re-evaluate</kbd><kbd>Continue / correct</kbd><kbd>Verify</kbd><kbd>Report</kbd>
+      </div>
+      <p class="lead" style="margin-top:16px">The LLM supplies the reasoning. depression.ai supplies the environment around the model: context, tools, permissions, sessions, execution and recovery. A model with weak reasoning or unreliable tool calling can still produce poor results &mdash; quality depends on both parts.</p>
+    </div>
+  </div>
+</section>
+
+<section id="tui">
+  <div class="wrap">
+    <div class="reveal">
+      <div class="eyebrow">Terminal-native TUI</div>
+      <h2>Your whole workflow, one screen.</h2>
+      <p class="lead">Live tool calls, plan/build modes, cost and token metrics — all without leaving the terminal.</p>
+    </div>
+    <div class="cmds reveal">
+      <kbd>/help</kbd><kbd>/plan</kbd><kbd>/build</kbd><kbd>/auto</kbd><kbd>/snapshot</kbd><kbd>/undo</kbd>
+      <kbd>/model</kbd><kbd>/provider</kbd><kbd>/session</kbd><kbd>/compact</kbd><kbd>/tools</kbd>
+      <kbd>/permissions</kbd><kbd>/plugins</kbd><kbd>/metrics</kbd><kbd>/cost</kbd><kbd>/tokens</kbd>
+      <kbd>/config</kbd><kbd>/set</kbd><kbd>/exit</kbd>
+    </div>
+    <p class="lead reveal" style="margin-top:22px">Switch between <b style="color:var(--txt)">PLAN ↔ BUILD</b> at any time with <kbd>Ctrl + P</kbd>.</p>
+
+    <figure class="shot reveal">
+      <img src="https://raw.githubusercontent.com/rnaveenpatil/depression.ai/main/assets/tui.png" alt="depression.ai terminal-native TUI" loading="lazy" />
+      <figcaption>assets/tui.png — the terminal-native Textual TUI: live tool calls, PLAN ↔ BUILD modes, permissions and metrics in one screen.</figcaption>
+    </figure>
+
+    <div class="two reveal">
+      <div class="det">
+        <h3>Inside the TUI</h3>
+        <ul>
+          <li>Interactive conversation with tool-call cards and thinking indicators</li>
+          <li>PLAN / BUILD mode switching and permission prompts</li>
+          <li>LLM connection and AWS configuration panels</li>
+          <li>Todo tracking, diff inspection and agent execution feedback</li>
+          <li>Session management and project context, all in-terminal</li>
+        </ul>
+      </div>
+      <div class="det">
+        <h3>Workspace &amp; setup</h3>
+        <ul>
+          <li><b>Provider</b> — OpenAI-compatible APIs plus fully local, GPU-backed inference</li>
+          <li><b>Base URL</b> — point the runtime at any compatible endpoint</li>
+          <li><b>Session</b> — sessions, messages, plans and tool output persisted to SQLite</li>
+          <li><b>Recovery</b> — resume any run with <code>--session &lt;id&gt;</code> or start clean with <code>--new-session</code></li>
+          <li><b>AWS</b> — credentials from profiles, the <code>/aws</code> panel or env vars, never printed</li>
+        </ul>
+      </div>
     </div>
   </div>
 </section>
@@ -165,13 +573,98 @@ footer{border-top:1px solid var(--line);padding:34px 0;color:var(--muted);font-s
     <div class="reveal">
       <div class="eyebrow">Get started</div>
       <h2>Install and run in under a minute.</h2>
-      <p class="lead">Requires Python 3.10+. Credentials and cloud access are configured automatically.</p>
+      <p class="lead">Requires Python 3.10+. Configure your model provider on first launch; AWS access is configured through the <code style="font-family:var(--mono);color:var(--brand-2)">/aws</code> panel or standard credentials.</p>
     </div>
     <div class="term reveal" style="margin-top:40px">
       <div class="term-bar"><i class="r"></i><i class="y"></i><i class="g"></i><span class="title">install</span></div>
-      <div class="term-body"><span class="prompt">$</span> <span class="cmd">pip install depression-agent</span>
-<span class="prompt">$</span> <span class="cmd">depression --help</span>
+      <div class="term-body"><span class="prompt">$</span> <span class="cmd">pip install depression.ai</span>
+<span class="dim">&#8594; collecting depression.ai ... installed depression-ai 1.1.0</span>
+<span class="prompt">$</span> <span class="cmd">depression -p /path/to/project</span>
+<span class="dim">→ LLM CONNECTION · provider, base URL, API key, model</span>
 <span class="ok">✓</span> ready — describe your task in plain English.</div>
+    </div>
+    <p class="lead pypi reveal">Official package on PyPI: <a href="https://pypi.org/project/depression.ai/" target="_blank" rel="noopener">pypi.org/project/depression.ai</a> &nbsp;&middot;&nbsp; run the app with the <code style="font-family:var(--mono);color:var(--brand-2)">depression</code> command.</p>
+    <div class="chips reveal">
+      <span class="chip">depression -m MODEL</span><span class="chip">--provider PROVIDER</span>
+      <span class="chip">--new-session</span><span class="chip">--session &lt;id&gt;</span>
+      <span class="chip">--no-mcp</span><span class="chip">--max-turns N</span><span class="chip">--init-config</span>
+    </div>
+
+    <figure class="shot reveal">
+      <img src="https://raw.githubusercontent.com/rnaveenpatil/depression.ai/main/assets/llm_connect.png" alt="depression.ai LLM connection panel" loading="lazy" />
+      <figcaption>assets/llm_connect.png — first launch: pick the provider, base URL, API key and model, then describe the task in plain English.</figcaption>
+    </figure>
+
+    <div class="det reveal" style="margin-top:22px">
+      <h3>Requires Python 3.10+</h3>
+      <ul>
+        <li><b>Interfaces</b> — Textual TUI, plus a scriptable CLI with model, provider and session flags</li>
+        <li><b>Tooling</b> — Git, Playwright browser automation, MCP servers, AWS CLI</li>
+        <li><b>Platforms</b> — macOS and Linux</li>
+        <li><b>License</b> — MIT</li>
+      </ul>
+    </div>
+  </div>
+</section>
+
+<section id="team">
+  <div class="wrap">
+    <div class="reveal">
+      <div class="eyebrow">Team &amp; context</div>
+      <h2>Built by Team Depression.</h2>
+      <p class="lead">An academic major project from the Department of Information Science &amp; Engineering (ISE) at Moodlakatte Institute of Technology (MIT), Kundapura — “a team that builds ON ETHICS.”</p>
+    </div>
+    <div class="mit-logo reveal">
+      <img src="https://raw.githubusercontent.com/rnaveenpatil/depression.ai/main/assets/mit_logo.png" alt="Moodlakatte Institute of Technology (MIT), Kundapura" loading="lazy" />
+      <div>
+        <strong>Moodlakatte Institute of Technology (MIT), Kundapura</strong>
+        <span>Department of Information Science &amp; Engineering (ISE) &middot; Major project, 2025&ndash;26</span>
+        <a class="mit-link" href="https://www.linkedin.com/company/mitkundapura/posts/" target="_blank" rel="noopener">linkedin.com/company/mitkundapura &rarr;</a>
+      </div>
+    </div>
+
+    <div class="team">
+      <div class="member lead reveal">
+        <span class="ribbon">Team Lead</span>
+        <div class="av"><img src="https://raw.githubusercontent.com/rnaveenpatil/depression.ai/main/assets/patil.png" alt="R Naveen Patil" loading="lazy" /></div>
+        <h3>R Naveen Patil</h3>
+        <div class="role">Lead Developer &middot; Project Founder</div>
+        <p>Owns the core architecture, the agentic workflow, LLM integration, the tool runtime and the cloud infrastructure — the entire depression.ai harness, end to end.</p>
+        <div class="links">
+          <a href="https://github.com/rnaveenpatil" target="_blank" rel="noopener">GitHub</a>
+          <a href="https://www.linkedin.com/in/r-naveen-patil-a45403292/" target="_blank" rel="noopener">LinkedIn</a>
+          <a href="https://rnaveenpatil-resume.netlify.app" target="_blank" rel="noopener">Portfolio</a>
+        </div>
+      </div>
+      <div class="member reveal">
+        <div class="av"><img src="https://raw.githubusercontent.com/rnaveenpatil/depression.ai/main/assets/rahul.jpeg" alt="Rahul Jadav" loading="lazy" /></div>
+        <h3>Rahul Jadav</h3>
+        <div class="role">Team Member</div>
+        <p>Major project contributor, ISE.</p>
+        <div class="links">
+          <a href="https://github.com/Rahul-Jadav-0" target="_blank" rel="noopener">GitHub</a>
+          <a href="https://www.linkedin.com/in/subzero91/" target="_blank" rel="noopener">LinkedIn</a>
+        </div>
+      </div>
+      <div class="member reveal">
+        <div class="av"><img src="https://raw.githubusercontent.com/rnaveenpatil/depression.ai/main/assets/meghasree.png" alt="K G Meghashree Naik" loading="lazy" /></div>
+        <h3>K G Meghashree Naik</h3>
+        <div class="role">Team Member</div>
+        <p>Major project contributor, ISE.</p>
+        <div class="links">
+          <a href="https://github.com/Meghashree-13" target="_blank" rel="noopener">GitHub</a>
+          <a href="https://www.linkedin.com/in/k-g-meghashree/" target="_blank" rel="noopener">LinkedIn</a>
+        </div>
+      </div>
+      <div class="member reveal">
+        <div class="av"><img src="https://raw.githubusercontent.com/rnaveenpatil/depression.ai/main/assets/sumantha.jpeg" alt="SUMANTHA MS" loading="lazy" /></div>
+        <h3>SUMANTHA MS</h3>
+        <div class="role">Team Member</div>
+        <p>Major project contributor, ISE.</p>
+        <div class="links">
+          <a href="https://www.linkedin.com/in/sumantha-ms-235ba2295/" target="_blank" rel="noopener">LinkedIn</a>
+        </div>
+      </div>
     </div>
   </div>
 </section>
@@ -186,7 +679,7 @@ footer{border-top:1px solid var(--line);padding:34px 0;color:var(--muted);font-s
 <footer>
   <div class="wrap foot-inner">
     <div class="logo"><span class="dot"></span><span>depression.ai</span></div>
-    <div>Terminal-native agentic AI · © 2026</div>
+    <div>Terminal-native agentic AI · MIT licensed · © 2026 Team Depression, MIT Kundapura</div>
   </div>
 </footer>
 

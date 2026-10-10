@@ -52,9 +52,8 @@ MODE_ORDER = ["build", "plan"]
 DEFAULT_TURN_TIMEOUT = 900.0
 DEFAULT_AWS_REGION = "us-east-1"
 
-_PANEL_NAMES = ("llm", "aws", "profile", "context", "llmcost", "help")
+_PANEL_NAMES = ("llm", "aws", "profile", "context", "llmcost", "todo", "help")
 
-# Tools whose calls should be diff-aware in the transcript.
 _DIFF_TOOLS = {"write", "edit", "apply_patch", "filesystem", "patch"}
 
 _PROMPT_MIN_ROWS = 1
@@ -96,14 +95,7 @@ def _shorten_path(path: str, max_len: int = 32) -> str:
 # ======================================================================
 
 class PromptArea(TextArea):
-    """
-    Soft-wrapping, auto-growing multiline prompt.
-
-    Textual's Input is single-line only. TextArea with `soft_wrap=True`
-    and `wrap_mode="none"` gives terminal-repl behaviour: text wraps,
-    the box grows up to _PROMPT_MAX_ROWS, Enter submits, Shift+Enter
-    (or Ctrl+J) inserts a newline.
-    """
+    """Soft-wrapping, auto-growing multiline prompt."""
 
     DEFAULT_CSS = f"""
     PromptArea {{
@@ -119,16 +111,9 @@ class PromptArea(TextArea):
         scrollbar-background: {BG};
         scrollbar-color: {BORDER};
     }}
-    PromptArea:focus {{
-        border: none;
-    }}
-    PromptArea .text-area--cursor {{
-        background: {GREEN};
-        color: {BG};
-    }}
-    PromptArea.busy {{
-        color: {AMBER};
-    }}
+    PromptArea:focus {{ border: none; }}
+    PromptArea .text-area--cursor {{ background: {GREEN}; color: {BG}; }}
+    PromptArea.busy {{ color: {AMBER}; }}
     """
 
     def __init__(self, **kwargs: Any) -> None:
@@ -166,8 +151,6 @@ class PromptArea(TextArea):
         self._resize()
 
     async def _on_key(self, event) -> None:
-        # Textual's Key event has no `.shift` attribute — modifiers are
-        # encoded into the `key` string. Compare against the full chord.
         key = event.key
 
         if key in ("shift+enter", "ctrl+j"):
@@ -200,8 +183,7 @@ class LLMPanel(Vertical):
     DEFAULT_CSS = f"""
     LLMPanel {{
         width: 100%; height: auto;
-        padding: 0 1;
-        background: {BG};
+        padding: 0 1; background: {BG};
     }}
     LLMPanel .label {{ color: {MUTED}; margin-top: 1; }}
     LLMPanel Input {{
@@ -248,8 +230,7 @@ class ContextPanel(Vertical):
     DEFAULT_CSS = f"""
     ContextPanel {{
         width: 100%; height: auto;
-        padding: 0 1;
-        background: {BG};
+        padding: 0 1; background: {BG};
     }}
     ContextPanel .ctx-value {{ color: {GREEN_GLOW}; height: 1; }}
     ContextPanel .ctx-bar   {{ height: 1; margin: 0 0 1 0; }}
@@ -301,6 +282,74 @@ class ContextPanel(Vertical):
 
 
 # ======================================================================
+# TODO PANEL — sidebar
+# ======================================================================
+
+class TodoPanel(Vertical):
+    """
+    Sidebar Todo panel.
+
+    Renders the checklist the loop emitted (via on_plan_created /
+    on_plan_rendered). Updates in place; not a separate view per turn.
+    """
+
+    DEFAULT_CSS = f"""
+    TodoPanel {{
+        width: 100%; height: auto;
+        padding: 0 1; background: {BG};
+    }}
+    TodoPanel .hint {{ color: {MUTED}; margin-top: 1; }}
+    """
+
+    def __init__(self, app_ref: "DepressionApp", **kwargs: Any):
+        super().__init__(**kwargs)
+        self._app = app_ref
+        self._entries: list[dict] = []
+
+    def compose(self) -> ComposeResult:
+        yield Static(f"[bold {GREEN}]▌ TODO[/]", markup=True)
+        yield Static("[{MUTED}]— no active plan —[/]",
+                     id="todo-body", markup=True)
+        yield Static("updates as the agent works",
+                     classes="hint")
+
+    def set_entries(self, entries: list[dict]) -> None:
+        if not entries:
+            return
+        self._entries = entries
+        try:
+            self.query_one("#todo-body", Static).update(
+                self._render(entries)
+            )
+        except Exception:
+            pass
+
+    @staticmethod
+    def _render(entries: list[dict]) -> str:
+        icons = {
+            "completed": f"[{GREEN}]✓[/]",
+            "in_progress": f"[{AMBER}]▸[/]",
+            "pending": f"[{DIM}]○[/]",
+            "failed": f"[{ERROR}]✗[/]",
+            "skipped": f"[{DIM}]—[/]",
+        }
+        out = []
+        for e in entries:
+            content = str(e.get("content") or e.get("description") or "")
+            status = str(e.get("status") or "pending").lower()
+            icon = icons.get(status, f"[{DIM}]○[/]")
+            if status == "completed":
+                out.append(f"  {icon} [{MUTED}]{_esc(content)}[/]")
+            elif status == "in_progress":
+                out.append(f"  {icon} [bold {TEXT}]{_esc(content)}[/]")
+            elif status == "failed":
+                out.append(f"  {icon} [{ERROR}]{_esc(content)}[/]")
+            else:
+                out.append(f"  {icon} [{TEXT}]{_esc(content)}[/]")
+        return "\n".join(out)
+
+
+# ======================================================================
 # LLM COST PANEL
 # ======================================================================
 
@@ -308,8 +357,7 @@ class LLMCostPanel(Vertical):
     DEFAULT_CSS = f"""
     LLMCostPanel {{
         width: 100%; height: auto;
-        padding: 0 1;
-        background: {BG};
+        padding: 0 1; background: {BG};
     }}
     LLMCostPanel .label  {{ color: {MUTED}; height: 1; }}
     LLMCostPanel .value  {{ color: {TEXT}; height: 1; }}
@@ -550,19 +598,12 @@ class LLMCostPanel(Vertical):
 # ======================================================================
 
 class HelpPanel(Vertical):
-    """
-    Static help panel.
-
-    Takes no app reference — its content is fixed. Passing the app as a
-    positional argument would forward it to Vertical.__init__ as a child
-    widget and raise TypeError. Only `id=` should be passed.
-    """
+    """Static help panel."""
 
     DEFAULT_CSS = f"""
     HelpPanel {{
         width: 100%; height: auto;
-        padding: 0 1;
-        background: {BG};
+        padding: 0 1; background: {BG};
     }}
     HelpPanel .help-section {{ color: {GREEN}; text-style: bold; margin: 1 0 0 0; }}
     HelpPanel .help-row     {{ color: {TEXT}; }}
@@ -578,9 +619,11 @@ class HelpPanel(Vertical):
         yield Static("/model     open LLM panel + discover models", classes="help-row")
         yield Static("/models    discover models", classes="help-row")
         yield Static("/aws       open AWS panel", classes="help-row")
-        yield Static("/profile   open profile panel (signed-in user)", classes="help-row")
+        yield Static("/profile   open profile panel", classes="help-row")
         yield Static("/context   open context panel", classes="help-row")
         yield Static("/llmcost   open token + api cost panel", classes="help-row")
+        yield Static("/todo      open todo panel", classes="help-row")
+        yield Static("/run CMD   run a shell command and show output", classes="help-row")
         yield Static("/plan      switch mode → plan", classes="help-row")
         yield Static("/build     switch mode → build", classes="help-row")
         yield Static("/clear     clear transcript", classes="help-row")
@@ -591,13 +634,11 @@ class HelpPanel(Vertical):
         yield Static("Ctrl+J     newline (fallback)", classes="help-row")
         yield Static("Tab        focus prompt / cycle mode", classes="help-row")
         yield Static("Ctrl+B     show / hide the sidebar", classes="help-row")
-        yield Static("Esc        interrupt running agent (also denies modal)", classes="help-row")
+        yield Static("Esc        interrupt running agent", classes="help-row")
         yield Static("e          expand / collapse the last tool block", classes="help-row")
         yield Static("Ctrl+L     clear transcript", classes="help-row")
         yield Static("Ctrl+C     interrupt if busy, quit if idle", classes="help-row")
         yield Static("Ctrl+Q     quit", classes="help-row")
-        yield Static("Ctrl+D     quit", classes="help-row")
-        yield Static("y/a/n/d    allow / deny in the modal", classes="help-row")
 
 
 # ======================================================================
@@ -819,7 +860,6 @@ class DepressionApp(App):
         self._is_shutting_down = False
         self._has_messages = False
 
-        # One PlanView per conversation; re-rendered in place.
         self._plan_view: Optional[PlanView] = None
         self._plan_signature: Optional[tuple] = None
 
@@ -855,7 +895,7 @@ class DepressionApp(App):
                     ("profile", ProfilePanel(id="panel-profile")),
                     ("context", ContextPanel(self, id="panel-context")),
                     ("llmcost", LLMCostPanel(self, id="panel-llmcost")),
-                    # HelpPanel is static — do NOT pass `self`.
+                    ("todo", TodoPanel(self, id="panel-todo")),
                     ("help", HelpPanel(id="panel-help")),
                 ],
                 id="sidebar",
@@ -1029,11 +1069,9 @@ class DepressionApp(App):
             self._events.set_ui_loop(asyncio.get_running_loop())
             self._events.attach(self.coordinator)
             self._events.subscribe("on_tool_executed", self._on_tool_event)
-            # loop.py fires both on_plan_created and on_plan_updated.
-            # Subscribe to both so the checklist renders from the structured
-            # payload.
             self._events.subscribe("on_plan_updated", self._on_plan_updated)
             self._events.subscribe("on_plan_created", self._on_plan_created)
+            self._events.subscribe("on_plan_rendered", self._on_plan_rendered)
             self._event_handlers_registered = True
         except Exception as exc:
             self._error(f"event wiring failed: {exc}")
@@ -1119,8 +1157,6 @@ class DepressionApp(App):
         await transcript.mount(widget)
         widget.set_running(execution_time=duration)
 
-        # [Diff honesty] Do NOT read from disk here — the tool has already
-        # run, so a read-back would return the post-mutation content.
         if isinstance(result, dict) and tool in _DIFF_TOOLS:
             result = self._shape_diff_payload(tool, params, result)
 
@@ -1148,11 +1184,6 @@ class DepressionApp(App):
 
     @staticmethod
     def _shape_diff_payload(tool: str, params: dict, result: dict) -> dict:
-        """
-        Build a diff payload ONLY from the tool's own report.
-        Never reads disk. Never invents a side. If either side is missing,
-        no diff will be rendered.
-        """
         r = dict(result)
 
         before = None
@@ -1187,10 +1218,6 @@ class DepressionApp(App):
     # ------------------------------------------------------------------
 
     async def _on_plan_created(self, event: AgentEvent) -> None:
-        """
-        loop.py fires this when the planner produces a multi-step plan,
-        before any task runs. Render the initial checklist here.
-        """
         if self._is_shutting_down:
             return
         data = event.payload or {}
@@ -1216,6 +1243,7 @@ class DepressionApp(App):
 
         self._show_transcript()
         await self._upsert_plan(entries)
+        self._update_todo_panel(entries)
 
     async def _on_plan_updated(self, event: AgentEvent) -> None:
         if self._is_shutting_down:
@@ -1225,15 +1253,33 @@ class DepressionApp(App):
         render_inline = bool(data.get("render", True))
         if not entries:
             return
-        if not render_inline:
-            return
 
         normalised = self._normalise_plan_entries(entries)
         if not normalised:
             return
 
+        self._update_todo_panel(normalised)
+
+        if not render_inline:
+            return
         self._show_transcript()
         await self._upsert_plan(normalised)
+
+    async def _on_plan_rendered(self, event: AgentEvent) -> None:
+        """
+        Unified plan event. Fires for both structured plans and checklists
+        parsed out of the model's text. Feeds the sidebar Todo panel.
+        """
+        if self._is_shutting_down:
+            return
+        data = event.payload or {}
+        entries = data.get("entries") or []
+        if not entries:
+            return
+        normalised = self._normalise_plan_entries(entries)
+        if not normalised:
+            return
+        self._update_todo_panel(normalised)
 
     @staticmethod
     def _normalise_plan_entries(entries: list) -> list:
@@ -1257,11 +1303,13 @@ class DepressionApp(App):
             })
         return out
 
+    def _update_todo_panel(self, entries: list) -> None:
+        try:
+            self.query_one("#panel-todo", TodoPanel).set_entries(entries)
+        except Exception:
+            pass
+
     async def _upsert_plan(self, normalised: list) -> None:
-        """
-        Mount a PlanView once, then mutate it in place. Signature guard
-        prevents re-renders when nothing has changed.
-        """
         sig = tuple((e["content"][:80], e["status"]) for e in normalised)
         if sig == self._plan_signature:
             return
@@ -1595,7 +1643,6 @@ class DepressionApp(App):
     # INPUT / COMMANDS
     # ------------------------------------------------------------------
 
-    # Called by PromptArea when Enter is pressed without Shift.
     def submit_prompt_text(self, text: str) -> None:
         text = (text or "").strip()
         if not text:
@@ -1626,7 +1673,10 @@ class DepressionApp(App):
         self._agent_worker = self._run_agent(text)
 
     def _slash(self, text: str) -> None:
-        command = text.split()[0].lower()
+        parts = text.split(maxsplit=1)
+        command = parts[0].lower()
+        arg = parts[1] if len(parts) > 1 else ""
+
         if command == "/aws":
             self._show_panel("aws")
             try:
@@ -1648,8 +1698,13 @@ class DepressionApp(App):
             self._show_panel("context")
         elif command == "/llmcost":
             self._show_panel("llmcost")
+        elif command == "/todo":
+            self._show_panel("todo")
+            self._dump_todos()
         elif command == "/help":
             self._show_panel("help")
+        elif command == "/run":
+            self._run_shell(arg)
         elif command == "/clear":
             try:
                 self.query_one("#transcript", VerticalScroll).remove_children()
@@ -1679,6 +1734,44 @@ class DepressionApp(App):
             self.exit()
         else:
             self._error(f"unknown command: {command}")
+
+    def _dump_todos(self) -> None:
+        try:
+            from agent.tools.todo import TodoTool
+        except Exception:
+            self._system("TodoTool not available")
+            return
+        session = self._session()
+        sid = TodoTool._session_key(session)
+        store = TodoTool._strong_keys.get(sid) or {}
+        if not store:
+            self._system("(todo list is empty)")
+            return
+        self._system("todo list:")
+        for item in store.values():
+            status = getattr(item, "status", "pending")
+            title = getattr(item, "title", "?")
+            self._write(f"  [{status}] {title}", "system")
+
+    def _run_shell(self, cmd: str) -> None:
+        if not cmd:
+            self._error("usage: /run <command>")
+            return
+        self._system(f"$ {cmd}")
+        try:
+            import subprocess
+            proc = subprocess.run(
+                cmd, shell=True, capture_output=True, text=True, timeout=30,
+            )
+            if proc.stdout:
+                for line in proc.stdout.splitlines():
+                    self._write(f"  {line}", "agent")
+            if proc.stderr:
+                for line in proc.stderr.splitlines():
+                    self._write(f"  {line}", "error")
+            self._system(f"exit {proc.returncode}")
+        except Exception as exc:
+            self._error(f"run failed: {exc}")
 
     def _switch_mode(self, mode: str) -> None:
         if mode not in MODE_ORDER:
@@ -1711,7 +1804,6 @@ class DepressionApp(App):
             self._schedule_drain()
             return
 
-        # Reset the plan so a new query starts a fresh checklist.
         self._plan_view = None
         self._plan_signature = None
 
@@ -1742,6 +1834,7 @@ class DepressionApp(App):
                         normalised = self._normalise_plan_entries(text_plan)
                         if normalised:
                             await self._upsert_plan(normalised)
+                            self._update_todo_panel(normalised)
                 except Exception:
                     pass
 
@@ -2078,4 +2171,4 @@ class DepressionApp(App):
         self._switch_mode(MODE_ORDER[(i + 1) % len(MODE_ORDER)])
 
 
-__all__ = ["DepressionApp", "PermissionModal", "PromptArea"]
+__all__ = ["DepressionApp", "PermissionModal", "PromptArea", "TodoPanel"]
