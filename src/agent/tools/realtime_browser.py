@@ -9,6 +9,7 @@ Full-featured browser control, distinct from the lightweight 'browser' tool:
     - Idle auto-close to prevent leaked Chromium processes
     - Session modes: ephemeral | persistent | cdp (attach to running Chrome)
     - Human handoff (pause for manual login)
+    - launch_and_show: open a URL in the user's REAL default browser
 
 Falls back gracefully when Playwright is not installed.
 """
@@ -17,6 +18,10 @@ from __future__ import annotations
 
 import asyncio
 import os
+import platform
+import shutil
+import subprocess
+import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -60,16 +65,73 @@ class NetworkEntry:
 
 
 # ======================================================================
+# OS BROWSER OPENER
+# ======================================================================
+
+def _open_in_default_browser(url: str) -> Dict[str, Any]:
+    """
+    Open `url` in the OS default browser, detached from our process.
+
+    Returns a small dict with the mechanism used and whether it worked.
+    Never raises.
+    """
+    system = platform.system().lower()
+    try:
+        if system == "darwin":
+            cmd = ["open", url]
+        elif system == "windows":
+            cmd = ["cmd", "/c", "start", "", url]
+        else:
+            # Linux / *BSD. Prefer xdg-open; fall back to sensible defaults.
+            if shutil.which("xdg-open"):
+                cmd = ["xdg-open", url]
+            elif shutil.which("gio"):
+                cmd = ["gio", "open", url]
+            elif shutil.which("sensible-browser"):
+                cmd = ["sensible-browser", url]
+            else:
+                return {
+                    "opened": False,
+                    "mechanism": "none",
+                    "error": (
+                        "No browser opener found (looked for xdg-open, gio, "
+                        "sensible-browser). Install one or open the URL manually."
+                    ),
+                }
+
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        return {
+            "opened": True,
+            "mechanism": " ".join(cmd[:1]),
+            "pid": proc.pid,
+        }
+    except Exception as exc:
+        return {
+            "opened": False,
+            "mechanism": "exception",
+            "error": str(exc),
+        }
+
+
+# ======================================================================
 # TOOL
 # ======================================================================
 
 class RealtimeBrowserTool(BaseTool):
     name = "realtime_browser"
     description = (
-        "Control a real browser in real time: navigate, click, type, extract "
-        "content, take screenshots, run JS, manage tabs, read console/network "
-        "logs. Use 'snapshot' to get an ARIA tree with stable element refs "
-        "(e1, e2, ...) that you can pass to 'click'/'type' via the 'ref' parameter."
+        "Control a real browser: navigate, click, type, extract content, take "
+        "screenshots, run JS, manage tabs, read console/network logs. "
+        "Use 'snapshot' for an ARIA tree with stable element refs (e1, e2, ...). "
+        "Set headless=false to show a visible Playwright window. "
+        "Use action='launch_and_show' to open a URL in the USER's real "
+        "default browser — this is what 'show me in the browser' means."
     )
     parameters = {
         "type": "object",
@@ -82,9 +144,10 @@ class RealtimeBrowserTool(BaseTool):
                     "tab_open", "tab_list", "tab_switch", "tab_close",
                     "console", "network", "back", "forward", "reload",
                     "pause_for_user", "close",
+                    "launch_and_show",
                 ],
             },
-            "url": {"type": "string", "description": "For navigate / tab_open"},
+            "url": {"type": "string", "description": "For navigate / tab_open / launch_and_show"},
             "selector": {"type": "string", "description": "CSS selector"},
             "ref": {"type": "string", "description": "Element ref from 'snapshot' (e.g. 'e3')"},
             "value": {"type": "string", "description": "For type / select"},
@@ -93,13 +156,21 @@ class RealtimeBrowserTool(BaseTool):
             "path": {"type": "string", "description": "Screenshot output path"},
             "tab_id": {"type": "string", "description": "Tab id for tab_switch/tab_close"},
             "timeout_ms": {"type": "integer", "default": 15000},
-            "clear": {"type": "boolean", "default": False, "description": "Clear console/network buffer before reading"},
+            "clear": {"type": "boolean", "default": False},
             "wait_until": {
                 "type": "string",
                 "enum": ["load", "domcontentloaded", "networkidle", "commit"],
                 "default": "domcontentloaded",
             },
-            "prompt": {"type": "string", "description": "Message to show user during pause_for_user"},
+            "prompt": {"type": "string", "description": "Message for pause_for_user"},
+            "headless": {
+                "type": "boolean",
+                "description": (
+                    "Per-call override. False opens a visible Playwright window; "
+                    "True keeps it headless. Only effective if the browser has "
+                    "not been launched yet in this session."
+                ),
+            },
         },
         "required": ["action"],
     }
@@ -194,14 +265,12 @@ class RealtimeBrowserTool(BaseTool):
 
     def _on_console(self, msg: Any) -> None:
         try:
-            self._console.append(
-                ConsoleEntry(
-                    timestamp=time.time(),
-                    level=getattr(msg, "type", "log"),
-                    text=getattr(msg, "text", ""),
-                    location=str(getattr(msg, "location", "")),
-                )
-            )
+            self._console.append(ConsoleEntry(
+                timestamp=time.time(),
+                level=getattr(msg, "type", "log"),
+                text=getattr(msg, "text", ""),
+                location=str(getattr(msg, "location", "")),
+            ))
             if len(self._console) > self.console_buffer:
                 del self._console[: len(self._console) - self.console_buffer]
         except Exception:
@@ -216,15 +285,13 @@ class RealtimeBrowserTool(BaseTool):
 
     def _on_request_failed(self, req: Any) -> None:
         try:
-            self._network.append(
-                NetworkEntry(
-                    timestamp=time.time(),
-                    method=getattr(req, "method", ""),
-                    url=getattr(req, "url", ""),
-                    resource_type=getattr(req, "resource_type", ""),
-                    failed=str(getattr(req, "failure", "") or "failed"),
-                )
-            )
+            self._network.append(NetworkEntry(
+                timestamp=time.time(),
+                method=getattr(req, "method", ""),
+                url=getattr(req, "url", ""),
+                resource_type=getattr(req, "resource_type", ""),
+                failed=str(getattr(req, "failure", "") or "failed"),
+            ))
             if len(self._network) > self.network_buffer:
                 del self._network[: len(self._network) - self.network_buffer]
         except Exception:
@@ -232,15 +299,13 @@ class RealtimeBrowserTool(BaseTool):
 
     def _on_response(self, resp: Any) -> None:
         try:
-            self._network.append(
-                NetworkEntry(
-                    timestamp=time.time(),
-                    method=getattr(resp.request, "method", ""),
-                    url=getattr(resp, "url", ""),
-                    status=getattr(resp, "status", None),
-                    resource_type=getattr(resp.request, "resource_type", ""),
-                )
-            )
+            self._network.append(NetworkEntry(
+                timestamp=time.time(),
+                method=getattr(resp.request, "method", ""),
+                url=getattr(resp, "url", ""),
+                status=getattr(resp, "status", None),
+                resource_type=getattr(resp.request, "resource_type", ""),
+            ))
             if len(self._network) > self.network_buffer:
                 del self._network[: len(self._network) - self.network_buffer]
         except Exception:
@@ -424,10 +489,45 @@ class RealtimeBrowserTool(BaseTool):
     # ------------------------------------------------------------------
 
     async def execute(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        if not self.allow_network and params.get("action") in ("navigate", "tab_open"):
+        action = params.get("action", "")
+
+        # [Visible window] Per-call override for headless. Only takes effect
+        # if the browser hasn't been launched yet in this session.
+        if "headless" in params and self._context is None:
+            try:
+                self.headless = bool(params["headless"])
+            except Exception:
+                pass
+
+        # launch_and_show does NOT need Playwright at all — it just shells
+        # out to the OS opener. Handle it before any browser setup.
+        if action == "launch_and_show":
+            url = params.get("url") or ""
+            if not url:
+                return {"success": False, "error": "launch_and_show requires 'url'"}
+            if not url.startswith(("http://", "https://", "file://")):
+                url = "https://" + url
+            result = _open_in_default_browser(url)
+            if result.get("opened"):
+                return {
+                    "success": True,
+                    "opened_in_default_browser": True,
+                    "url": url,
+                    "mechanism": result.get("mechanism"),
+                    "message": (
+                        "Opened the URL in the user's default browser. "
+                        "The visible window is on the user's screen."
+                    ),
+                }
+            return {
+                "success": False,
+                "error": result.get("error") or "failed to open browser",
+                "url": url,
+            }
+
+        if not self.allow_network and action in ("navigate", "tab_open"):
             return {"success": False, "error": "Network access disabled"}
 
-        action = params.get("action", "")
         if action == "close":
             await self._close_context()
             return {"success": True, "closed": True}
@@ -487,8 +587,6 @@ class RealtimeBrowserTool(BaseTool):
             if not url:
                 return {"success": False, "error": "navigate requires 'url'"}
             if url.startswith("file://"):
-                # file:// lets the model render arbitrary local files and read
-                # their contents back out of the resulting page.
                 try:
                     target = Path(url[len("file://"):].split("?")[0]).resolve(
                         strict=False

@@ -3,7 +3,9 @@ from __future__ import annotations
 
 import asyncio
 import os as _os
+import platform
 import re
+import subprocess
 import time
 from typing import Any, Optional
 
@@ -88,6 +90,86 @@ def _shorten_path(path: str, max_len: int = 32) -> str:
     head_len = max(4, max_len - 24)
     tail_len = max_len - head_len - 1
     return f"{path[:head_len]}…{path[-tail_len:]}"
+
+
+def _open_file_with_default_app(path: str) -> bool:
+    """Open a file with the OS default application. Best effort."""
+    try:
+        system = platform.system().lower()
+        if system == "darwin":
+            cmd = ["open", path]
+        elif system == "windows":
+            cmd = ["cmd", "/c", "start", "", path]
+        else:
+            if subprocess.run(["which", "xdg-open"], capture_output=True).returncode == 0:
+                cmd = ["xdg-open", path]
+            else:
+                cmd = ["gio", "open", path]
+        subprocess.Popen(
+            cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        return True
+    except Exception:
+        return False
+
+
+# ======================================================================
+# STREAMING OUTPUT WIDGET
+# ======================================================================
+
+class StreamingOutput(Vertical):
+    """
+    Live text output. Appended to as `on_token` events arrive.
+    When the turn completes, the app replaces this widget with the
+    structured OutputView.
+    """
+
+    DEFAULT_CSS = f"""
+    StreamingOutput {{
+        height: auto;
+        width: 100%;
+        margin: 0 0 1 0;
+        padding: 0 1;
+        border-left: thick {GREEN_DIM};
+    }}
+    StreamingOutput > Static {{
+        height: auto;
+        width: 100%;
+    }}
+    """
+
+    def __init__(self, header: str = "◆ depression.ai", **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self._header = header
+        self._buffer: list[str] = []
+
+    def compose(self) -> ComposeResult:
+        yield Static(
+            f"[bold {GREEN}]{_esc(self._header)}[/] [{DIM}]streaming…[/]",
+            markup=True,
+        )
+        yield Static(
+            f"[{BORDER}]" + "─" * 56 + "[/]",
+            markup=True,
+        )
+        yield Static("", id="stream-body", markup=True)
+
+    def append_token(self, delta: str) -> None:
+        self._buffer.append(delta)
+        text = "".join(self._buffer)
+        # Escape brackets so the model's own [text] doesn't render as markup.
+        safe = text.replace("[", r"\[")
+        try:
+            self.query_one("#stream-body", Static).update(safe)
+        except Exception:
+            pass
+
+    def get_text(self) -> str:
+        return "".join(self._buffer)
 
 
 # ======================================================================
@@ -282,16 +364,11 @@ class ContextPanel(Vertical):
 
 
 # ======================================================================
-# TODO PANEL — sidebar
+# TODO PANEL
 # ======================================================================
 
 class TodoPanel(Vertical):
-    """
-    Sidebar Todo panel.
-
-    Renders the checklist the loop emitted (via on_plan_created /
-    on_plan_rendered). Updates in place; not a separate view per turn.
-    """
+    """Sidebar Todo panel."""
 
     DEFAULT_CSS = f"""
     TodoPanel {{
@@ -598,8 +675,6 @@ class LLMCostPanel(Vertical):
 # ======================================================================
 
 class HelpPanel(Vertical):
-    """Static help panel."""
-
     DEFAULT_CSS = f"""
     HelpPanel {{
         width: 100%; height: auto;
@@ -624,6 +699,7 @@ class HelpPanel(Vertical):
         yield Static("/llmcost   open token + api cost panel", classes="help-row")
         yield Static("/todo      open todo panel", classes="help-row")
         yield Static("/run CMD   run a shell command and show output", classes="help-row")
+        yield Static("/shot PATH open a screenshot with the OS viewer", classes="help-row")
         yield Static("/plan      switch mode → plan", classes="help-row")
         yield Static("/build     switch mode → build", classes="help-row")
         yield Static("/clear     clear transcript", classes="help-row")
@@ -862,6 +938,7 @@ class DepressionApp(App):
 
         self._plan_view: Optional[PlanView] = None
         self._plan_signature: Optional[tuple] = None
+        self._streaming_widget: Optional[StreamingOutput] = None
 
         try:
             self.turn_timeout = float(
@@ -1072,6 +1149,9 @@ class DepressionApp(App):
             self._events.subscribe("on_plan_updated", self._on_plan_updated)
             self._events.subscribe("on_plan_created", self._on_plan_created)
             self._events.subscribe("on_plan_rendered", self._on_plan_rendered)
+            # [Streaming] Live model output.
+            self._events.subscribe("on_token", self._on_token)
+            self._events.subscribe("on_token_end", self._on_token_end)
             self._event_handlers_registered = True
         except Exception as exc:
             self._error(f"event wiring failed: {exc}")
@@ -1128,6 +1208,48 @@ class DepressionApp(App):
                 return
         except Exception:
             pass
+
+    # ------------------------------------------------------------------
+    # STREAMING
+    # ------------------------------------------------------------------
+
+    async def _on_token(self, event: AgentEvent) -> None:
+        if self._is_shutting_down:
+            return
+        if not self.is_running:
+            return
+
+        data = event.payload or {}
+        delta = data.get("delta") or ""
+        if not delta:
+            return
+
+        self._show_transcript()
+
+        # Ensure a streaming widget exists.
+        if self._streaming_widget is None or not self._streaming_widget.is_mounted:
+            try:
+                transcript = self.query_one("#transcript", VerticalScroll)
+            except Exception:
+                return
+            widget = StreamingOutput()
+            try:
+                await transcript.mount(widget)
+            except Exception:
+                return
+            self._streaming_widget = widget
+
+        self._streaming_widget.append_token(delta)
+        try:
+            transcript = self.query_one("#transcript", VerticalScroll)
+            self.call_after_refresh(lambda: transcript.scroll_end(animate=False))
+        except Exception:
+            pass
+
+    async def _on_token_end(self, event: AgentEvent) -> None:
+        # The turn ended; the structured OutputView will replace the
+        # streaming widget in _render_output.
+        pass
 
     # ------------------------------------------------------------------
     # AGENT EVENTS
@@ -1266,10 +1388,6 @@ class DepressionApp(App):
         await self._upsert_plan(normalised)
 
     async def _on_plan_rendered(self, event: AgentEvent) -> None:
-        """
-        Unified plan event. Fires for both structured plans and checklists
-        parsed out of the model's text. Feeds the sidebar Todo panel.
-        """
         if self._is_shutting_down:
             return
         data = event.payload or {}
@@ -1705,6 +1823,8 @@ class DepressionApp(App):
             self._show_panel("help")
         elif command == "/run":
             self._run_shell(arg)
+        elif command == "/shot":
+            self._open_shot(arg)
         elif command == "/clear":
             try:
                 self.query_one("#transcript", VerticalScroll).remove_children()
@@ -1712,6 +1832,7 @@ class DepressionApp(App):
                 pass
             self._plan_view = None
             self._plan_signature = None
+            self._streaming_widget = None
             self._has_messages = False
             try:
                 self.query_one("#empty-banner", EmptyBanner).display = True
@@ -1734,6 +1855,19 @@ class DepressionApp(App):
             self.exit()
         else:
             self._error(f"unknown command: {command}")
+
+    def _open_shot(self, path: str) -> None:
+        if not path:
+            self._error("usage: /shot <path-to-image>")
+            return
+        p = path.strip().strip("'\"")
+        if not _os.path.exists(p):
+            self._error(f"not found: {p}")
+            return
+        if _open_file_with_default_app(p):
+            self._system(f"opened {p}")
+        else:
+            self._error(f"could not open {p}; open it manually")
 
     def _dump_todos(self) -> None:
         try:
@@ -1759,7 +1893,6 @@ class DepressionApp(App):
             return
         self._system(f"$ {cmd}")
         try:
-            import subprocess
             proc = subprocess.run(
                 cmd, shell=True, capture_output=True, text=True, timeout=30,
             )
@@ -1806,6 +1939,7 @@ class DepressionApp(App):
 
         self._plan_view = None
         self._plan_signature = None
+        self._streaming_widget = None
 
         started = time.time()
         try:
@@ -1862,6 +1996,15 @@ class DepressionApp(App):
         except Exception as exc:
             self._error(f"agent error: {exc}")
         finally:
+            # Remove the streaming widget (its content is now part of the
+            # structured OutputView).
+            if self._streaming_widget is not None and self._streaming_widget.is_mounted:
+                try:
+                    await self._streaming_widget.remove()
+                except Exception:
+                    pass
+            self._streaming_widget = None
+
             self.busy = False
             self._set_busy_visual(False)
             self._refresh_mode_chip()
@@ -2138,6 +2281,7 @@ class DepressionApp(App):
             pass
         self._plan_view = None
         self._plan_signature = None
+        self._streaming_widget = None
         self._has_messages = False
         try:
             self.query_one("#empty-banner", EmptyBanner).display = True
@@ -2171,4 +2315,10 @@ class DepressionApp(App):
         self._switch_mode(MODE_ORDER[(i + 1) % len(MODE_ORDER)])
 
 
-__all__ = ["DepressionApp", "PermissionModal", "PromptArea", "TodoPanel"]
+__all__ = [
+    "DepressionApp",
+    "PermissionModal",
+    "PromptArea",
+    "TodoPanel",
+    "StreamingOutput",
+]
