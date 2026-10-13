@@ -23,6 +23,10 @@ Design rules
       existing installs keep working.
     * Every provider gets `await provider.start()` called at install time,
       so the first real request doesn't pay the client-construction cost.
+    * [Streaming] The registry exposes `stream_with_tools()` so the loop's
+      streaming path can emit token deltas. If the concrete provider has
+      no `stream()`, the wrapper degrades to a single-chunk yield from
+      `chat()` — the loop still receives a valid NormalizedResponse.
 """
 
 from __future__ import annotations
@@ -31,7 +35,7 @@ import asyncio
 import os
 import time
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, AsyncIterator, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import urlparse
 
 from agent.llm.normalizer import NormalizedResponse, normalize
@@ -143,6 +147,31 @@ DEFAULT_CONTEXT_WINDOW = 500_000
 
 #: model id -> metadata (context_window, cost_input, capabilities, ...)
 MODEL_METADATA: Dict[str, Dict[str, Any]] = {}
+
+
+# ======================================================================
+# STREAMING HELPERS
+# ======================================================================
+
+def _safe_delta(chunk: Any) -> str:
+    """
+    Best-effort extraction of a text delta from a NormalizedResponse or
+    a raw LLMResponse or a dict. Returns "" if nothing textual is present.
+    """
+    if chunk is None:
+        return ""
+    # NormalizedResponse may expose .content or .text.
+    for attr in ("content", "text", "delta"):
+        v = getattr(chunk, attr, None)
+        if isinstance(v, str) and v:
+            return v
+    # Dict-shaped chunks.
+    if isinstance(chunk, dict):
+        for key in ("content", "text", "delta"):
+            v = chunk.get(key)
+            if isinstance(v, str) and v:
+                return v
+    return ""
 
 
 # ======================================================================
@@ -537,6 +566,126 @@ class LLMProviderRegistry:
             tools=tools,
             **kwargs,
         )
+
+    # ------------------------------------------------------------------
+    # STREAMING
+    # ------------------------------------------------------------------
+
+    async def stream_with_tools(
+        self,
+        messages: Sequence[Any],
+        tools: Optional[Sequence[Any]] = None,
+        model: Optional[str] = None,
+        temperature: float = 0.1,
+        max_tokens: int = 4096,
+        **kwargs: Any,
+    ) -> AsyncIterator[NormalizedResponse]:
+        """
+        Streaming completion with optional tools.
+
+        Yields `NormalizedResponse` chunks:
+          * intermediate chunks carry `.content` / `.text` deltas
+            (and possibly a partial tool call argument stream);
+          * the final chunk carries the assembled `.tool_calls`,
+            `.finish_reason`, and `.usage`.
+
+        Behaviour:
+          * If the active provider has no `stream()`, this degrades to a
+            single-chunk yield built from `chat()` — the loop still
+            receives a valid NormalizedResponse and behaves correctly.
+          * Each chunk passes through the normalizer so downstream code
+            sees the same type as the non-streaming path.
+
+        The loop reads deltas via `getattr(chunk, "content", "")`; if the
+        normalizer uses `.text`, `_safe_delta` in the loop handles it.
+        """
+        primary = model or self._current_model
+        if not primary:
+            raise ProviderError(
+                "No model selected. Connect a model first.",
+                code=ProviderErrorCode.MODEL_NOT_FOUND,
+            )
+
+        provider = self._provider_for(primary)
+        if provider is None:
+            raise ProviderError(
+                f"No installed provider for model: {primary}",
+                code=ProviderErrorCode.MODEL_NOT_FOUND,
+                model=primary,
+            )
+
+        stream_fn = getattr(provider, "stream", None)
+        request: Dict[str, Any] = {
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+        }
+        if tools is not None:
+            request["tools"] = tools
+        request.update(kwargs)
+
+        # No provider-level streaming: degrade to a single chunk.
+        if not callable(stream_fn):
+            response = await provider.chat(messages, model=primary, **request)
+            normalized = normalize(
+                response,
+                provider=getattr(provider, "name", "") or "",
+                model=primary,
+                started_at=time.time(),
+            )
+            # Guarantee at least one textual delta so the UI mounts.
+            if not _safe_delta(normalized):
+                try:
+                    text = (
+                        getattr(normalized, "content", None)
+                        or getattr(normalized, "text", None)
+                        or ""
+                    )
+                    if text:
+                        setattr(normalized, "content", text)
+                except Exception:
+                    pass
+            yield normalized
+            return
+
+        started_at = time.time()
+        async for chunk in stream_fn(
+            messages,
+            model=primary,
+            **request,
+        ):
+            try:
+                normalized_chunk = normalize(
+                    chunk,
+                    provider=getattr(provider, "name", "") or "",
+                    model=primary,
+                    started_at=started_at,
+                )
+            except Exception as exc:
+                logger.debug("normalize(chunk) failed: %s", exc)
+                normalized_chunk = chunk  # pass through raw
+            yield normalized_chunk
+
+    async def stream(
+        self,
+        messages: Sequence[Any],
+        model: Optional[str] = None,
+        temperature: float = 0.1,
+        max_tokens: int = 4096,
+        **kwargs: Any,
+    ) -> AsyncIterator[NormalizedResponse]:
+        """
+        Text-only streaming without tools. Thin wrapper over
+        `stream_with_tools` with `tools=None`.
+        """
+        async for chunk in self.stream_with_tools(
+            messages=messages,
+            tools=None,
+            model=model,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            **kwargs,
+        ):
+            yield chunk
 
     # ------------------------------------------------------------------
     # HEALTH
