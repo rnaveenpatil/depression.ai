@@ -1229,9 +1229,10 @@ class DepressionApp(App):
     # ------------------------------------------------------------------
 
     async def _on_token(self, event: AgentEvent) -> None:
+        # [Streaming fix] Do NOT gate on self.is_running. Tokens can arrive
+        # while the app is still wiring up its first frame. The only valid
+        # gate is a shutdown check.
         if self._is_shutting_down:
-            return
-        if not self.is_running:
             return
 
         data = event.payload or {}
@@ -1262,9 +1263,11 @@ class DepressionApp(App):
             pass
 
     async def _on_token_end(self, event: AgentEvent) -> None:
-        # The turn ended; the structured OutputView will replace the
-        # streaming widget in _render_output.
-        pass
+        # [Streaming fix] Same rationale as _on_token — no is_running gate.
+        # The structured OutputView will replace the streaming widget in
+        # _render_output once the turn's result comes back.
+        if self._is_shutting_down:
+            return
 
     # ------------------------------------------------------------------
     # AGENT EVENTS
