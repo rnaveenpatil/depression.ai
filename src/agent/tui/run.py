@@ -46,7 +46,7 @@ def main() -> None:
 
         from agent.tui.app import DepressionApp, PermissionModal
 
-        app = DepressionApp(coordinator=cli.agent_coordinator)
+        app = DepressionApp(coordinator=cli.agent_coordinator, skip_onboarding=args.nosignin)
 
         # One-at-a-time permission bridge, resolved on the UI loop.
         pending: dict[str, Any] = {"fut": None}

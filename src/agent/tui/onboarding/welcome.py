@@ -529,6 +529,10 @@ def should_onboard(
     if profile.metadata.get(ONBOARDED_KEY):
         # Explicitly marked complete — never ask again.
         return False
+    # Local/guest profile (created via --nosignin): show welcome screen
+    # so user can sign in with Google to upgrade.
+    if profile.metadata.get("local"):
+        return True
     # Legacy profile from before the marker existed: treat as onboarded
     # and stamp it, so this only ever runs once.
     try:

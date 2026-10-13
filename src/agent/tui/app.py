@@ -919,10 +919,12 @@ class DepressionApp(App):
     def __init__(
         self,
         coordinator: Optional[AgentCoordinator] = None,
+        skip_onboarding: bool = False,
         **kwargs: Any,
     ):
         super().__init__(**kwargs)
         self.coordinator = coordinator
+        self.skip_onboarding = skip_onboarding
         self.cfg = load_runtime_config()
         self.aws = get_aws_credentials()
 
@@ -1065,6 +1067,19 @@ class DepressionApp(App):
             pass
 
     async def _maybe_onboard(self) -> None:
+        if self.skip_onboarding:
+            from agent.tui.onboarding.profile import guest_profile, ProfileStore
+            store = ProfileStore()
+            if store.load() is None:
+                profile = guest_profile()
+                store.save(profile)
+                self._sync_identity(profile)
+            else:
+                profile = store.load()
+                if profile:
+                    self._sync_identity(profile)
+            return
+
         from agent.tui.onboarding.welcome import push_welcome_if_new_user
 
         prompt = None

@@ -866,6 +866,10 @@ class OpenAICompatibleProvider(LLMProvider):
         calls = self._parse_tool_calls(msg.get("tool_calls") or [])
 
         content = msg.get("content")
+        # Some models (e.g., Qwen3 on Cloudflare Workers AI) return the
+        # actual response in reasoning_content when content is None/empty.
+        if content is None or content == "":
+            content = msg.get("reasoning_content") or msg.get("reasoning") or ""
         if content is None:
             content = ""
 

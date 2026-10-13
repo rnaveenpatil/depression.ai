@@ -201,6 +201,7 @@ Examples:
 
         # TUI options
         parser.add_argument("--no-sidebar", action="store_true", help="Hide sidebar in TUI")
+        parser.add_argument("--nosignin", action="store_true", help="Skip Google sign-in / onboarding screen")
 
         # Extras
         parser.add_argument("--plugins", nargs="*", help="Plugin names to load")
