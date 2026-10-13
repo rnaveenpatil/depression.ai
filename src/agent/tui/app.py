@@ -448,23 +448,38 @@ class LLMCostPanel(Vertical):
         self._app = app_ref
         self._query_start_ts: float = 0.0
         self._query_active: bool = False
-        # Snapshot of accumulated session totals captured when a query
-        # starts, so the "this query" section can be computed independently
-        # of what the loop's context currently holds.
-        self._session_baseline: dict[str, float] = {
-            "in": 0, "out": 0, "total": 0, "calls": 0, "tools": 0, "turns": 0,
-        }
-        self._last_seen_ctx: dict[str, int] = {
-            "in": 0, "out": 0, "total": 0, "calls": 0, "tools": 0,
-        }
+
+    def compose(self) -> ComposeResult:
+        yield Static(f"[bold {GREEN}]▌ LLM COST[/]", markup=True)
+        yield Static("dir", classes="label")
+        yield Static("", id="cost-dir", classes="value")
+        yield Static("data", classes="label")
+        yield Static("", id="cost-data", classes="value")
+        yield Static("model", classes="label")
+        yield Static("", id="cost-model", classes="value")
+        yield Static("provider", classes="label")
+        yield Static("", id="cost-provider", classes="value")
+        yield Static("session", classes="label")
+        yield Static("", id="cost-session", classes="value")
+        yield Static("── this query ──", classes="head")
+        yield Static("", id="cost-q-in",    classes="value")
+        yield Static("", id="cost-q-out",   classes="value")
+        yield Static("", id="cost-q-total", classes="accent")
+        yield Static("", id="cost-q-calls", classes="value")
+        yield Static("", id="cost-q-tools", classes="value")
+        yield Static("", id="cost-q-dur",   classes="value")
+        yield Static("── session ──", classes="head")
+        yield Static("", id="cost-s-in",    classes="value")
+        yield Static("", id="cost-s-out",   classes="value")
+        yield Static("", id="cost-s-total", classes="accent")
+        yield Static("", id="cost-s-calls", classes="value")
+        yield Static("", id="cost-s-tools", classes="value")
+        yield Static("", id="cost-s-turns", classes="value")
+        yield Static("", id="cost-s-cost",  classes="value")
 
     def on_mount(self) -> None:
         self.refresh_values()
         self.set_interval(1.0, self.refresh_values)
-
-    # ------------------------------------------------------------------
-    # Data sources
-    # ------------------------------------------------------------------
 
     def _coordinator_status(self) -> dict:
         try:
@@ -542,21 +557,7 @@ class LLMCostPanel(Vertical):
                 return str(v)
         return default
 
-    # ------------------------------------------------------------------
-    # Query lifecycle
-    # ------------------------------------------------------------------
-
     def mark_query_start(self) -> None:
-        # Freeze the current session-accumulated values into a baseline so
-        # this-query numbers don't double count what happened earlier.
-        self._session_baseline = {
-            "in": self._last_seen_ctx.get("in", 0),
-            "out": self._last_seen_ctx.get("out", 0),
-            "total": self._last_seen_ctx.get("total", 0),
-            "calls": self._last_seen_ctx.get("calls", 0),
-            "tools": self._last_seen_ctx.get("tools", 0),
-            "turns": int(getattr(self._app, "message_count", 0) or 0),
-        }
         self._query_start_ts = time.time()
         self._query_active = True
         self.refresh_values()
@@ -565,15 +566,10 @@ class LLMCostPanel(Vertical):
         self._query_active = False
         self.refresh_values()
 
-    # ------------------------------------------------------------------
-    # Rendering
-    # ------------------------------------------------------------------
-
     def refresh_values(self) -> None:
         status = self._coordinator_status()
         ctx = self._loop_context()
 
-        # -------- meta --------
         project_dir = self._str(status, "project_dir", "workspace_dir", "cwd", default="")
         data_dir = self._str(status, "data_dir", "home_dir", default="")
         self._update("#cost-dir", f"[{TEXT}]{_esc(_shorten_path(project_dir))}[/]")
@@ -597,51 +593,23 @@ class LLMCostPanel(Vertical):
         self._update("#cost-provider", f"[{TEXT}]{_esc(provider)}[/]")
         self._update("#cost-session", f"[{TEXT}]{_esc(session_id)}[/]")
 
-        # -------- read the loop context directly --------
-        # The loop's context is the authoritative source for the live
-        # session counters. It is the same object that accumulates across
-        # turns, so we use it for BOTH the this-query block and the
-        # session block (with a baseline subtraction for this-query).
-        ctx_in = self._num(ctx, "input_tokens", "prompt_tokens")
-        ctx_out = self._num(ctx, "output_tokens", "completion_tokens")
-        ctx_total = self._num(ctx, "tokens_used", "total_tokens") or (ctx_in + ctx_out)
-        ctx_calls = self._num(ctx, "llm_calls", "api_calls")
-        actions = getattr(ctx, "actions_taken", None) if ctx is not None else None
-        if actions is None and isinstance(ctx, dict):
-            actions = ctx.get("actions_taken")
-        ctx_tools = len(actions) if actions is not None else 0
-
-        # Remember latest seen values so mark_query_start can use them.
-        self._last_seen_ctx = {
-            "in": ctx_in, "out": ctx_out, "total": ctx_total,
-            "calls": ctx_calls, "tools": ctx_tools,
-        }
-
-        # Fallback if the loop context is unavailable: use the app-level
-        # reactive token counters (these are session-wide as well).
-        if ctx is None:
-            ctx_in = int(getattr(self._app, "live_input_tokens", 0) or 0)
-            ctx_out = int(getattr(self._app, "live_output_tokens", 0) or 0)
-            ctx_total = int(
-                getattr(self._app, "live_total_tokens", 0)
-                or (ctx_in + ctx_out)
-            )
-            ctx_calls = 0
-            ctx_tools = 0
-
-        # -------- this-query block (session totals minus baseline) --------
-        qi = max(0, ctx_in - self._session_baseline["in"])
-        qo = max(0, ctx_out - self._session_baseline["out"])
-        qt = max(0, ctx_total - self._session_baseline["total"])
-        if qt == 0 and (qi or qo):
-            qt = qi + qo
-        qc = max(0, ctx_calls - int(self._session_baseline["calls"]))
-        qtools = max(0, ctx_tools - int(self._session_baseline["tools"]))
-
-        if self._query_active and self._query_start_ts:
-            qdur = time.time() - self._query_start_ts
+        if ctx is not None:
+            qi = self._num(ctx, "input_tokens", "prompt_tokens")
+            qo = self._num(ctx, "output_tokens", "completion_tokens")
+            qt = self._num(ctx, "tokens_used", "total_tokens") or (qi + qo)
+            qc = self._num(ctx, "llm_calls", "api_calls")
+            actions = getattr(ctx, "actions_taken", None)
+            if actions is None and isinstance(ctx, dict):
+                actions = ctx.get("actions_taken")
+            qtools = len(actions) if actions is not None else 0
+            start_ts = self._flt(ctx, "start_time") or self._query_start_ts
+            qdur = time.time() - start_ts if start_ts else 0.0
         else:
-            qdur = 0.0
+            qi = qo = qt = qc = qtools = 0
+            qdur = (
+                time.time() - self._query_start_ts
+                if self._query_active and self._query_start_ts else 0.0
+            )
 
         self._update("#cost-q-in", f"[{MUTED}]in[/]      [{TEXT}]{_fmt(qi)}[/]")
         self._update("#cost-q-out", f"[{MUTED}]out[/]     [{TEXT}]{_fmt(qo)}[/]")
@@ -650,46 +618,37 @@ class LLMCostPanel(Vertical):
         self._update("#cost-q-tools", f"[{MUTED}]tool calls[/] [{TEXT}]{_fmt(qtools)}[/]")
         self._update("#cost-q-dur", f"[{MUTED}]duration[/]  [{TEXT}]{qdur:.1f}s[/]")
 
-        # -------- session block (authoritative from loop context) --------
-        si = ctx_in
-        so = ctx_out
-        st = ctx_total or (si + so)
-        sc = ctx_calls
-        stools = ctx_tools
-        sturns = int(getattr(self._app, "message_count", 0) or 0)
+        si = self._num(status, "input_tokens", "prompt_tokens", "total_input_tokens")
+        so = self._num(status, "output_tokens", "completion_tokens", "total_output_tokens")
+        st = self._num(status, "tokens_used", "total_tokens") or (si + so)
+        sc = self._num(status, "llm_calls", "api_calls", "total_llm_calls")
+        tools_used = None
+        if isinstance(status, dict):
+            tools_used = status.get("tools_used") or status.get("tool_calls")
+        stools = 0
+        if isinstance(tools_used, dict):
+            try:
+                stools = sum(int(v) for v in tools_used.values())
+            except Exception:
+                stools = 0
+        elif isinstance(tools_used, (int, float)):
+            stools = int(tools_used)
+        if stools == 0:
+            stools = self._num(status, "total_tool_calls", "tool_calls_total")
+        sturns = self._num(status, "turn_count", "turns", "message_count", "messages")
+        scost = self._flt(status, "cost", "total_cost", "cost_usd")
 
-        # Only if the loop context gave us literally nothing, fall back
-        # to whatever get_status() reported. We do NOT fall back to
-        # app.cost here (that was the misleading "last variable").
-        if st == 0 and sc == 0:
-            si = self._num(status, "input_tokens", "prompt_tokens",
-                           "total_input_tokens") or si
-            so = self._num(status, "output_tokens", "completion_tokens",
-                           "total_output_tokens") or so
-            st = self._num(status, "tokens_used", "total_tokens") or (si + so)
-            sc = self._num(status, "llm_calls", "api_calls",
-                           "total_llm_calls") or sc
-            tools_used = None
-            if isinstance(status, dict):
-                tools_used = status.get("tools_used") or status.get("tool_calls")
-            if isinstance(tools_used, dict):
-                try:
-                    stools = stools or sum(int(v) for v in tools_used.values())
-                except Exception:
-                    pass
-            elif isinstance(tools_used, (int, float)):
-                stools = stools or int(tools_used)
-            if stools == 0:
-                stools = self._num(status, "total_tool_calls", "tool_calls_total")
-            sturns = (
-                self._num(status, "turn_count", "turns",
-                          "message_count", "messages")
-                or sturns
-            )
+        if st == 0:
+            st = int(getattr(self._app, "tokens_used", 0) or 0)
+        if sturns == 0:
+            sturns = int(getattr(self._app, "message_count", 0) or 0)
 
-        # Session cost: computed from session tokens, never from the
-        # previous app.cost field.
-        scost = self._compute_session_cost(si, so)
+        if st == 0 and ctx is not None:
+            si = self._num(ctx, "input_tokens")
+            so = self._num(ctx, "output_tokens")
+            st = self._num(ctx, "tokens_used") or (si + so)
+            sc = self._num(ctx, "llm_calls")
+            stools = stools or (len(getattr(ctx, "actions_taken", []) or []))
 
         self._update("#cost-s-in", f"[{MUTED}]in[/]      [{TEXT}]{_fmt(si)}[/]")
         self._update("#cost-s-out", f"[{MUTED}]out[/]     [{TEXT}]{_fmt(so)}[/]")
@@ -701,29 +660,6 @@ class LLMCostPanel(Vertical):
             "#cost-s-cost",
             f"[{MUTED}]cost[/]      [{GREEN_GLOW}]{_fmt_cost(scost)}[/]",
         )
-
-    def _compute_session_cost(self, in_tokens: int, out_tokens: int) -> float:
-        """Compute cost from session token counts.
-
-        Uses per-token rates if the app exposes them, otherwise returns 0.
-        """
-        app = self._app
-        in_rate = getattr(app, "price_input_per_token", None)
-        out_rate = getattr(app, "price_output_per_token", None)
-        if in_rate is None and isinstance(getattr(app, "cfg", None), dict):
-            in_rate = app.cfg.get("price_input_per_token")
-            out_rate = app.cfg.get("price_output_per_token")
-        try:
-            in_rate = float(in_rate) if in_rate is not None else 0.0
-        except Exception:
-            in_rate = 0.0
-        try:
-            out_rate = float(out_rate) if out_rate is not None else 0.0
-        except Exception:
-            out_rate = 0.0
-        if in_rate <= 0.0 and out_rate <= 0.0:
-            return 0.0
-        return (in_tokens * in_rate) + (out_tokens * out_rate)
 
     def _update(self, selector: str, markup: str) -> None:
         try:
