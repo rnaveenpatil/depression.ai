@@ -92,6 +92,21 @@ def _shorten_path(path: str, max_len: int = 32) -> str:
     return f"{path[:head_len]}…{path[-tail_len:]}"
 
 
+def _get(obj: Any, *names: str, default: Any = None) -> Any:
+    """Read a value from a dict-like or attribute-like object."""
+    if obj is None:
+        return default
+    for n in names:
+        if isinstance(obj, dict):
+            if n in obj and obj[n] is not None:
+                return obj[n]
+        else:
+            v = getattr(obj, n, None)
+            if v is not None:
+                return v
+    return default
+
+
 def _open_file_with_default_app(path: str) -> bool:
     """Open a file with the OS default application. Best effort."""
     try:
@@ -145,7 +160,11 @@ class StreamingOutput(Vertical):
     def __init__(self, header: str = "◆ depression.ai", **kwargs: Any) -> None:
         super().__init__(**kwargs)
         self._header = header
-        self._buffer: list[str] = []
+        # [Streaming fix] Keep a running buffer + a running *escaped* string
+        # so we don't re-join / re-escape the whole transcript on every token.
+        self._raw: list[str] = []
+        self._escaped: list[str] = []
+        self._body: Optional[Static] = None
 
     def compose(self) -> ComposeResult:
         yield Static(
@@ -158,18 +177,26 @@ class StreamingOutput(Vertical):
         )
         yield Static("", id="stream-body", markup=True)
 
-    def append_token(self, delta: str) -> None:
-        self._buffer.append(delta)
-        text = "".join(self._buffer)
-        # Escape brackets so the model's own [text] doesn't render as markup.
-        safe = text.replace("[", r"\[")
+    def on_mount(self) -> None:
         try:
-            self.query_one("#stream-body", Static).update(safe)
+            self._body = self.query_one("#stream-body", Static)
         except Exception:
-            pass
+            self._body = None
+
+    def append_token(self, delta: str) -> None:
+        if not delta:
+            return
+        self._raw.append(delta)
+        # Escape only the incoming delta; append to the escaped list.
+        self._escaped.append(delta.replace("[", r"\["))
+        if self._body is not None:
+            try:
+                self._body.update("".join(self._escaped))
+            except Exception:
+                pass
 
     def get_text(self) -> str:
-        return "".join(self._buffer)
+        return "".join(self._raw)
 
 
 # ======================================================================
@@ -336,6 +363,12 @@ class ContextPanel(Vertical):
 
     def on_mount(self) -> None:
         self.refresh_values()
+        self.set_interval(1.0, self.refresh_values)
+
+    def _live_ctx(self) -> Any:
+        # [Token-count fix] Same probe as LLMCostPanel so we see live tokens
+        # instead of only the post-turn snapshot.
+        return _probe_loop_context(self._app.coordinator)
 
     def refresh_values(self) -> None:
         try:
@@ -344,7 +377,19 @@ class ContextPanel(Vertical):
                 f"[{MUTED}]model[/]   [{TEXT}]{model}[/]")
             self.query_one("#ctx-window", Static).update(
                 f"[{MUTED}]window[/]  [{TEXT}]{self._app.context_window:,}[/]")
-            used = self._app.tokens_used
+
+            live = self._live_ctx()
+            used = 0
+            if live is not None:
+                used = int(_get(live, "tokens_used", "total_tokens", default=0) or 0)
+                if not used:
+                    used = (
+                        int(_get(live, "input_tokens", "prompt_tokens", default=0) or 0)
+                        + int(_get(live, "output_tokens", "completion_tokens", default=0) or 0)
+                    )
+            if not used:
+                used = int(self._app.tokens_used or 0)
+
             window = max(1, self._app.context_window)
             pct = min(100.0, (used / window) * 100.0)
             bar_w = 30
@@ -355,8 +400,14 @@ class ContextPanel(Vertical):
             self.query_one("#ctx-tokens", Static).update(
                 f"[{MUTED}]tokens[/]  [{TEXT}]{used:,} / {window:,}  "
                 f"([{color}]{pct:.1f}%[/])[/]")
+
+            cost = 0.0
+            if live is not None:
+                cost = float(_get(live, "cost", default=0.0) or 0.0)
+            if not cost:
+                cost = float(self._app.cost or 0.0)
             self.query_one("#ctx-cost", Static).update(
-                f"[{MUTED}]cost[/]    [{TEXT}]${self._app.cost:.4f}[/]")
+                f"[{MUTED}]cost[/]    [{TEXT}]${cost:.4f}[/]")
             self.query_one("#ctx-msgs", Static).update(
                 f"[{MUTED}]turns[/]   [{TEXT}]{self._app.message_count}[/]")
         except Exception:
@@ -391,12 +442,16 @@ class TodoPanel(Vertical):
                      classes="hint")
 
     def set_entries(self, entries: list[dict]) -> None:
-        if not entries:
-            return
-        self._entries = entries
+        # [Todo fix] Accept empty lists so the panel clears correctly.
+        self._entries = list(entries or [])
         try:
+            if not self._entries:
+                self.query_one("#todo-body", Static).update(
+                    f"[{MUTED}]— no active plan —[/]"
+                )
+                return
             self.query_one("#todo-body", Static).update(
-                self._render(entries)
+                self._render(self._entries)
             )
         except Exception:
             pass
@@ -413,22 +468,82 @@ class TodoPanel(Vertical):
         out = []
         for e in entries:
             content = str(e.get("content") or e.get("description") or "")
+            content = _esc(content)
             status = str(e.get("status") or "pending").lower()
             icon = icons.get(status, f"[{DIM}]○[/]")
             if status == "completed":
-                out.append(f"  {icon} [{MUTED}]{_esc(content)}[/]")
+                out.append(f"  {icon} [{MUTED}]{content}[/]")
             elif status == "in_progress":
-                out.append(f"  {icon} [bold {TEXT}]{_esc(content)}[/]")
+                out.append(f"  {icon} [bold {TEXT}]{content}[/]")
             elif status == "failed":
-                out.append(f"  {icon} [{ERROR}]{_esc(content)}[/]")
+                out.append(f"  {icon} [{ERROR}]{content}[/]")
             else:
-                out.append(f"  {icon} [{TEXT}]{_esc(content)}[/]")
+                out.append(f"  {icon} [{TEXT}]{content}[/]")
         return "\n".join(out)
 
 
 # ======================================================================
 # LLM COST PANEL
 # ======================================================================
+
+def _probe_loop_context(coordinator: Any) -> Any:
+    """
+    Best-effort lookup of the live AgentLoop.context for whatever agent is
+    currently active on the coordinator.
+
+    Probes, in order:
+      1. coordinator.current_agent            (attribute)
+      2. coordinator.get_current_agent()      (method)
+      3. coordinator.build_agent              (attribute)
+      4. coordinator.plan_agent               (attribute)
+      5. agent.loop.context
+      6. agent.context_manager (with usage attrs)
+    """
+    if coordinator is None:
+        return None
+
+    agent = None
+
+    # 1. direct attribute
+    agent = getattr(coordinator, "current_agent", None)
+
+    # 2. method
+    if agent is None:
+        fn = getattr(coordinator, "get_current_agent", None)
+        if callable(fn):
+            try:
+                agent = fn()
+            except Exception:
+                agent = None
+
+    # 3/4. explicit agents
+    if agent is None:
+        for attr in ("build_agent", "plan_agent"):
+            candidate = getattr(coordinator, attr, None)
+            if candidate is not None:
+                agent = candidate
+                break
+
+    if agent is None:
+        return None
+
+    loop = getattr(agent, "loop", None)
+    if loop is not None:
+        ctx = getattr(loop, "context", None)
+        if ctx is not None:
+            return ctx
+
+    # 6. fallback: context_manager with usage attributes
+    cm = getattr(agent, "context_manager", None)
+    if cm is not None:
+        if any(
+            hasattr(cm, k) for k in
+            ("tokens_used", "input_tokens", "output_tokens", "llm_calls")
+        ):
+            return cm
+
+    return None
+
 
 class LLMCostPanel(Vertical):
     DEFAULT_CSS = f"""
@@ -448,6 +563,7 @@ class LLMCostPanel(Vertical):
         self._app = app_ref
         self._query_start_ts: float = 0.0
         self._query_active: bool = False
+        self._frozen_dur: float = 0.0
 
     def compose(self) -> ComposeResult:
         yield Static(f"[bold {GREEN}]▌ LLM COST[/]", markup=True)
@@ -468,6 +584,7 @@ class LLMCostPanel(Vertical):
         yield Static("", id="cost-q-calls", classes="value")
         yield Static("", id="cost-q-tools", classes="value")
         yield Static("", id="cost-q-dur",   classes="value")
+        yield Static("", id="cost-q-tps",   classes="dim")
         yield Static("── session ──", classes="head")
         yield Static("", id="cost-s-in",    classes="value")
         yield Static("", id="cost-s-out",   classes="value")
@@ -476,10 +593,11 @@ class LLMCostPanel(Vertical):
         yield Static("", id="cost-s-tools", classes="value")
         yield Static("", id="cost-s-turns", classes="value")
         yield Static("", id="cost-s-cost",  classes="value")
+        yield Static("", id="cost-s-tps",   classes="dim")
 
     def on_mount(self) -> None:
         self.refresh_values()
-        self.set_interval(1.0, self.refresh_values)
+        self.set_interval(0.5, self.refresh_values)
 
     def _coordinator_status(self) -> dict:
         try:
@@ -496,28 +614,7 @@ class LLMCostPanel(Vertical):
         return {}
 
     def _loop_context(self) -> Any:
-        coord = getattr(self._app, "coordinator", None)
-        if coord is None:
-            return None
-        agent = None
-        try:
-            fn = getattr(coord, "get_current_agent", None)
-            if callable(fn):
-                agent = fn()
-        except Exception:
-            agent = None
-        if agent is None:
-            for attr in ("build_agent", "plan_agent"):
-                candidate = getattr(coord, attr, None)
-                if candidate is not None:
-                    agent = candidate
-                    break
-        if agent is None:
-            return None
-        loop = getattr(agent, "loop", None)
-        if loop is None:
-            return None
-        return getattr(loop, "context", None)
+        return _probe_loop_context(getattr(self._app, "coordinator", None))
 
     @staticmethod
     def _num(obj: Any, *names: str) -> int:
@@ -560,9 +657,12 @@ class LLMCostPanel(Vertical):
     def mark_query_start(self) -> None:
         self._query_start_ts = time.time()
         self._query_active = True
+        self._frozen_dur = 0.0
         self.refresh_values()
 
     def mark_query_end(self) -> None:
+        if self._query_active and self._query_start_ts:
+            self._frozen_dur = time.time() - self._query_start_ts
         self._query_active = False
         self.refresh_values()
 
@@ -593,6 +693,12 @@ class LLMCostPanel(Vertical):
         self._update("#cost-provider", f"[{TEXT}]{_esc(provider)}[/]")
         self._update("#cost-session", f"[{TEXT}]{_esc(session_id)}[/]")
 
+        # ---- this query ----
+        # [Token-count fix] Read the live loop context FIRST; only fall back
+        # to the coordinator status dict if the loop isn't reachable.
+        qi = qo = qt = qc = qtools = 0
+        qdur = 0.0
+
         if ctx is not None:
             qi = self._num(ctx, "input_tokens", "prompt_tokens")
             qo = self._num(ctx, "output_tokens", "completion_tokens")
@@ -602,14 +708,29 @@ class LLMCostPanel(Vertical):
             if actions is None and isinstance(ctx, dict):
                 actions = ctx.get("actions_taken")
             qtools = len(actions) if actions is not None else 0
-            start_ts = self._flt(ctx, "start_time") or self._query_start_ts
-            qdur = time.time() - start_ts if start_ts else 0.0
-        else:
-            qi = qo = qt = qc = qtools = 0
-            qdur = (
-                time.time() - self._query_start_ts
-                if self._query_active and self._query_start_ts else 0.0
-            )
+            start_ts = self._flt(ctx, "start_time")
+            if start_ts:
+                qdur = time.time() - start_ts
+            elif self._query_active and self._query_start_ts:
+                qdur = time.time() - self._query_start_ts
+        elif status:
+            qi = self._num(status, "input_tokens", "prompt_tokens",
+                           "query_input_tokens")
+            qo = self._num(status, "output_tokens", "completion_tokens",
+                           "query_output_tokens")
+            qt = self._num(status, "tokens_used", "query_tokens",
+                           "total_tokens") or (qi + qo)
+            qc = self._num(status, "llm_calls", "api_calls",
+                           "query_llm_calls")
+            qtools = self._num(status, "total_tool_calls", "tool_calls_total")
+            qdur = self._flt(status, "turn_duration", "query_duration")
+
+        if not qdur and self._query_active and self._query_start_ts:
+            qdur = time.time() - self._query_start_ts
+        if not qdur and self._frozen_dur:
+            qdur = self._frozen_dur
+
+        tps = (qo / qdur) if qdur > 0 and qo else 0.0
 
         self._update("#cost-q-in", f"[{MUTED}]in[/]      [{TEXT}]{_fmt(qi)}[/]")
         self._update("#cost-q-out", f"[{MUTED}]out[/]     [{TEXT}]{_fmt(qo)}[/]")
@@ -617,38 +738,57 @@ class LLMCostPanel(Vertical):
         self._update("#cost-q-calls", f"[{MUTED}]api calls[/]  [{AMBER}]{_fmt(qc)}[/]")
         self._update("#cost-q-tools", f"[{MUTED}]tool calls[/] [{TEXT}]{_fmt(qtools)}[/]")
         self._update("#cost-q-dur", f"[{MUTED}]duration[/]  [{TEXT}]{qdur:.1f}s[/]")
+        self._update("#cost-q-tps", f"[{MUTED}]tok/s[/]     [{TEXT}]{tps:.1f}[/]")
 
-        si = self._num(status, "input_tokens", "prompt_tokens", "total_input_tokens")
-        so = self._num(status, "output_tokens", "completion_tokens", "total_output_tokens")
-        st = self._num(status, "tokens_used", "total_tokens") or (si + so)
-        sc = self._num(status, "llm_calls", "api_calls", "total_llm_calls")
-        tools_used = None
-        if isinstance(status, dict):
-            tools_used = status.get("tools_used") or status.get("tool_calls")
+        # ---- session ----
+        si = so = st = sc = 0
         stools = 0
-        if isinstance(tools_used, dict):
-            try:
-                stools = sum(int(v) for v in tools_used.values())
-            except Exception:
-                stools = 0
-        elif isinstance(tools_used, (int, float)):
-            stools = int(tools_used)
-        if stools == 0:
-            stools = self._num(status, "total_tool_calls", "tool_calls_total")
-        sturns = self._num(status, "turn_count", "turns", "message_count", "messages")
-        scost = self._flt(status, "cost", "total_cost", "cost_usd")
+        sturns = 0
+        scost = 0.0
+
+        if ctx is not None:
+            si = self._num(ctx, "input_tokens", "prompt_tokens")
+            so = self._num(ctx, "output_tokens", "completion_tokens")
+            st = self._num(ctx, "tokens_used", "total_tokens") or (si + so)
+            sc = self._num(ctx, "llm_calls", "api_calls")
+            actions = getattr(ctx, "actions_taken", None)
+            if actions is None and isinstance(ctx, dict):
+                actions = ctx.get("actions_taken")
+            stools = len(actions) if actions is not None else 0
+            scost = self._flt(ctx, "cost")
+
+        if si == 0 and so == 0 and st == 0 and status:
+            si = self._num(status, "input_tokens", "prompt_tokens",
+                           "total_input_tokens")
+            so = self._num(status, "output_tokens", "completion_tokens",
+                           "total_output_tokens")
+            st = self._num(status, "tokens_used", "total_tokens") or (si + so)
+        if not sc and status:
+            sc = self._num(status, "llm_calls", "api_calls",
+                           "total_llm_calls")
+        if not stools and status:
+            tools_used = status.get("tools_used") or status.get("tool_calls")
+            if isinstance(tools_used, dict):
+                try:
+                    stools = sum(int(v) for v in tools_used.values())
+                except Exception:
+                    stools = 0
+            elif isinstance(tools_used, (int, float)):
+                stools = int(tools_used)
+            if not stools:
+                stools = self._num(status, "total_tool_calls", "tool_calls_total")
+        if not sturns and status:
+            sturns = self._num(status, "turn_count", "turns",
+                               "message_count", "messages")
+        if not scost and status:
+            scost = self._flt(status, "cost", "total_cost", "cost_usd")
 
         if st == 0:
             st = int(getattr(self._app, "tokens_used", 0) or 0)
         if sturns == 0:
             sturns = int(getattr(self._app, "message_count", 0) or 0)
 
-        if st == 0 and ctx is not None:
-            si = self._num(ctx, "input_tokens")
-            so = self._num(ctx, "output_tokens")
-            st = self._num(ctx, "tokens_used") or (si + so)
-            sc = self._num(ctx, "llm_calls")
-            stools = stools or (len(getattr(ctx, "actions_taken", []) or []))
+        stps = (so / qdur) if qdur > 0 and so else 0.0
 
         self._update("#cost-s-in", f"[{MUTED}]in[/]      [{TEXT}]{_fmt(si)}[/]")
         self._update("#cost-s-out", f"[{MUTED}]out[/]     [{TEXT}]{_fmt(so)}[/]")
@@ -660,6 +800,7 @@ class LLMCostPanel(Vertical):
             "#cost-s-cost",
             f"[{MUTED}]cost[/]      [{GREEN_GLOW}]{_fmt_cost(scost)}[/]",
         )
+        self._update("#cost-s-tps", f"[{MUTED}]tok/s[/]     [{TEXT}]{stps:.1f}[/]")
 
     def _update(self, selector: str, markup: str) -> None:
         try:
@@ -914,6 +1055,10 @@ class DepressionApp(App):
     live_output_tokens: reactive[int] = reactive(0)
     live_total_tokens: reactive[int] = reactive(0)
 
+    # [Spinner fix] Tick a dedicated reactive so the spinner animates even
+    # when no messages are being written.
+    spinner_tick: reactive[int] = reactive(0)
+
     def __init__(
         self,
         coordinator: Optional[AgentCoordinator] = None,
@@ -1035,9 +1180,18 @@ class DepressionApp(App):
         self._refresh_token_bar()
         self._refresh_llmcost_panel()
 
+        # [Spinner fix] Animate the mode chip independently of message_count.
+        self.set_interval(0.12, self._tick_spinner)
+
         self._mounted = True
 
         self.call_later(self._maybe_onboard)
+
+    def _tick_spinner(self) -> None:
+        if not self.busy:
+            return
+        self.spinner_tick = (self.spinner_tick + 1) % 10_000
+        self._refresh_mode_chip()
 
     def _load_identity_from_env(self) -> None:
         try:
@@ -1064,6 +1218,31 @@ class DepressionApp(App):
         except Exception:
             pass
 
+    def _is_real_user_profile(self, profile: Any) -> bool:
+        """Check if profile is a real signed-in user (not placeholder/guest)."""
+        try:
+            if not profile or not getattr(profile, "signed_in", False):
+                return False
+            if getattr(profile, "metadata", {}).get("local"):
+                return False
+            uid = getattr(profile, "uid", "") or ""
+            email = getattr(profile, "email", "") or ""
+            name = getattr(profile, "name", "") or ""
+            # Detect placeholder/fake profiles
+            if uid.startswith("firebase-uid-") or uid == "local-guest":
+                return False
+            if email in ("user@gmail.com", "") or name in ("Real User", "Local user", ""):
+                return False
+            # Real profile should have tokens saved
+            from agent.tui.onboarding.profile import ProfileStore
+            store = ProfileStore()
+            tokens = store.load_tokens()
+            if not tokens or not tokens.get("refresh_token"):
+                return False
+            return True
+        except Exception:
+            return False
+
     async def _maybe_onboard(self) -> None:
         if self.skip_onboarding:
             from agent.tui.onboarding.profile import guest_profile, ProfileStore
@@ -1078,6 +1257,17 @@ class DepressionApp(App):
                     self._sync_identity(profile)
             return
 
+        # Normal mode: check for real user profile before deciding to show welcome
+        from agent.tui.onboarding.profile import ProfileStore
+        store = ProfileStore()
+        existing_profile = store.load()
+        
+        if existing_profile and self._is_real_user_profile(existing_profile):
+            # Real signed-in user exists, skip welcome
+            self._sync_identity(existing_profile)
+            return
+
+        # No real user profile (no profile, guest, or placeholder) -> show welcome
         from agent.tui.onboarding.welcome import push_welcome_if_new_user
 
         prompt = None
@@ -1272,9 +1462,9 @@ class DepressionApp(App):
     # ------------------------------------------------------------------
 
     async def _on_tool_event(self, event: AgentEvent) -> None:
+        # [UI fix] Do not gate on self.is_running — the first tool event can
+        # arrive before the app fully settles, and dropping it loses UI state.
         if self._is_shutting_down:
-            return
-        if not self.is_running:
             return
 
         data = event.payload or {}
@@ -1515,28 +1705,36 @@ class DepressionApp(App):
     # ------------------------------------------------------------------
 
     def _sync_tokens_from_loop(self) -> None:
-        loop_obj = None
-        if self.coordinator is not None:
-            try:
-                agent = self.coordinator.get_current_agent()
-            except Exception:
-                agent = getattr(self.coordinator, "build_agent", None)
-            loop_obj = getattr(agent, "loop", None)
-        if loop_obj is None:
-            return
-        ctx = getattr(loop_obj, "context", None)
+        # [Token-count fix] Use the shared probe so we always find the
+        # live loop context if one exists.
+        ctx = _probe_loop_context(self.coordinator)
         if ctx is None:
             return
         try:
-            self.live_input_tokens = int(getattr(ctx, "input_tokens", 0) or 0)
-            self.live_output_tokens = int(getattr(ctx, "output_tokens", 0) or 0)
-            total = getattr(ctx, "tokens_used", 0) or 0
+            self.live_input_tokens = int(
+                _get(ctx, "input_tokens", "prompt_tokens", default=0) or 0
+            )
+            self.live_output_tokens = int(
+                _get(ctx, "output_tokens", "completion_tokens", default=0) or 0
+            )
+            total = int(
+                _get(ctx, "tokens_used", "total_tokens", default=0) or 0
+            )
             if not total:
                 total = self.live_input_tokens + self.live_output_tokens
-            self.live_total_tokens = int(total)
+            self.live_total_tokens = total
+
+            # Also keep the app-level reactive counters in sync so the
+            # ContextPanel and the token bar agree.
+            if total:
+                self.tokens_used = total
+            cost = float(_get(ctx, "cost", default=0.0) or 0.0)
+            if cost:
+                self.cost = cost
         except Exception:
             pass
         self._refresh_token_bar()
+        self._refresh_context_panel()
 
     def _token_bar(self) -> str:
         ti = self.live_input_tokens
@@ -1612,7 +1810,7 @@ class DepressionApp(App):
 
         prefix = ""
         if self.busy:
-            spin = SPINNER_FRAMES[self.message_count % len(SPINNER_FRAMES)]
+            spin = SPINNER_FRAMES[self.spinner_tick % len(SPINNER_FRAMES)]
             prefix = f"[{AMBER}]{spin}[/] "
 
         pct = (self.tokens_used / max(1, self.context_window)) * 100.0

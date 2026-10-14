@@ -86,6 +86,25 @@ TOTAL_FAILURE_CAP = 15
 PER_TOOL_FAILURE_CAP = 5
 SAME_ARGS_FAILURE_CAP = 2
 
+# [Duplicate success detection] A successful call with identical name+args
+# re-issued within this window is treated as a stall and refused.
+SAME_ARGS_SUCCESS_WINDOW_S = 30.0
+SAME_ARGS_SUCCESS_CAP = 2
+
+# [Read-only heuristic] Used when the registry cannot answer.
+_READ_ONLY_TOOL_NAMES = frozenset({
+    "read", "read_file", "list", "list_dir", "ls", "glob", "grep", "find",
+    "search", "cat", "head", "tail", "stat", "file_info", "filesystem_read",
+    "question", "todo_read", "todo_list",
+})
+
+_MUTATING_TOOL_NAMES = frozenset({
+    "write", "write_file", "edit", "apply_patch", "patch", "create",
+    "delete", "remove", "move", "rename", "mkdir", "rmdir", "truncate",
+    "todo_write", "todo_add", "todo_update", "bash", "terminal", "shell",
+    "exec", "run", "execute",
+})
+
 _LAUNCH_INTENT_PATTERNS = (
     re.compile(r"\b(run|launch|start|open|execute|serve)\b", re.I),
     re.compile(r"\bshow\s+me\b", re.I),
@@ -311,6 +330,33 @@ def _looks_destructive_call(name: str, args: Dict[str, Any]) -> bool:
     return False
 
 
+def _mutation_target(name: str, args: Dict[str, Any]) -> Optional[str]:
+    """Best-effort target identity for a mutating call.
+
+    Used to scope verification clearing so a read of file A does not clear
+    a pending verification for file B.
+    """
+    if not isinstance(args, dict):
+        return None
+    for key in ("path", "filePath", "file_path", "filename", "file", "target"):
+        v = args.get(key)
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+    # bash/terminal: derive target from a redirect or the command itself
+    cmd = args.get("command")
+    if isinstance(cmd, str) and cmd.strip():
+        m = re.search(r">\s*([^\s|;&]+)", cmd)
+        if m:
+            return m.group(1).strip()
+        return f"cmd::{cmd.strip()[:120]}"
+    return None
+
+
+def _read_target(name: str, args: Dict[str, Any]) -> Optional[str]:
+    """Target identity for a read call, matching _mutation_target keys."""
+    return _mutation_target(name, args)
+
+
 class LoopState(Enum):
     IDLE = "idle"
     INITIALIZING = "initializing"
@@ -435,6 +481,9 @@ class AgentLoop:
         self._checklist_rendered = False
         self._last_checklist_signature: Optional[tuple] = None
 
+        # [Duplicate success detection] signature -> list of (timestamp, result_hash)
+        self._successful_call_history: Dict[str, List[tuple]] = {}
+
     @property
     def model_context(self):
         return self.agent.context_manager
@@ -533,14 +582,35 @@ class AgentLoop:
     # ------------------------------------------------------------------
 
     def _is_read_only(self, name: str) -> bool:
+        """Return True if the tool only reads state.
+
+        Tries the registry probe first; falls back to a name heuristic so a
+        broken/missing probe does not classify every tool as a mutation.
+        """
         probe = getattr(self.tool_registry, "is_read_only", None)
-        if not callable(probe):
+        if callable(probe):
+            try:
+                return bool(probe(name))
+            except Exception:
+                logger.debug("is_read_only(%s) probe failed", name, exc_info=True)
+
+        n = (name or "").lower()
+        if n in _READ_ONLY_TOOL_NAMES:
+            return True
+        if n in _MUTATING_TOOL_NAMES:
             return False
-        try:
-            return bool(probe(name))
-        except Exception:
-            logger.debug("is_read_only(%s) probe failed", name, exc_info=True)
-            return False
+        # Heuristic on name substrings.
+        for tok in ("read", "list", "get", "show", "cat", "search", "find",
+                    "glob", "grep", "stat", "info", "question"):
+            if tok in n:
+                return True
+        for tok in ("write", "edit", "create", "delete", "remove", "move",
+                    "rename", "patch", "exec", "run", "bash", "terminal"):
+            if tok in n:
+                return False
+        # Unknown tool: default to "not read-only" so we err on the side of
+        # asking the model to verify rather than silently trusting it.
+        return False
 
     def _registry_epoch(self) -> int:
         epoch = getattr(self.tool_registry, "mutation_epoch", 0)
@@ -676,7 +746,11 @@ class AgentLoop:
                 temperature=temperature,
                 max_tokens=max_tokens,
             ):
-                delta = getattr(chunk, "content", "") or ""
+                delta = (
+                    getattr(chunk, "text", "")
+                    or getattr(chunk, "content", "")
+                    or ""
+                )
                 if delta:
                     accumulated_text.append(delta)
                     await self._trigger_event("on_token", {"delta": delta})
@@ -737,6 +811,7 @@ class AgentLoop:
         self.pending_tool_calls = []
         self.completed_tool_calls = []
         self.tool_result_cache.clear()
+        self._successful_call_history.clear()
         self._cache_epoch = self._registry_epoch()
         self.should_stop = False
         self.is_paused = False
@@ -778,6 +853,24 @@ class AgentLoop:
                 plan_result = await self._run_plan_driven(query, context)
                 if plan_result is not None:
                     return plan_result
+                # FIX: previously fell through to _run_free_form, redoing work.
+                # Now we synthesize a result from whatever the plan produced.
+                logger.warning(
+                    "Plan-driven loop returned without a result; "
+                    "synthesizing from plan state instead of re-entering free-form"
+                )
+                self._update_metrics()
+                summary = await self._summarize_plan_safe()
+                summary = await self._ensure_demo_offer(summary)
+                failed = [
+                    t for t in (self.current_plan._all_tasks() if self.current_plan else [])
+                    if t.status in (TaskStatus.FAILED, TaskStatus.SKIPPED)
+                ]
+                return self._result(
+                    not failed,
+                    summary,
+                    error=(f"{len(failed)} task(s) failed or skipped" if failed else None),
+                )
 
             return await self._run_free_form(query)
 
@@ -893,28 +986,40 @@ class AgentLoop:
 
             response_text = (thought.get("response") or "").strip()
 
+            # FIX: verification gate now correctly respects the nudge budget
+            # and the mutation list is scoped (see _track_mutation_or_read /
+            # _clear_unverified_mutations). If the model has explicitly
+            # declared UNVERIFIED, or the budget is exhausted, we accept.
             if (
                 self.require_verification
                 and self.context.unverified_mutations
                 and self.context.verification_nudges < self.max_verification_nudges
                 and self.context.iteration < self.max_iterations
+                and not self._declared_unverified(response_text)
             ):
-                if not self._declared_unverified(response_text):
-                    self.context.verification_nudges += 1
-                    logger.info(
-                        "Refusing final answer: %d unverified mutation(s) "
-                        "(nudge %d/%d)",
-                        len(self.context.unverified_mutations),
-                        self.context.verification_nudges,
-                        self.max_verification_nudges,
-                    )
-                    await self._inject_verification_guidance()
-                    continue
+                self.context.verification_nudges += 1
+                logger.info(
+                    "Refusing final answer: %d unverified mutation(s) "
+                    "(nudge %d/%d)",
+                    len(self.context.unverified_mutations),
+                    self.context.verification_nudges,
+                    self.max_verification_nudges,
+                )
+                await self._inject_verification_guidance()
+                continue
 
+            if self.context.unverified_mutations:
                 self.context.metadata["unverified_declared"] = True
 
             if not response_text:
                 response_text = await self._generate_final_response()
+
+            if not response_text:
+                response_text = (
+                    "I stopped before producing a final answer. "
+                    "The last tool activity is in the transcript above; "
+                    "tell me how you'd like to proceed."
+                )
 
             response_text = await self._ensure_demo_offer(response_text)
 
@@ -925,6 +1030,11 @@ class AgentLoop:
         self.context.hit_iteration_limit = self.context.iteration >= self.max_iterations
         self.state = LoopState.STOPPED
         final = await self._generate_final_response()
+        if not final:
+            final = (
+                "I hit the iteration limit before finishing. "
+                "Here's what I have so far; tell me how you'd like to continue."
+            )
         final = await self._ensure_demo_offer(final)
         self._update_metrics()
         success = bool(final and final.strip())
@@ -1054,6 +1164,21 @@ class AgentLoop:
             return self._result(True, summary)
 
         return None
+
+    async def _summarize_plan_safe(self) -> str:
+        """Fallback summarizer used when _run_plan_driven returns None."""
+        try:
+            plan = self.current_plan
+            if plan is None:
+                return "Plan execution ended without a plan."
+            try:
+                system_prompt = await self._get_system_prompt()
+            except Exception:
+                system_prompt = "You are an autonomous AI agent."
+            return await self._summarize_plan(plan, system_prompt)
+        except Exception as exc:
+            logger.debug("Plan summary fallback failed: %s", exc)
+            return "Plan execution ended. See transcript above for details."
 
     async def _execute_task_turn(
         self,
@@ -1410,6 +1535,7 @@ INTENT
 - Analyze/Review → inspect and report; do not modify unless requested.
 - Use conversation history and prior results. Never repeat completed work unnecessarily.
 - Ask one concise question only when essential information is missing; otherwise use sensible defaults.
+- understand the user intent clearly and make decisions according to that 
 
 CONTEXT & COST
 - Never read every file in a directory by default.
@@ -2077,6 +2203,40 @@ or a genuine external blocker requires user input.
                 "result": result, "success": False, "params": args,
             }
 
+        # FIX: detect identical *successful* calls re-issued in a short window
+        # (the model re-reading the same file with the same args, etc.). This
+        # stops the loop from churning on no-op repeats even when the tool
+        # "succeeds" every time.
+        dup_success = self._is_duplicate_successful_call(name, args)
+        if dup_success is not None:
+            logger.info(
+                "Refusing duplicate successful call within window: %s", name
+            )
+            result = {
+                "success": True,
+                "result": dup_success,
+                "duplicate": True,
+                "note": (
+                    "This exact call already returned the same result moments "
+                    "ago. Reuse the earlier result; do not re-issue it."
+                ),
+            }
+            await self._safe_add_tool_result(call, result)
+            self.completed_tool_calls.append(call)
+            self.context.add_action({
+                "tool": name, "tool_call_id": call_id,
+                "params": args, "result": result,
+                "time": 0.0, "cached": True, "duplicate": True,
+            })
+            await self._trigger_event("on_tool_executed", {
+                "tool": name, "tool_call_id": call_id,
+                "params": args, "result": result, "duplicate": True,
+            })
+            return {
+                "tool": name, "tool_call_id": call_id,
+                "result": result, "cached": True, "params": args,
+            }
+
         if (
             self.require_permission_for_destructive
             and _looks_destructive_call(name, args)
@@ -2123,7 +2283,7 @@ or a genuine external blocker requires user input.
                     "time": 0.0, "cached": True,
                 })
                 if result.get("success", False) and self._is_read_only(name):
-                    self._clear_unverified_mutations(name)
+                    self._clear_unverified_mutations(name, args)
                 await self._trigger_event("on_tool_executed", {
                     "tool": name, "tool_call_id": call_id,
                     "params": args, "result": result, "cached": True,
@@ -2176,6 +2336,7 @@ or a genuine external blocker requires user input.
                         "result": result, "timestamp": time.time(),
                     }
                 self._track_mutation_or_read(name, args, call_id, result)
+                self._remember_successful_call(name, args, result)
 
             self.completed_tool_calls.append(call)
             await self._trigger_event("on_tool_executed", {
@@ -2240,6 +2401,63 @@ or a genuine external blocker requires user input.
         return None
 
     # ------------------------------------------------------------------
+    # Duplicate successful-call detection
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _result_fingerprint(result: Dict[str, Any]) -> str:
+        try:
+            h = hashlib.sha1()
+            h.update(json.dumps(result, sort_keys=True, default=str).encode("utf-8"))
+            return h.hexdigest()
+        except Exception:
+            return ""
+
+    def _remember_successful_call(
+        self,
+        name: str,
+        args: Dict[str, Any],
+        result: Dict[str, Any],
+    ) -> None:
+        sig = self._call_signature(name, args)
+        if sig is None:
+            return
+        fp = self._result_fingerprint(result)
+        if not fp:
+            return
+        now = time.time()
+        bucket = self._successful_call_history.setdefault(sig, [])
+        bucket.append((now, fp))
+        # Trim old entries.
+        cutoff = now - SAME_ARGS_SUCCESS_WINDOW_S
+        self._successful_call_history[sig] = [
+            (ts, f) for (ts, f) in bucket if ts >= cutoff
+        ]
+
+    def _is_duplicate_successful_call(
+        self,
+        name: str,
+        args: Dict[str, Any],
+    ) -> Optional[Any]:
+        sig = self._call_signature(name, args)
+        if sig is None:
+            return None
+        bucket = self._successful_call_history.get(sig) or []
+        if not bucket:
+            return None
+        now = time.time()
+        recent = [(ts, fp) for (ts, fp) in bucket if now - ts <= SAME_ARGS_SUCCESS_WINDOW_S]
+        if len(recent) < SAME_ARGS_SUCCESS_CAP:
+            return None
+        # Look up the cached result content to hand back.
+        cache_key = sig  # same shape as _act_one's cache key
+        cached = self.tool_result_cache.get(cache_key)
+        if cached and cached.get("result"):
+            return cached["result"]
+        # Fall back to a marker so the model knows it already saw this.
+        return {"note": "duplicate successful call; earlier result was identical"}
+
+    # ------------------------------------------------------------------
     # Verification gate
     # ------------------------------------------------------------------
 
@@ -2254,34 +2472,73 @@ or a genuine external blocker requires user input.
             return
 
         if self._is_read_only(name):
-            self._clear_unverified_mutations(name)
+            # Reading a specific target clears only the pending mutations that
+            # touch that same target. Unrelated mutations stay pending.
+            self._clear_unverified_mutations(name, args)
             return
 
+        target = _mutation_target(name, args)
+        # Dedupe: if there's already a pending entry for the same
+        # (tool, target), replace it instead of stacking duplicates.
+        for entry in list(self.context.unverified_mutations):
+            if entry.get("tool") == name and entry.get("target") == target:
+                entry["time"] = time.time()
+                entry["call_id"] = call_id
+                return
         self.context.unverified_mutations.append({
             "tool": name,
             "args": args,
+            "target": target,
             "call_id": call_id,
             "time": time.time(),
         })
         logger.debug(
-            "Recorded unverified mutation: %s (%d pending)",
-            name, len(self.context.unverified_mutations),
+            "Recorded unverified mutation: %s target=%s (%d pending)",
+            name, target, len(self.context.unverified_mutations),
         )
 
-    def _clear_unverified_mutations(self, by_tool: str) -> None:
+    def _clear_unverified_mutations(
+        self,
+        by_tool: str,
+        by_args: Optional[Dict[str, Any]] = None,
+    ) -> None:
         if not self.context.unverified_mutations:
             return
-        self.context.unverified_mutations.clear()
+        if by_args is None:
+            # Backwards-compatible full clear (used only when caller truly
+            # wants to wipe everything).
+            self.context.unverified_mutations.clear()
+            return
+
+        target = _read_target(by_tool, by_args)
+        if not target:
+            # Read without an identifiable target: don't clear anything,
+            # otherwise a `list` call would wipe unrelated pending writes.
+            return
+
+        remaining = [
+            m for m in self.context.unverified_mutations
+            if m.get("target") != target
+        ]
+        cleared = len(self.context.unverified_mutations) - len(remaining)
+        self.context.unverified_mutations = remaining
+        if cleared:
+            logger.debug(
+                "Cleared %d unverified mutation(s) for target=%s",
+                cleared, target,
+            )
 
     async def _inject_verification_guidance(self) -> None:
         pending = self.context.unverified_mutations
         if not pending:
             return
         names = sorted({m["tool"] for m in pending})
+        targets = sorted({m.get("target") or "?" for m in pending})
         count = len(pending)
         msg = (
             f"You have {count} unverified change(s) to state via: "
             f"{', '.join(names)}.\n"
+            f"Targets: {', '.join(targets)}\n"
             f"Before answering, verify each change: read the changed "
             f"section back, or rerun the affected command, and quote the "
             f"actual output as evidence.\n"
@@ -2616,10 +2873,20 @@ or a genuine external blocker requires user input.
             raise
         except Exception as exc:
             logger.error("Final response generation failed: %s", exc)
-            return ""
+            # FIX: do not return empty string; give the caller something
+            # usable so the loop always has a final response.
+            return (
+                "I wasn't able to generate a final summary, but the work "
+                "above is complete. Check the transcript for tool output."
+            )
 
         content = getattr(response, "content", "") or ""
         self._record_usage(getattr(response, "usage", None))
+        if not content.strip():
+            return (
+                "I finished the available steps but couldn't produce a "
+                "summary. See the transcript above for the tool activity."
+            )
         return content
 
     # ==================================================================
@@ -2646,6 +2913,7 @@ or a genuine external blocker requires user input.
         self.pending_tool_calls = []
         self.completed_tool_calls = []
         self.tool_result_cache.clear()
+        self._successful_call_history.clear()
         self._cache_epoch = self._registry_epoch()
         self.should_stop = False
         self.is_paused = False
