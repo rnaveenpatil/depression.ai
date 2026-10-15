@@ -2161,7 +2161,8 @@ class DepressionApp(App):
                 self.coordinator.process_query(
                     text,
                     mode=self.current_mode,
-                    auto_execute=True,
+                    # Plan mode is planning-only; build/auto may auto-execute.
+                    auto_execute=(self.current_mode != "plan"),
                 ),
                 timeout=self.turn_timeout,
             )

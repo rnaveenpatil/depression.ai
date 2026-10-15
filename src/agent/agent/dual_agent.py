@@ -897,6 +897,14 @@ class AgentCoordinator:
     ) -> Dict[str, Any]:
         effective_mode = mode or self.current_mode
 
+        # Plan mode is strictly planning-only: never auto-escalate to the
+        # build agent (which has write access), regardless of what the caller
+        # requested. Auto-execution is honoured only in build/auto modes.
+        if effective_mode == "plan":
+            if auto_execute:
+                logger.info("Plan mode: ignoring auto_execute (planning only)")
+            auto_execute = False
+
         if effective_mode == "auto":
             return await self._process_auto(query, context, auto_execute, max_iterations)
 

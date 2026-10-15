@@ -638,12 +638,15 @@ Examples:
 
         start = time.time()
         try:
-            # Use current mode for processing
+            # Use current mode for processing.
+            # Plan mode is planning-only: never auto-execute the plan.
+            # Build/auto modes may auto-execute (plan -> build hand-off).
+            mode = self.agent_coordinator.current_mode
             result = await asyncio.wait_for(
                 self.agent_coordinator.process_query(
-                    text, 
-                    mode=self.agent_coordinator.current_mode,
-                    auto_execute=True,  # Auto-execute plan if in plan mode
+                    text,
+                    mode=mode,
+                    auto_execute=(mode != "plan"),
                 ),
                 timeout=self.args.timeout,
             )
