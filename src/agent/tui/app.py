@@ -1726,11 +1726,11 @@ class DepressionApp(App):
 
             # Also keep the app-level reactive counters in sync so the
             # ContextPanel and the token bar agree.
-            if total:
-                self.tokens_used = total
-            cost = float(_get(ctx, "cost", default=0.0) or 0.0)
-            if cost:
-                self.cost = cost
+           # if total:
+           #    self.tokens_used = total
+            #cost = float(_get(ctx, "cost", default=0.0) or 0.0)
+           # if cost:
+            #    self.cost = cost
         except Exception:
             pass
         self._refresh_token_bar()

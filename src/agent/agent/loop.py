@@ -764,8 +764,16 @@ class AgentLoop:
                     final_finish = fr
 
                 u = getattr(chunk, "usage", None)
-                if isinstance(u, dict) and u:
-                    final_usage = u
+                if u:
+                    if isinstance(u, dict):
+                        final_usage = u
+                    else:
+                        # Handle NormalizedUsage object from normalizer
+                        final_usage = {
+                            "prompt_tokens": getattr(u, "prompt_tokens", 0),
+                            "completion_tokens": getattr(u, "completion_tokens", 0),
+                            "total_tokens": getattr(u, "total_tokens", 0),
+                        }
 
                 m = getattr(chunk, "model", None)
                 if m:
@@ -1552,6 +1560,7 @@ CONTEXT & COST
 EXECUTION
 - For nontrivial tasks: understand → act → observe → adapt → verify.
 - Planning must lead to action. Do not narrate plans unnecessarily.
+-  use the todo panel if your doing complex multi step tasks show that to do list to user
 - Make minimal, targeted changes and preserve unrelated code, APIs, user data, and project conventions.
 - On failure, diagnose before retrying; change the arguments or approach. Never repeat an identical failed call. After two failures, switch methods.
 - Respect permissions and required approvals. Never bypass denied operations.
