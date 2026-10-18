@@ -1713,7 +1713,6 @@ The development direction includes:
 **Lead Developer**
 
 * Email: `rnaveenpatil@gmail.com`
-* Phone: `7483894502`
 * LinkedIn: https://www.linkedin.com/in/r-naveen-patil-a45403292/
 * GitHub: https://github.com/rnaveenpatil
 * Portfolio: https://rnaveenpatil-resume.netlify.app
@@ -1723,7 +1722,6 @@ The development direction includes:
 **Teammate**
 
 * Email: `rjadav214@gmail.com`
-* Phone: `8296537642`
 * LinkedIn: https://www.linkedin.com/in/subzero91/
 * GitHub: https://github.com/Rahul-Jadav-0
 
@@ -1732,7 +1730,6 @@ The development direction includes:
 **Teammate**
 
 * Email: `meghashree.kg13@gmail.com`
-* Phone: `8431898976`
 * LinkedIn: https://www.linkedin.com/in/k-g-meghashree/
 * GitHub: https://github.com/Meghashree-13
 
@@ -1741,7 +1738,6 @@ The development direction includes:
 **Teammate**
 
 * Email: `mssumanth836@gmail.com`
-* Phone: `9481864481`
 * LinkedIn: https://www.linkedin.com/in/sumantha-ms-235ba2295/
 
 ---
