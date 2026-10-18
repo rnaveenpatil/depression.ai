@@ -1731,7 +1731,7 @@ The development direction includes:
 
 * Email: `meghashree.kg13@gmail.com`
 * LinkedIn: https://www.linkedin.com/in/k-g-meghashree/
-* GitHub/Portfolio: https://github.com/Meghashree-13
+* GitHub: https://github.com/Meghashree-13
 
 ## SUMANTHA MS
 
