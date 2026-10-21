@@ -1908,12 +1908,12 @@ https://github.com/rnaveenpatil/depression.ai
 
 <p align="center">
   <a href="https://youtu.be/en5f4pOvfL0">
-    <img src="https://img.youtube.com/vi/en5f4pOvfL0/maxresdefault.jpg" alt="▶ Play the depression.ai demo on YouTube" width="900">
+    <img src="https://raw.githubusercontent.com/rnaveenpatil/depression.ai/main/assets/youtube-demo-thumbnail.png" alt="▶ Play the depression.ai demo on YouTube" width="900">
   </a>
 </p>
 
 <p align="center">
-  <b><a href="https://youtu.be/en5f4pOvfL0">▶ Watch the full 7-minute walkthrough on YouTube</a></b>
+  <b><a href="https://youtu.be/en5f4pOvfL0">▶ Watch the full 11-minute walkthrough on YouTube</a></b>
 </p>
 
 See the complete setup and agent workflow in the official `depression.ai` demo — install with one command, connect your API credentials and start working with the agent on any machine.
