@@ -1,23 +1,22 @@
 # depression.ai — Project File Listing
 
-Generated: 2026-10-12 22:51:49
-Repo: 980c34f  Branch: main
+Generated: 2026-10-21 19:35:59
+Repo: e8702a8  Branch: main
 
 ## Summary
 
 | Area | Files | Size |
 |---|---:|---:|
 | `src/agent` | 107 | 89M |
-| `tests` | 25 | 796K |
+| `tests` | 25 | 820K |
 | `docs` | 12 | 2.1M |
-| `assets` | 30 | 4.3M |
-| `.agents` | 26 | 164K |
+| `assets` | 37 | 5.8M |
 | `.opencode` | 3 | 63M |
 | `.github` | 3 | 24K |
 | `.githooks` | 1 | 12K |
 | `.agent` | 3 | 20K |
-| (root files) | 16 | — |
-| **total** | **226** | |
+| (root files) | 13 | — |
+| **total** | **204** | |
 
 Excluded: .git/, deprssion/ (venv), dist/, .opencode/node_modules/,
 src/agent/depression/ (nested venv), .mypy_cache/, .pytest_cache/,
@@ -29,33 +28,11 @@ src/agent/depression/ (nested venv), .mypy_cache/, .pytest_cache/,
          0  .agent/cache/.gitkeep
        185  .agent/config.json
          0  .agent/sessions/.gitkeep
-      6111  .agents/skills/firebase-auth-basics/references/client_sdk_android.md
-      7637  .agents/skills/firebase-auth-basics/references/client_sdk_web.md
-      5507  .agents/skills/firebase-auth-basics/references/flutter_setup.md
-      2487  .agents/skills/firebase-auth-basics/references/ios_setup.md
-      1444  .agents/skills/firebase-auth-basics/references/security_rules.md
-      4671  .agents/skills/firebase-auth-basics/SKILL.md
-      5729  .agents/skills/firebase-basics/references/android_setup.md
-       464  .agents/skills/firebase-basics/references/firebase-cli-guide.md
-       692  .agents/skills/firebase-basics/references/firebase-service-init.md
-      4839  .agents/skills/firebase-basics/references/flutter_setup.md
-      4055  .agents/skills/firebase-basics/references/ios_setup.md
-      2741  .agents/skills/firebase-basics/references/local-env-setup.md
-      1311  .agents/skills/firebase-basics/references/refresh/android_studio.md
-      2119  .agents/skills/firebase-basics/references/refresh/antigravity.md
-       380  .agents/skills/firebase-basics/references/refresh/claude.md
-       482  .agents/skills/firebase-basics/references/refresh/gemini-cli.md
-      2302  .agents/skills/firebase-basics/references/refresh/other-agents.md
-       658  .agents/skills/firebase-basics/references/setup/android_studio.md
-      3398  .agents/skills/firebase-basics/references/setup/antigravity.md
-      1927  .agents/skills/firebase-basics/references/setup/claude_code.md
-      3112  .agents/skills/firebase-basics/references/setup/cursor.md
-      2037  .agents/skills/firebase-basics/references/setup/gemini_cli.md
-      3428  .agents/skills/firebase-basics/references/setup/github_copilot.md
-      3486  .agents/skills/firebase-basics/references/setup/other_agents.md
-      1675  .agents/skills/firebase-basics/references/web_setup.md
-      7268  .agents/skills/firebase-basics/SKILL.md
+     79974  assets/AWS Authentication And Account Access.png
+    119063  assets/Command Reference Interface.png
+     74053  assets/LLM Connection Configuration.png
      73281  assets/llm_connect.png
+    276779  assets/LLM Usage and Cost Tracking.png
        820  assets/main project - Repository debugging analysis_files/ansi-1f6vhsjh.css
        586  assets/main project - Repository debugging analysis_files/app-block-trigger-actions-hxl87txx.css
       3060  assets/main project - Repository debugging analysis_files/client-defined-widget-gdqdmhro.css
@@ -79,13 +56,15 @@ src/agent/depression/ (nested venv), .mypy_cache/, .pytest_cache/,
        537  assets/main project - Repository debugging analysis_files/table-components-b39fqymt.css
       1427  assets/main project - Repository debugging analysis_files/writing-block-gwgymy54.css
      25481  assets/main project - Repository debugging analysis_files/writing-block-provider-lbnz1gc0.css
-    822968  assets/meghasree.png
+   1672803  assets/meghasree.png
      83671  assets/mit_logo.png
     831244  assets/patil.png
     115380  assets/rahul.jpeg
      27582  assets/sumantha.jpeg
+     37006  assets/Tool Permission and  Execution Confirmation.png
      53560  assets/tui.png
-       296  byut.py
+     55790  assets/User Interface (1).png
+     94051  assets/User Profile.png
      73281  docs/assets/llm_connect.png
     822968  docs/assets/meghasree.png
      83671  docs/assets/mit_logo.png
@@ -98,7 +77,7 @@ src/agent/depression/ (nested venv), .mypy_cache/, .pytest_cache/,
      10040  docs/firebase-onboarding.md
      50819  docs/index.html
       2564  docs/opencode-runtime-parity-report.md
-       339  .env
+       261  .env
        283  .env.example
       6080  .githooks/pre-commit
        892  .github/workflows/publish.yml
@@ -110,15 +89,15 @@ src/agent/depression/ (nested venv), .mypy_cache/, .pytest_cache/,
         63  .opencode/.gitignore
         65  .opencode/package.json
      14634  .opencode/package-lock.json
-      2016  pyproject.toml
-     43278  README.md
+      2017  pyproject.toml
+     46245  README.md
      28156  src/agent/agent/agent.py
-     43473  src/agent/agent/dual_agent.py
+     43887  src/agent/agent/dual_agent.py
       1124  src/agent/agent/__init__.py
-    103048  src/agent/agent/loop.py
+    117298  src/agent/agent/loop.py
      35888  src/agent/agent/planner.py
      18286  src/agent/agent/subagent.py
-     74166  src/agent/cli/commands.py
+     74314  src/agent/cli/commands.py
        603  src/agent/cli/__init__.py
      35789  src/agent/cli/input.py
      24819  src/agent/cli/ui.py
@@ -138,11 +117,11 @@ src/agent/depression/ (nested venv), .mypy_cache/, .pytest_cache/,
       3314  src/agent/llm/__init__.py
      36764  src/agent/llm/normalizer.py
      43772  src/agent/llm/ollama.py
-     37920  src/agent/llm/openai_compatible.py
+     38193  src/agent/llm/openai_compatible.py
      20622  src/agent/llm/provider.py
       3390  src/agent/llm/rate_limiter.py
-     44346  src/agent/llm/runtime.py
-     29746  src/agent/main.py
+     49752  src/agent/llm/runtime.py
+     30019  src/agent/main.py
       7526  src/agent/mcp/aws_config.py
      58358  src/agent/mcp/client.py
       1745  src/agent/mcp/__init__.py
@@ -185,8 +164,8 @@ src/agent/depression/ (nested venv), .mypy_cache/, .pytest_cache/,
      11883  src/agent/tools/terminal.py
       5672  src/agent/tools/todo.py
      11049  src/agent/tools/web.py
-     82272  src/agent/tui/app.py
-      4215  src/agent/tui/events.py
+     91239  src/agent/tui/app.py
+      5688  src/agent/tui/events.py
        124  src/agent/tui/__init__.py
        113  src/agent/tui/__main__.py
      15365  src/agent/tui/onboarding/empty_banner.py
@@ -197,9 +176,9 @@ src/agent/depression/ (nested venv), .mypy_cache/, .pytest_cache/,
       9150  src/agent/tui/onboarding/identity.py
       1842  src/agent/tui/onboarding/__init__.py
       9656  src/agent/tui/onboarding/profile.py
-     19896  src/agent/tui/onboarding/welcome.py
+     20076  src/agent/tui/onboarding/welcome.py
       6897  src/agent/tui/plan_parser.py
-      3381  src/agent/tui/run.py
+      3412  src/agent/tui/run.py
       1160  src/agent/tui/theme.py
       7097  src/agent/tui/tool_call.py
      29316  src/agent/tui/widgets/aws_panel.py
@@ -250,6 +229,4 @@ src/agent/depression/ (nested venv), .mypy_cache/, .pytest_cache/,
       3500  tests/test_tui_pty.py
       7597  tests/test_tui.py
       3948  tests/test_version.py
-     11359  TOOL_CALLING_PERFORMANCE_ANALYSIS.txt
-        18  .tool_test/sandbox/a.txt
 ```

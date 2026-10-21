@@ -141,6 +141,7 @@ class CLIAgent:
             epilog="""
 Examples:
   depression                          Start interactive mode
+  depression --nosignin               Start without Google sign-in / onboarding
   depression "fix the login bug"      Run a single query
   depression -p /path/to/project      Use a specific project
   depression --model gpt-4o           Override the model
@@ -571,7 +572,7 @@ Examples:
             model=status.get("model") or "—",
         )
         self.ui.print_shortcuts()
-        self.ui.print_info("Press Ctrl+P to switch between Plan/Build mode, or use /plan and /build commands")
+        self.ui.print_info("Press Tab to cycle Plan/Build/Auto mode, or use /plan, /build and /auto commands")
 
         while self.running:
             try:
@@ -605,9 +606,8 @@ Examples:
                 self._refresh_status_bar()
                 continue
             elif text == "/auto":
-                self.ui.print_info("Auto mode: Plan -> Build loop")
-                # In auto mode, we process with auto_execute=True
-                # The actual processing happens in _handle_query
+                self.agent_coordinator.set_mode("auto")
+                self.ui.print_info("Switched to Auto mode (Plan -> Build loop)")
                 self._refresh_status_bar()
                 continue
 

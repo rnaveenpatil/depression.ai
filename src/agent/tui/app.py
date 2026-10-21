@@ -48,8 +48,8 @@ from agent.tui.widgets.tool_call import ToolCallWidget
 
 
 SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
-MODE_ICONS = {"plan": "◇", "build": "◆"}
-MODE_ORDER = ["build", "plan"]
+MODE_ICONS = {"plan": "◇", "build": "◆", "auto": "◈"}
+MODE_ORDER = ["build", "plan", "auto"]
 
 DEFAULT_TURN_TIMEOUT = 900.0
 DEFAULT_AWS_REGION = "us-east-1"
@@ -841,8 +841,11 @@ class HelpPanel(Vertical):
         yield Static("/shot PATH open a screenshot with the OS viewer", classes="help-row")
         yield Static("/plan      switch mode → plan", classes="help-row")
         yield Static("/build     switch mode → build", classes="help-row")
+        yield Static("/auto      switch mode → auto (plan → build loop)", classes="help-row")
         yield Static("/clear     clear transcript", classes="help-row")
         yield Static("/quit      exit", classes="help-row")
+        yield Static("CLI Flags", classes="help-section")
+        yield Static("depression --nosignin   start without Google sign-in / onboarding", classes="help-row")
         yield Static("Keys", classes="help-section")
         yield Static("Enter      submit prompt", classes="help-row")
         yield Static("Shift+Ent  newline inside the prompt", classes="help-row")
@@ -2064,6 +2067,8 @@ class DepressionApp(App):
             self._switch_mode("plan")
         elif command == "/build":
             self._switch_mode("build")
+        elif command == "/auto":
+            self._switch_mode("auto")
         elif command in ("/quit", "/exit"):
             self._is_shutting_down = True
             self.exit()

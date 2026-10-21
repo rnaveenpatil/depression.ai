@@ -632,6 +632,8 @@ class CommandProcessor:
 
         self.ui.print_info("\n💡 Type /help <command> for detailed help")
         self.ui.print_info("💡 Use ↑/↓ arrows to navigate history")
+        self.ui.print_info("\n🖥️ CLI flags:")
+        self.ui.print_info("  depression --nosignin    Skip Google sign-in / onboarding screen")
 
     async def cmd_exit(self, args: List[str]) -> str:
         save = "--save" in args

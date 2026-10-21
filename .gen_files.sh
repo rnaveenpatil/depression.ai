@@ -35,7 +35,7 @@ total=$(wc -l < "$tmp")
   echo
   echo "| Area | Files | Size |"
   echo "|---|---:|---:|"
-  dirs=(src/agent src/agent/depression tests docs assets .agents .opencode .github .githooks .agent)
+  dirs=(src/agent src/agent/depression tests docs assets .opencode .github .githooks .agent)
   counted=0
   for d in "${dirs[@]}"; do
     n=$(grep -c "^$d/" "$tmp" || true)

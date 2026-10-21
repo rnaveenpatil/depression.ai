@@ -734,7 +734,7 @@ class AgentCoordinator:
         await self.build_agent.initialize()
 
     def set_mode(self, mode: str) -> bool:
-        if mode in ("plan", "build"):
+        if mode in ("plan", "build", "auto"):
             self.current_mode = mode
             return True
         return False

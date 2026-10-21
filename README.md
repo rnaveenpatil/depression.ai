@@ -269,10 +269,16 @@ The primary interface is a terminal-native **Textual TUI** designed for interact
   <img src="https://raw.githubusercontent.com/rnaveenpatil/depression.ai/main/assets/tui.png" alt="depression.ai Terminal User Interface" width="950">
 </p>
 
+<p align="center">
+  <img src="https://raw.githubusercontent.com/rnaveenpatil/depression.ai/main/assets/User%20Interface%20%281%29.png" alt="depression.ai start screen" width="900">
+</p>
+
+<p align="center"><em>Start screen — type a prompt to begin, or run <code>depression --nosignin</code> to enter without Google sign-in.</em></p>
+
 The interface brings the agent workflow into a single workspace with features such as:
 
 * Interactive conversation
-* Plan / Build mode switching
+* Plan / Build / Auto mode switching
 * LLM connection configuration
 * AWS configuration
 * Tool-call cards
@@ -462,8 +468,10 @@ System-level operations are controlled through the permission system where requi
 AWS is integrated into the agent workflow so cloud infrastructure can be handled from the same terminal-native environment.
 
 <p align="center">
-  <img src="https://raw.githubusercontent.com/rnaveenpatil/depression.ai/main/assets/tui.png" alt="depression.ai AWS-capable TUI" width="900">
+  <img src="https://raw.githubusercontent.com/rnaveenpatil/depression.ai/main/assets/AWS%20Authentication%20And%20Account%20Access.png" alt="depression.ai AWS credentials panel" width="900">
 </p>
+
+<p align="center"><em>AWS CREDENTIALS panel — configure the Access Key ID, Secret Access Key and Region from the TUI.</em></p>
 
 The architecture allows the agent to combine:
 
@@ -801,8 +809,10 @@ For the latest AWS guidance, see the official AWS IAM documentation on access ke
 # 🤖 LLM Integration
 
 <p align="center">
-  <img src="https://raw.githubusercontent.com/rnaveenpatil/depression.ai/main/assets/llm_connect.png" alt="depression.ai LLM Connection" width="850">
+  <img src="https://raw.githubusercontent.com/rnaveenpatil/depression.ai/main/assets/LLM%20Connection%20Configuration.png" alt="depression.ai LLM connection configuration panel" width="900">
 </p>
+
+<p align="center"><em>LLM CONNECTION panel — configure Base URL, API Key and Model ID from inside the TUI.</em></p>
 
 The framework separates the **agent runtime** from the **LLM provider**.
 
@@ -841,6 +851,14 @@ Model    : your-model
 ```
 
 This allows the framework to work with compatible remote model APIs.
+
+### Usage & cost tracking
+
+<p align="center">
+  <img src="https://raw.githubusercontent.com/rnaveenpatil/depression.ai/main/assets/LLM%20Usage%20and%20Cost%20Tracking.png" alt="depression.ai LLM usage and cost tracking panel" width="900">
+</p>
+
+The TUI tracks token usage and API cost per query and per session. Open the live panel with `/llmcost` (or `/cost`) to see input/output tokens, total cost, API calls, tool calls and query duration.
 
 ---
 
@@ -1093,6 +1111,12 @@ Allow? [y/N]
 
 The permission system allows users to review potentially sensitive or destructive actions before execution.
 
+<p align="center">
+  <img src="https://raw.githubusercontent.com/rnaveenpatil/depression.ai/main/assets/Tool%20Permission%20and%20%20Execution%20Confirmation.png" alt="depression.ai tool permission and execution confirmation modal" width="900">
+</p>
+
+<p align="center"><em>Permission request modal — high-risk tool actions must be explicitly allowed or denied.</em></p>
+
 Conceptually:
 
 ```text
@@ -1186,17 +1210,27 @@ This helps separate the overall task into smaller execution steps.
 /exit
 ```
 
+<p align="center">
+  <img src="https://raw.githubusercontent.com/rnaveenpatil/depression.ai/main/assets/Command%20Reference%20Interface.png" alt="depression.ai command reference and help panel" width="900">
+</p>
+
 ### Mode Switching
 
 ```text
-Ctrl + P
+Tab
 ```
 
 Switch between:
 
 ```text
-PLAN ↔ BUILD
+PLAN ↔ BUILD ↔ AUTO
 ```
+
+* **PLAN** — read-only analysis and task planning.
+* **BUILD** — executes tools and applies changes.
+* **AUTO** — runs the Plan → Build loop automatically, re-planning until the task succeeds or the iteration limit is reached (`--max-iterations`).
+
+You can also switch directly with `/plan`, `/build` and `/auto`.
 
 ---
 
@@ -1207,6 +1241,14 @@ Start the application:
 ```bash
 depression
 ```
+
+Skip the Google sign-in / onboarding screen and enter as a local guest:
+
+```bash
+depression --nosignin
+```
+
+This is useful for offline use, CI/demo environments, or when you simply want to reach the prompt immediately. A local guest profile is stored on disk and the Google sign-in screen is bypassed; you can still sign in later from the profile panel.
 
 Specify a project:
 
@@ -1288,6 +1330,12 @@ git clone https://github.com/rnaveenpatil/depression.ai.git
 cd depression.ai
 pip install -e .
 depression
+```
+
+To skip the Google sign-in / onboarding screen and go straight to the TUI:
+
+```bash
+depression --nosignin
 ```
 
 After starting the TUI, configure the LLM:
@@ -1570,6 +1618,14 @@ The Gmail/Google login is **not the agent backend**.
 It is used for authentication and product-level usage identification by Team Depression, such as understanding authenticated usage and estimating how many people are using or installing the package.
 
 Signing in does **not** give Team Depression remote access to your terminal, project directory or local files.
+
+<p align="center">
+  <img src="https://raw.githubusercontent.com/rnaveenpatil/depression.ai/main/assets/User%20Profile.png" alt="depression.ai signed-in user profile panel" width="900">
+</p>
+
+<p align="center"><em>Signed-in profile — Google identity, verification status and login metadata.</em></p>
+
+Sign-in is optional. Start with `depression --nosignin` to enter the TUI immediately with a local guest profile (`local-guest`); you can sign in with Google later from the profile panel. Gmail-specific features remain disabled for guest profiles.
 
 The login system should therefore be understood separately from the agent execution system:
 
