@@ -42,6 +42,10 @@ class BashTool(BaseTool):
     }
     timeout = 120.0
 
+    read_only = False
+    mutating = True
+    category = "run"
+
     def __init__(self, workspace: Any = None, config: Optional[Dict[str, Any]] = None):
         from agent.tools.terminal import TerminalTool
         self._inner = TerminalTool(workspace, config)
@@ -77,9 +81,13 @@ class ReadTool(BaseTool):
             "limit": {"type": "integer", "description": "Max lines to read"},
             "offset": {"type": "integer", "description": "Line offset (0-indexed)"},
         },
-        "required": ["filePath"],
+        "required": [],
     }
     timeout = 30.0
+
+    read_only = True
+    mutating = False
+    category = "inspect"
 
     def __init__(self, workspace: Any = None):
         from agent.tools.filesystem import FileSystemTool
@@ -122,9 +130,13 @@ class WriteTool(BaseTool):
             "content": {"type": "string"},
             "include_diff": {"type": "boolean", "default": True},
         },
-        "required": ["filePath", "content"],
+        "required": ["content"],
     }
     timeout = 30.0
+
+    read_only = False
+    mutating = True
+    category = "edit"
 
     def __init__(self, workspace: Any = None):
         from agent.tools.filesystem import FileSystemTool
@@ -162,9 +174,13 @@ class EditTool(BaseTool):
             "replaceAll": {"type": "boolean", "default": False},
             "include_diff": {"type": "boolean", "default": True},
         },
-        "required": ["filePath"],
+        "required": [],
     }
     timeout = 30.0
+
+    read_only = False
+    mutating = True
+    category = "edit"
 
     def __init__(self, workspace: Any = None):
         from agent.tools.filesystem import FileSystemTool
@@ -205,9 +221,13 @@ class ApplyPatchTool(BaseTool):
             "diff": {"type": "string"},
             "include_diff": {"type": "boolean", "default": True},
         },
-        "required": ["patchText"],
+        "required": [],
     }
     timeout = 30.0
+
+    read_only = False
+    mutating = True
+    category = "edit"
 
     def __init__(self, workspace: Any = None):
         from agent.tools.patch import PatchTool
@@ -394,6 +414,14 @@ class ApplyPatchTool(BaseTool):
         chunks: List[List[str]] = []
         current: List[str] = []
         for line in hunk_lines:
+            # Standard apply_patch hunk headers are metadata, not context.
+            if line.startswith("@@"):
+                if current:
+                    chunks.append(current)
+                    current = []
+                continue
+            if line.startswith("\\"):
+                continue
             if line.startswith(("+", "-", " ")):
                 current.append(line)
             else:
@@ -446,6 +474,10 @@ class GrepTool(BaseTool):
     }
     timeout = 60.0
 
+    read_only = True
+    mutating = False
+    category = "inspect"
+
     def __init__(self, workspace: Any = None):
         from agent.tools.search import SearchTool
         self._inner = SearchTool(workspace)
@@ -478,6 +510,10 @@ class GlobTool(BaseTool):
         "required": ["pattern"],
     }
     timeout = 30.0
+
+    read_only = True
+    mutating = False
+    category = "inspect"
 
     def __init__(self, workspace: Any = None):
         self.workspace = workspace
@@ -523,6 +559,10 @@ class WebFetchTool(BaseTool):
     }
     timeout = 60.0
 
+    read_only = True
+    mutating = False
+    category = "net"
+
     def __init__(self, config: Optional[Dict[str, Any]] = None):
         from agent.tools.web import WebTool
         self._inner = WebTool(config)
@@ -547,6 +587,10 @@ class WebSearchTool(BaseTool):
         "required": ["query"],
     }
     timeout = 60.0
+
+    read_only = True
+    mutating = False
+    category = "net"
 
     def __init__(self, config: Optional[Dict[str, Any]] = None):
         from agent.tools.web import WebTool
@@ -585,6 +629,10 @@ class TodoWriteTool(BaseTool):
         "required": ["todos"],
     }
     timeout = 10.0
+
+    read_only = False
+    mutating = False
+    category = "plan"
 
     def __init__(self, session: Any = None):
         from agent.tools.todo import TodoTool, TodoItem
@@ -659,6 +707,10 @@ class TodoReadTool(BaseTool):
     parameters = {"type": "object", "properties": {}, "required": []}
     timeout = 10.0
 
+    read_only = True
+    mutating = False
+    category = "plan"
+
     def __init__(self, session: Any = None):
         from agent.tools.todo import TodoTool
         self.session = session
@@ -697,6 +749,10 @@ class SkillTool(BaseTool):
         "required": [],
     }
     timeout = 10.0
+
+    read_only = True
+    mutating = False
+    category = "inspect"
 
     def __init__(self, workspace: Any = None, config: Optional[Dict[str, Any]] = None):
         self.workspace = workspace
@@ -777,6 +833,10 @@ class QuestionTool(BaseTool):
     }
     timeout = 600.0
 
+    read_only = False
+    mutating = False
+    category = "ui"
+
     def __init__(self, input_handler: Any = None):
         self.input_handler = input_handler
 
@@ -825,6 +885,10 @@ class LspTool(BaseTool):
         "required": ["operation"],
     }
     timeout = 30.0
+
+    read_only = True
+    mutating = False
+    category = "inspect"
 
     def __init__(self, workspace: Any = None, config: Optional[Dict[str, Any]] = None):
         self.workspace = workspace

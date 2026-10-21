@@ -11,6 +11,7 @@ Features:
 from __future__ import annotations
 
 import asyncio
+import base64
 import html
 import ipaddress
 import re
@@ -113,6 +114,10 @@ class WebTool(BaseTool):
         "required": ["action"],
     }
     timeout = 60.0
+
+    read_only = True
+    mutating = False
+    category = "net"
 
     def __init__(self, config: Optional[Dict[str, Any]] = None):
         cfg = config or {}
@@ -259,18 +264,69 @@ class WebTool(BaseTool):
             return {"success": False, "error": "search requires 'query'"}
 
         limit = int(params.get("limit", 10))
-        url = "https://html.duckduckgo.com/html/?" + urllib.parse.urlencode({"q": query})
+        headers = {
+            "User-Agent": self.user_agent,
+            "Accept-Language": "en-US,en;q=0.9",
+        }
+        errors: List[str] = []
 
-        async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
-            try:
-                r = await client.get(url, headers={"User-Agent": self.user_agent})
-            except Exception as e:
-                return {"success": False, "error": str(e)}
+        # DuckDuckGo HTML is the primary backend, but it frequently answers
+        # with a 202 anti-bot challenge. Only a 200 with parsed results counts.
+        ddg_url = "https://html.duckduckgo.com/html/?" + urllib.parse.urlencode(
+            {"q": query}
+        )
+        try:
+            async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
+                r = await client.get(ddg_url, headers=headers)
+            if r.status_code == 200:
+                results = self._parse_ddg(r.text, limit)
+                if results:
+                    return {
+                        "success": True,
+                        "query": query,
+                        "results": results,
+                        "count": len(results),
+                        "backend": "duckduckgo",
+                    }
+            errors.append(f"duckduckgo HTTP {r.status_code}")
+        except Exception as e:
+            errors.append(f"duckduckgo: {e}")
 
+        # Bing's HTML endpoint is the fallback and generally does not
+        # challenge non-browser clients.
+        bing_url = "https://www.bing.com/search?" + urllib.parse.urlencode(
+            {"q": query}
+        )
+        try:
+            async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
+                r = await client.get(bing_url, headers=headers)
+            if r.status_code == 200:
+                results = self._parse_bing(r.text, limit)
+                if results:
+                    return {
+                        "success": True,
+                        "query": query,
+                        "results": results,
+                        "count": len(results),
+                        "backend": "bing",
+                    }
+            errors.append(f"bing HTTP {r.status_code}")
+        except Exception as e:
+            errors.append(f"bing: {e}")
+
+        return {
+            "success": False,
+            "query": query,
+            "error": "web search returned no results (" + "; ".join(errors) + ")",
+            "results": [],
+            "count": 0,
+        }
+
+    def _parse_ddg(self, text: str, limit: int) -> List[Dict[str, str]]:
         results: List[Dict[str, str]] = []
         for m in re.finditer(
             r'<a[^>]+class="result__a"[^>]+href="([^"]+)"[^>]*>(.*?)</a>',
-            r.text,
+            text,
             re.DOTALL,
         ):
             link = html.unescape(m.group(1))
@@ -278,8 +334,49 @@ class WebTool(BaseTool):
             results.append({"title": title, "url": link})
             if len(results) >= limit:
                 break
+        return results
 
-        return {"success": True, "query": query, "results": results, "count": len(results)}
+    def _parse_bing(self, text: str, limit: int) -> List[Dict[str, str]]:
+        results: List[Dict[str, str]] = []
+        for block in re.findall(r'<li class="b_algo".*?</li>', text, re.DOTALL):
+            m = re.search(
+                r'<h2[^>]*>.*?<a[^>]+href="([^"]+)"[^>]*>(.*?)</a>',
+                block,
+                re.DOTALL,
+            )
+            if not m:
+                continue
+            snippet_match = re.search(r'<p[^>]*>(.*?)</p>', block, re.DOTALL)
+            results.append({
+                "title": self._strip_tags(m.group(2)),
+                "url": self._unwrap_bing_url(html.unescape(m.group(1))),
+                "snippet": (
+                    self._strip_tags(snippet_match.group(1))
+                    if snippet_match else ""
+                ),
+            })
+            if len(results) >= limit:
+                break
+        return results
+
+    @staticmethod
+    def _unwrap_bing_url(url: str) -> str:
+        """Turn Bing's /ck/a redirect into the underlying result URL."""
+        if "bing.com/ck/a" not in url:
+            return url
+        try:
+            query = urllib.parse.parse_qs(urllib.parse.urlsplit(url).query)
+            token = (query.get("u") or [""])[0]
+            if not token.startswith("a1"):
+                return url
+            payload = token[2:]
+            payload += "=" * (-len(payload) % 4)
+            decoded = base64.urlsafe_b64decode(payload).decode(
+                "utf-8", errors="replace"
+            )
+            return decoded if decoded.startswith(("http://", "https://")) else url
+        except Exception:
+            return url
 
     @staticmethod
     def _html_to_text(html_text: str) -> str:

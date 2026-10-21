@@ -113,7 +113,7 @@ class FileSystemTool(BaseTool):
     timeout = 30.0
 
     read_only = False
-    mutating = False
+    mutating = True
     category = "inspect"
 
     def __init__(self, workspace: Any = None):

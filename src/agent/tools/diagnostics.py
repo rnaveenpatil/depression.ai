@@ -10,12 +10,31 @@ import asyncio
 import json
 import os
 import shutil
+import sys
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from agent.tools.registry import BaseTool
 from agent.utils.logging import get_logger
 
 logger = get_logger(__name__)
+
+
+def _find_executable(name: str) -> Optional[str]:
+    """Find an executable on PATH, then in the running interpreter's bin dir.
+
+    The second check matters when the agent is launched via a venv console
+    script by absolute path: ``venv/bin`` is not necessarily on PATH, so
+    ``shutil.which("ruff")`` fails even though ``venv/bin/ruff`` exists.
+    """
+    found = shutil.which(name)
+    if found:
+        return found
+    exe_name = f"{name}.exe" if os.name == "nt" else name
+    candidate = Path(sys.executable).parent / exe_name
+    if candidate.is_file() and os.access(candidate, os.X_OK):
+        return str(candidate)
+    return None
 
 
 class DiagnosticsTool(BaseTool):
@@ -37,6 +56,10 @@ class DiagnosticsTool(BaseTool):
     }
     timeout = 120.0
 
+    read_only = True
+    mutating = False
+    category = "run"
+
     def __init__(self, workspace: Any = None):
         self.workspace = workspace
         self.cwd = str(workspace.get_project_dir()) if workspace else os.getcwd()
@@ -49,6 +72,16 @@ class DiagnosticsTool(BaseTool):
         cmd = self._build_command(tool, params)
         if not cmd:
             return {"success": False, "error": f"No diagnostics backend available for '{tool}'"}
+
+        executable = _find_executable(cmd[0])
+        if executable is None:
+            return {
+                "success": False,
+                "error": f"Command not found: {cmd[0]}",
+                "tool": tool,
+                "recoverable": True,
+            }
+        cmd[0] = executable
 
         try:
             proc = await asyncio.create_subprocess_exec(
@@ -76,11 +109,11 @@ class DiagnosticsTool(BaseTool):
     def _detect_tool(self) -> str:
         if (os.path.isdir(os.path.join(self.cwd, "src")) or
                 any(f.endswith(".py") for f in os.listdir(self.cwd) if os.path.isfile(os.path.join(self.cwd, f)))):
-            if shutil.which("ruff"):
+            if _find_executable("ruff"):
                 return "ruff"
-            if shutil.which("flake8"):
+            if _find_executable("flake8"):
                 return "flake8"
-            if shutil.which("mypy"):
+            if _find_executable("mypy"):
                 return "mypy"
         if os.path.exists(os.path.join(self.cwd, "tsconfig.json")):
             return "tsc"

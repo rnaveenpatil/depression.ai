@@ -7,7 +7,7 @@ import platform
 import re
 import subprocess
 import time
-from typing import Any, Optional
+from typing import Any, Dict, List, Optional
 
 import httpx
 from textual import on, work
@@ -73,13 +73,6 @@ def _fmt(n: Any) -> str:
         return f"{int(n):,}"
     except Exception:
         return "0"
-
-
-def _fmt_cost(v: Any) -> str:
-    try:
-        return f"${float(v):.4f}"
-    except Exception:
-        return "$0.0000"
 
 
 def _shorten_path(path: str, max_len: int = 32) -> str:
@@ -433,17 +426,83 @@ class TodoPanel(Vertical):
         super().__init__(**kwargs)
         self._app = app_ref
         self._entries: list[dict] = []
+        self._store_sig: tuple = ()
+        self._entries_from_store = False
 
     def compose(self) -> ComposeResult:
         yield Static(f"[bold {GREEN}]▌ TODO[/]", markup=True)
-        yield Static("[{MUTED}]— no active plan —[/]",
+        yield Static(f"[{MUTED}]— no active plan —[/]",
                      id="todo-body", markup=True)
         yield Static("updates as the agent works",
                      classes="hint")
 
+    def on_mount(self) -> None:
+        self.refresh_from_store(force=True)
+        self.set_interval(0.5, self.refresh_from_store)
+
     def set_entries(self, entries: list[dict]) -> None:
         # [Todo fix] Accept empty lists so the panel clears correctly.
         self._entries = list(entries or [])
+        self._entries_from_store = False
+        # Remember the store state the pushed entries correspond to so the
+        # poll below does not immediately overwrite a model-authored
+        # checklist with an older store bucket.
+        self._store_sig = self._current_store_signature()
+        self._paint_entries()
+
+    def refresh_from_store(self, force: bool = False) -> None:
+        """Refresh from the shared TodoTool store (polled every 0.5s)."""
+        store = self._read_store()
+        sig = self._signature(store)
+        if not force and sig == self._store_sig:
+            return
+        self._store_sig = sig
+        if not store:
+            if self._entries_from_store:
+                self._entries = []
+                self._entries_from_store = False
+                self._paint_entries()
+            return
+        self._entries = [self._store_entry(item) for item in store.values()]
+        self._entries_from_store = True
+        self._paint_entries()
+
+    def _read_store(self) -> dict:
+        try:
+            from agent.tools.todo import TodoTool
+            session = self._app._session() if self._app is not None else None
+            sid = TodoTool._session_key(session)
+            return TodoTool._strong_keys.get(sid) or {}
+        except Exception:
+            return {}
+
+    @staticmethod
+    def _signature(store: dict) -> tuple:
+        return tuple(
+            (
+                getattr(item, "id", ""),
+                getattr(item, "status", ""),
+                getattr(item, "title", ""),
+                getattr(item, "updated_at", 0),
+            )
+            for item in store.values()
+        )
+
+    def _current_store_signature(self) -> tuple:
+        return self._signature(self._read_store())
+
+    @staticmethod
+    def _store_entry(item: Any) -> dict:
+        status = str(getattr(item, "status", "pending") or "pending").lower()
+        if status == "done":
+            status = "completed"
+        return {
+            "content": str(getattr(item, "title", "") or ""),
+            "status": status,
+            "priority": getattr(item, "priority", 3),
+        }
+
+    def _paint_entries(self) -> None:
         try:
             if not self._entries:
                 self.query_one("#todo-body", Static).update(
@@ -463,6 +522,8 @@ class TodoPanel(Vertical):
             "in_progress": f"[{AMBER}]▸[/]",
             "pending": f"[{DIM}]○[/]",
             "failed": f"[{ERROR}]✗[/]",
+            "blocked": f"[{ERROR}]■[/]",
+            "cancelled": f"[{DIM}]✕[/]",
             "skipped": f"[{DIM}]—[/]",
         }
         out = []
@@ -475,8 +536,10 @@ class TodoPanel(Vertical):
                 out.append(f"  {icon} [{MUTED}]{content}[/]")
             elif status == "in_progress":
                 out.append(f"  {icon} [bold {TEXT}]{content}[/]")
-            elif status == "failed":
+            elif status in ("failed", "blocked"):
                 out.append(f"  {icon} [{ERROR}]{content}[/]")
+            elif status == "cancelled":
+                out.append(f"  {icon} [{DIM}]{content}[/]")
             else:
                 out.append(f"  {icon} [{TEXT}]{content}[/]")
         return "\n".join(out)
@@ -492,6 +555,7 @@ def _probe_loop_context(coordinator: Any) -> Any:
     currently active on the coordinator.
 
     Probes, in order:
+      0. auto mode: the most recently started plan/build loop
       1. coordinator.current_agent            (attribute)
       2. coordinator.get_current_agent()      (method)
       3. coordinator.build_agent              (attribute)
@@ -501,6 +565,27 @@ def _probe_loop_context(coordinator: Any) -> Any:
     """
     if coordinator is None:
         return None
+
+    # Auto mode runs plan and build in sequence. `get_current_agent()`
+    # always returns the build agent there, which is stale while the plan
+    # phase is running. Pick the loop that started most recently instead.
+    if getattr(coordinator, "current_mode", None) == "auto":
+        best_ctx = None
+        best_start = float("-inf")
+        for attr in ("plan_agent", "build_agent"):
+            candidate = getattr(coordinator, attr, None)
+            loop = getattr(candidate, "loop", None) if candidate is not None else None
+            ctx = getattr(loop, "context", None) if loop is not None else None
+            if ctx is None:
+                continue
+            try:
+                start = float(getattr(ctx, "start_time", 0.0) or 0.0)
+            except Exception:
+                start = 0.0
+            if start >= best_start:
+                best_start, best_ctx = start, ctx
+        if best_ctx is not None:
+            return best_ctx
 
     agent = None
 
@@ -543,6 +628,198 @@ def _probe_loop_context(coordinator: Any) -> Any:
             return cm
 
     return None
+
+
+def _usage_empty() -> Dict[str, Any]:
+    return {
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "tokens_used": 0,
+        "llm_calls": 0,
+        "tool_calls": 0,
+        "cost": 0.0,
+        "duration": 0.0,
+    }
+
+
+def _usage_float(obj: Any, *names: str) -> float:
+    for name in names:
+        value = _get(obj, name)
+        if value is None:
+            continue
+        try:
+            return float(value)
+        except Exception:
+            continue
+    return 0.0
+
+
+def _usage_int(obj: Any, *names: str) -> int:
+    for name in names:
+        value = _get(obj, name)
+        if value is None:
+            continue
+        try:
+            return int(value)
+        except Exception:
+            continue
+    return 0
+
+
+def _usage_snapshot(obj: Any, *, now: Optional[float] = None) -> Dict[str, Any]:
+    """
+    Read one usage-bearing object (AgentLoop.context or Agent.context).
+
+    Loop contexts expose `actions_taken`; session contexts expose a
+    `tools_used` map. Both are normalised to the same shape.
+    """
+    snap = _usage_empty()
+    if obj is None:
+        return snap
+
+    snap["input_tokens"] = _usage_int(obj, "input_tokens", "prompt_tokens")
+    snap["output_tokens"] = _usage_int(obj, "output_tokens", "completion_tokens")
+    snap["tokens_used"] = (
+        _usage_int(obj, "tokens_used", "total_tokens")
+        or snap["input_tokens"] + snap["output_tokens"]
+    )
+    snap["llm_calls"] = _usage_int(obj, "llm_calls", "api_calls")
+    snap["cost"] = _usage_float(obj, "cost", "total_cost")
+
+    actions = _get(obj, "actions_taken")
+    if isinstance(actions, list):
+        snap["tool_calls"] = len(actions)
+    else:
+        tools_used = _get(obj, "tools_used")
+        if isinstance(tools_used, dict) and tools_used:
+            total = 0
+            for value in tools_used.values():
+                try:
+                    total += int(value)
+                except Exception:
+                    continue
+            snap["tool_calls"] = total
+        else:
+            snap["tool_calls"] = _usage_int(obj, "tool_calls", "total_tool_calls")
+        snap["duration"] = _usage_float(obj, "duration")
+
+    start = _usage_float(obj, "start_time")
+    if now is not None and start:
+        snap["duration"] = max(0.0, now - start)
+
+    return snap
+
+
+def _usage_add(total: Dict[str, Any], part: Dict[str, Any]) -> None:
+    for key in total:
+        if key == "cost" or key == "duration":
+            total[key] += float(part.get(key, 0.0) or 0.0)
+        else:
+            total[key] += int(part.get(key, 0) or 0)
+
+
+def _usage_agents(coordinator: Any) -> List[Any]:
+    """Return distinct plan/build agents, falling back to the active agent."""
+    if coordinator is None:
+        return []
+
+    agents: List[Any] = []
+    seen: set = set()
+    for attr in ("plan_agent", "build_agent"):
+        agent = getattr(coordinator, attr, None)
+        if agent is not None and id(agent) not in seen:
+            seen.add(id(agent))
+            agents.append(agent)
+    if agents:
+        return agents
+
+    agent = getattr(coordinator, "current_agent", None)
+    if agent is None:
+        fn = getattr(coordinator, "get_current_agent", None)
+        if callable(fn):
+            try:
+                agent = fn()
+            except Exception:
+                agent = None
+    return [agent] if agent is not None else []
+
+
+def _query_usage(coordinator: Any, query_start_ts: float) -> Dict[str, Any]:
+    """
+    Usage for the current top-level query.
+
+    Every AgentLoop resets its context when a run starts, so summing the
+    contexts whose `start_time` is at/after the query marker captures all
+    phases of an auto run (plan + build) without leaking the previous turn.
+    """
+    total = _usage_empty()
+    if coordinator is None:
+        return total
+
+    if not query_start_ts:
+        return _usage_snapshot(_probe_loop_context(coordinator))
+
+    found = False
+    for agent in _usage_agents(coordinator):
+        loop = getattr(agent, "loop", None)
+        ctx = getattr(loop, "context", None) if loop is not None else None
+        if ctx is None:
+            continue
+        start = _usage_float(ctx, "start_time")
+        if start and start < query_start_ts - 0.001:
+            continue
+        _usage_add(total, _usage_snapshot(ctx))
+        found = True
+
+    if not found:
+        ctx = _probe_loop_context(coordinator)
+        start = _usage_float(ctx, "start_time")
+        if ctx is not None and (not start or start >= query_start_ts - 0.001):
+            _usage_add(total, _usage_snapshot(ctx))
+    return total
+
+
+def _session_usage(coordinator: Any, now: Optional[float] = None) -> Dict[str, Any]:
+    """
+    Session totals across both agents.
+
+    `Agent.context` only receives a run's usage after that run completes, so
+    add the live loop context while a query is in flight. `_query_started_at`
+    is set for the duration of `_run_query_pipeline`, which avoids counting
+    the previous run twice.
+    """
+    total = _usage_empty()
+    if coordinator is None:
+        return total
+
+    current = time.time() if now is None else now
+    for agent in _usage_agents(coordinator):
+        _usage_add(total, _usage_snapshot(getattr(agent, "context", None)))
+
+        query_started = _usage_float(agent, "_query_started_at")
+        if not query_started:
+            continue
+        loop = getattr(agent, "loop", None)
+        ctx = getattr(loop, "context", None) if loop is not None else None
+        if ctx is None:
+            continue
+        start = _usage_float(ctx, "start_time")
+        if start and start < query_started - 0.001:
+            continue
+        _usage_add(total, _usage_snapshot(ctx, now=current))
+    return total
+
+
+def _query_elapsed(
+    active: bool,
+    start_ts: float,
+    frozen: float,
+    now: Optional[float] = None,
+) -> float:
+    if active and start_ts:
+        current = time.time() if now is None else now
+        return max(0.0, current - start_ts)
+    return max(0.0, frozen)
 
 
 class LLMCostPanel(Vertical):
@@ -592,7 +869,6 @@ class LLMCostPanel(Vertical):
         yield Static("", id="cost-s-calls", classes="value")
         yield Static("", id="cost-s-tools", classes="value")
         yield Static("", id="cost-s-turns", classes="value")
-        yield Static("", id="cost-s-cost",  classes="value")
         yield Static("", id="cost-s-tps",   classes="dim")
 
     def on_mount(self) -> None:
@@ -667,8 +943,8 @@ class LLMCostPanel(Vertical):
         self.refresh_values()
 
     def refresh_values(self) -> None:
+        coordinator = getattr(self._app, "coordinator", None)
         status = self._coordinator_status()
-        ctx = self._loop_context()
 
         project_dir = self._str(status, "project_dir", "workspace_dir", "cwd", default="")
         data_dir = self._str(status, "data_dir", "home_dir", default="")
@@ -694,42 +970,29 @@ class LLMCostPanel(Vertical):
         self._update("#cost-session", f"[{TEXT}]{_esc(session_id)}[/]")
 
         # ---- this query ----
-        # [Token-count fix] Read the live loop context FIRST; only fall back
-        # to the coordinator status dict if the loop isn't reachable.
-        qi = qo = qt = qc = qtools = 0
-        qdur = 0.0
+        query = _query_usage(coordinator, self._query_start_ts)
+        if not any(
+            query[k] for k in
+            ("input_tokens", "output_tokens", "tokens_used", "llm_calls", "cost")
+        ):
+            query["input_tokens"] = self._num(status, "query_input_tokens")
+            query["output_tokens"] = self._num(status, "query_output_tokens")
+            query["tokens_used"] = (
+                self._num(status, "query_tokens")
+                or query["input_tokens"] + query["output_tokens"]
+            )
+            query["llm_calls"] = self._num(status, "query_llm_calls")
+            query["tool_calls"] = self._num(status, "query_tool_calls")
+            query["cost"] = self._flt(status, "query_cost")
 
-        if ctx is not None:
-            qi = self._num(ctx, "input_tokens", "prompt_tokens")
-            qo = self._num(ctx, "output_tokens", "completion_tokens")
-            qt = self._num(ctx, "tokens_used", "total_tokens") or (qi + qo)
-            qc = self._num(ctx, "llm_calls", "api_calls")
-            actions = getattr(ctx, "actions_taken", None)
-            if actions is None and isinstance(ctx, dict):
-                actions = ctx.get("actions_taken")
-            qtools = len(actions) if actions is not None else 0
-            start_ts = self._flt(ctx, "start_time")
-            if start_ts:
-                qdur = time.time() - start_ts
-            elif self._query_active and self._query_start_ts:
-                qdur = time.time() - self._query_start_ts
-        elif status:
-            qi = self._num(status, "input_tokens", "prompt_tokens",
-                           "query_input_tokens")
-            qo = self._num(status, "output_tokens", "completion_tokens",
-                           "query_output_tokens")
-            qt = self._num(status, "tokens_used", "query_tokens",
-                           "total_tokens") or (qi + qo)
-            qc = self._num(status, "llm_calls", "api_calls",
-                           "query_llm_calls")
-            qtools = self._num(status, "total_tool_calls", "tool_calls_total")
-            qdur = self._flt(status, "turn_duration", "query_duration")
-
-        if not qdur and self._query_active and self._query_start_ts:
-            qdur = time.time() - self._query_start_ts
-        if not qdur and self._frozen_dur:
-            qdur = self._frozen_dur
-
+        qi = int(query["input_tokens"])
+        qo = int(query["output_tokens"])
+        qt = int(query["tokens_used"])
+        qc = int(query["llm_calls"])
+        qtools = int(query["tool_calls"])
+        qdur = _query_elapsed(
+            self._query_active, self._query_start_ts, self._frozen_dur,
+        )
         tps = (qo / qdur) if qdur > 0 and qo else 0.0
 
         self._update("#cost-q-in", f"[{MUTED}]in[/]      [{TEXT}]{_fmt(qi)}[/]")
@@ -741,54 +1004,45 @@ class LLMCostPanel(Vertical):
         self._update("#cost-q-tps", f"[{MUTED}]tok/s[/]     [{TEXT}]{tps:.1f}[/]")
 
         # ---- session ----
-        si = so = st = sc = 0
-        stools = 0
-        sturns = 0
-        scost = 0.0
+        # Agent.context holds session-accumulated counters. The active run's
+        # loop context is added while it is in flight, then folded into the
+        # session totals when the run returns.
+        session = _session_usage(coordinator)
+        si = int(session["input_tokens"])
+        so = int(session["output_tokens"])
+        st = int(session["tokens_used"])
+        sc = int(session["llm_calls"])
+        stools = int(session["tool_calls"])
+        sdur = float(session["duration"])
 
-        if ctx is not None:
-            si = self._num(ctx, "input_tokens", "prompt_tokens")
-            so = self._num(ctx, "output_tokens", "completion_tokens")
-            st = self._num(ctx, "tokens_used", "total_tokens") or (si + so)
-            sc = self._num(ctx, "llm_calls", "api_calls")
-            actions = getattr(ctx, "actions_taken", None)
-            if actions is None and isinstance(ctx, dict):
-                actions = ctx.get("actions_taken")
-            stools = len(actions) if actions is not None else 0
-            scost = self._flt(ctx, "cost")
-
-        if si == 0 and so == 0 and st == 0 and status:
+        if not _usage_agents(coordinator) and status:
             si = self._num(status, "input_tokens", "prompt_tokens",
                            "total_input_tokens")
             so = self._num(status, "output_tokens", "completion_tokens",
                            "total_output_tokens")
             st = self._num(status, "tokens_used", "total_tokens") or (si + so)
-        if not sc and status:
             sc = self._num(status, "llm_calls", "api_calls",
                            "total_llm_calls")
-        if not stools and status:
             tools_used = status.get("tools_used") or status.get("tool_calls")
             if isinstance(tools_used, dict):
-                try:
-                    stools = sum(int(v) for v in tools_used.values())
-                except Exception:
-                    stools = 0
+                stools = sum(int(v) for v in tools_used.values())
             elif isinstance(tools_used, (int, float)):
                 stools = int(tools_used)
             if not stools:
                 stools = self._num(status, "total_tool_calls", "tool_calls_total")
-        if not sturns and status:
-            sturns = self._num(status, "turn_count", "turns",
-                               "message_count", "messages")
-        if not scost and status:
-            scost = self._flt(status, "cost", "total_cost", "cost_usd")
 
         if st == 0:
             st = int(getattr(self._app, "tokens_used", 0) or 0)
-        if sturns == 0:
-            sturns = int(getattr(self._app, "message_count", 0) or 0)
+            si = si or int(getattr(self._app, "live_input_tokens", 0) or 0)
+            so = so or int(getattr(self._app, "live_output_tokens", 0) or 0)
 
-        stps = (so / qdur) if qdur > 0 and so else 0.0
+        # User turns come from the TUI, not from plan/build agent turn
+        # counters (auto mode counts internal phases as turns).
+        sturns = int(getattr(self._app, "message_count", 0) or 0)
+        if not sturns and status:
+            sturns = self._num(status, "user_turns", "message_count")
+
+        stps = (so / sdur) if sdur > 0 and so else 0.0
 
         self._update("#cost-s-in", f"[{MUTED}]in[/]      [{TEXT}]{_fmt(si)}[/]")
         self._update("#cost-s-out", f"[{MUTED}]out[/]     [{TEXT}]{_fmt(so)}[/]")
@@ -796,10 +1050,6 @@ class LLMCostPanel(Vertical):
         self._update("#cost-s-calls", f"[{MUTED}]api calls[/]  [{AMBER}]{_fmt(sc)}[/]")
         self._update("#cost-s-tools", f"[{MUTED}]tool calls[/] [{TEXT}]{_fmt(stools)}[/]")
         self._update("#cost-s-turns", f"[{MUTED}]turns[/]     [{TEXT}]{_fmt(sturns)}[/]")
-        self._update(
-            "#cost-s-cost",
-            f"[{MUTED}]cost[/]      [{GREEN_GLOW}]{_fmt_cost(scost)}[/]",
-        )
         self._update("#cost-s-tps", f"[{MUTED}]tok/s[/]     [{TEXT}]{stps:.1f}[/]")
 
     def _update(self, selector: str, markup: str) -> None:
@@ -1355,6 +1605,8 @@ class DepressionApp(App):
             self._events.subscribe("on_plan_updated", self._on_plan_updated)
             self._events.subscribe("on_plan_created", self._on_plan_created)
             self._events.subscribe("on_plan_rendered", self._on_plan_rendered)
+            self._events.subscribe("on_plan_task_complete", self._on_plan_task_complete)
+            self._events.subscribe("on_plan_task_failed", self._on_plan_task_failed)
             # [Streaming] Live model output.
             self._events.subscribe("on_token", self._on_token)
             self._events.subscribe("on_token_end", self._on_token_end)
@@ -1502,6 +1754,9 @@ class DepressionApp(App):
         self._sync_tokens_from_loop()
         self._refresh_llmcost_panel()
 
+        if tool in ("todo", "todowrite", "todoread"):
+            self._refresh_todo_from_store(force=True)
+
         if tool in ("aws",) or tool.startswith("mcp__aws__"):
             try:
                 self.query_one("#panel-aws", AWSPanel).refresh_mcp_status()
@@ -1607,6 +1862,35 @@ class DepressionApp(App):
         if not normalised:
             return
         self._update_todo_panel(normalised)
+
+    async def _on_plan_task_complete(self, event: AgentEvent) -> None:
+        if self._is_shutting_down:
+            return
+        self._refresh_todo_from_store(force=True)
+
+    async def _on_plan_task_failed(self, event: AgentEvent) -> None:
+        if self._is_shutting_down:
+            return
+        data = event.payload or {}
+        task_id = str(data.get("task_id") or "")
+        if task_id:
+            try:
+                from agent.tools.todo import TodoTool
+                session = self._session()
+                sid = TodoTool._session_key(session)
+                store = TodoTool._strong_keys.get(sid) or {}
+                item = store.get(task_id)
+                if item is not None:
+                    item.status = "failed"
+            except Exception:
+                pass
+        self._refresh_todo_from_store(force=True)
+
+    def _refresh_todo_from_store(self, force: bool = False) -> None:
+        try:
+            self.query_one("#panel-todo", TodoPanel).refresh_from_store(force=force)
+        except Exception:
+            pass
 
     @staticmethod
     def _normalise_plan_entries(entries: list) -> list:
@@ -1995,17 +2279,18 @@ class DepressionApp(App):
             self._queued(f"queued ({len(self._prompt_queue)} ahead): {preview}")
             return
 
+        self._begin_query()
+        self._agent_worker = self._run_agent(text)
+
+    def _begin_query(self) -> None:
         self.live_input_tokens = 0
         self.live_output_tokens = 0
         self.live_total_tokens = 0
         self._refresh_token_bar()
-
         try:
             self.query_one("#panel-llmcost", LLMCostPanel).mark_query_start()
         except Exception:
             pass
-
-        self._agent_worker = self._run_agent(text)
 
     def _slash(self, text: str) -> None:
         parts = text.split(maxsplit=1)
@@ -2271,6 +2556,7 @@ class DepressionApp(App):
         nxt = self._prompt_queue.pop(0)
         self.queue_depth = len(self._prompt_queue)
         self._refresh_mode_chip()
+        self._begin_query()
         self._agent_worker = self._run_agent(nxt)
 
     def is_agent_busy(self) -> bool:

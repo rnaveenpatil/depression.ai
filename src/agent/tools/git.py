@@ -49,6 +49,10 @@ class GitTool(BaseTool):
     }
     timeout = 60.0
 
+    read_only = False
+    mutating = True
+    category = "vcs"
+
     def __init__(self, workspace: Any = None, read_only: bool = False):
         self.workspace = workspace
         self.read_only = bool(read_only)

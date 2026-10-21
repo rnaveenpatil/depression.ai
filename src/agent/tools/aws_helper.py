@@ -89,6 +89,10 @@ class AWSHelperTool(BaseTool):
     }
     timeout = 120.0
 
+    read_only = False
+    mutating = True
+    category = "cloud"
+
     def __init__(self, agent: Any = None, workspace: Any = None):
         self.agent = agent
         self.workspace = workspace

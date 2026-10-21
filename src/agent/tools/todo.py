@@ -46,6 +46,10 @@ class TodoTool(BaseTool):
     }
     timeout = 999999.0
 
+    read_only = False
+    mutating = False
+    category = "plan"
+
     # Shared store per session so `todo`, `todowrite`, and `todoread` see the
     # same data. Plain dict — session-scoped cleanup is handled by
     # forget_session(), not by weak references.

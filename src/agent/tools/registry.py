@@ -149,17 +149,18 @@ def _validate_schema(value: Any, schema: Dict[str, Any], path: str = "") -> List
 
 # Which categories each intent cares about. Order matters only for logging.
 INTENT_CATEGORIES: Dict[str, Set[str]] = {
-    "feature":   {"inspect", "edit", "run", "proc", "vcs"},
-    "bugfix":    {"inspect", "edit", "run", "proc", "vcs"},
-    "refactor":  {"inspect", "edit", "vcs"},
-    "analysis":  {"inspect", "run", "vcs"},
-    "question":  {"inspect", "net"},
+    "feature":   {"inspect", "edit", "run", "proc", "vcs", "cloud", "net"},
+    "bugfix":    {"inspect", "edit", "run", "proc", "vcs", "cloud", "net"},
+    "refactor":  {"inspect", "edit", "run", "proc", "vcs", "cloud", "net"},
+    "analysis":  {"inspect", "run", "proc", "vcs", "cloud", "net"},
+    "question":  {"inspect", "net", "cloud"},
     "unknown":   {"inspect", "edit", "run", "proc", "vcs", "cloud", "net", "plan", "ui", "misc"},
 }
 
-# Fallback: when an intent's category set would leave out a tool that
-# should always be visible (plan updates, todo).
-ALWAYS_VISIBLE_CATEGORIES: Set[str] = {"plan", "ui"}
+# Fallback: these categories are always advertised. `misc` is included
+# deliberately: third-party / MCP tools default to it, and hiding an
+# unclassified tool is worse than sending one extra schema.
+ALWAYS_VISIBLE_CATEGORIES: Set[str] = {"plan", "ui", "misc"}
 
 
 # ======================================================================

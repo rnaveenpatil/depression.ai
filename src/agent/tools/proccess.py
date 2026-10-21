@@ -172,10 +172,13 @@ class ProcessTool(BaseTool):
 
         raw_cwd = params.get("cwd") or self.cwd
         try:
-            cwd = str(Path(raw_cwd).expanduser().resolve())
+            if self.workspace is not None:
+                cwd = str(self.workspace.assert_inside_workspace(raw_cwd))
+            else:
+                cwd = str(Path(raw_cwd).expanduser().resolve())
         except Exception as e:
             return {"success": False, "error": f"Invalid cwd: {e}",
-                    "recoverable": False}
+                    "recoverable": False, "command": command, "cwd": str(raw_cwd)}
         if not Path(cwd).exists():
             return {"success": False, "error": f"cwd does not exist: {cwd}",
                     "recoverable": False}

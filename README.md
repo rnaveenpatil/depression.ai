@@ -17,7 +17,7 @@
 </p>
 
 <p align="center">
-  <b>▶ <a href="https://youtu.be/Q10rkTMS4yY">Watch the full 11-minute walkthrough on YouTube</a></b>
+  <b>▶ <a href="https://youtu.be/en5f4pOvfL0">Watch the full 7 minute walkthrough demo on YouTube</a></b>
 </p>
 
 ---
@@ -32,7 +32,10 @@ You type what you want. The AI looks at your project, makes a plan, uses tools o
 * **It can work on your system** — run commands, inspect processes, use Git.
 * **It can work with AWS** — inspect and manage cloud resources your keys allow.
 * **It asks before risky actions** — you stay in control.
-* **Your data stays with you** — API keys, files and sessions are stored on your machine.
+* **Credentials stay on your device** — API keys and AWS keys are stored locally and never sent to Team Depression.
+* **Works offline and is open source** — use a local model with no internet, and inspect the code yourself.
+* **Google login is optional** — it only personalizes the agent (for example, your name); that profile data stays on your device.
+* **Your chats stay private** — Team Depression does not store your conversation history, and chats are not linked to your Gmail.
 * **You choose the AI model** — use a cloud API or a local model.
 * **No account is required** — install, run `depression --nosignin`, connect a model and start.
 * **It runs anywhere** — Linux, macOS or Windows; laptop, VM, container or server.
@@ -300,10 +303,6 @@ It is not just a set of fixed commands. The agent can inspect the environment, u
 # 🖥️ Terminal-Native TUI
 
 The main screen is a terminal UI (built with **Textual**) where you work with the agent interactively.
-
-<p align="center">
-  <img src="https://raw.githubusercontent.com/rnaveenpatil/depression.ai/main/assets/tui.png" alt="depression.ai Terminal User Interface" width="950">
-</p>
 
 <p align="center">
   <img src="https://raw.githubusercontent.com/rnaveenpatil/depression.ai/main/assets/User%20Interface%20%281%29.png" alt="depression.ai start screen" width="900">
@@ -1601,9 +1600,12 @@ A typical task looks like this:
 
 ### What makes it different
 
-* **Security-first design** — credentials and session data stay on your machine, and sensitive actions need your permission.
-* **Everything local by default** — LLM API keys, AWS credentials, sessions and profile data are stored locally, not uploaded to Team Depression.
-* **Sign-in is optional** — run `depression --nosignin` to use the full agent with a local guest profile. No Google account is required.
+* **Credentials stay on your device** — the agent uses API keys and AWS keys locally, only for the services you configure. Team Depression never receives them.
+* **No data is sent to Team Depression** — your conversations, project files, terminal output and usage data are not sent to us.
+* **Works offline** — with a local model, the agent runs without an internet connection.
+* **Conversations stay private** — we do not store your chat history, and your chats are not linked to your Google account.
+* **Google login is optional and only for personalization** — it provides your name/profile locally; your Gmail content is never read.
+* **Sensitive actions need permission** — you approve risky tool actions before they run.
 * **Open source and modifiable** — inspect the code, fork it and adapt the agent, tools, models or workflows to your needs.
 * **Lightweight and optimized** — a small Python package that runs on any machine, virtual or physical, without heavy infrastructure.
 * **Single-command install** — `pip install depression.ai`.
@@ -1676,17 +1678,21 @@ Local parts include:
 - Filesystem interaction
 - Terminal commands
 - Git operations
-- Session state
+- Session and conversation state
+- Credentials, API keys and profile data
 - Permission handling
 - Local project context
 
 ### Credentials and data boundary
 
-- **Credentials are never uploaded.** LLM API keys, AWS access keys, tokens and session state are stored locally in the agent's data/config directory.
-- **No project data is uploaded.** Project files, terminal output, source code and tool results stay on your machine. Only the prompt/context you send to a configured remote LLM leaves the machine.
+- **Credentials are stored on your device.** LLM API keys, AWS access keys, tokens and session data are kept locally in the agent's data/config directory. The agent uses them only on your machine to connect to the provider or service you configure. They are **never sent to Team Depression**, and no one at Team Depression can access them.
+- **Nothing is sent to Team Depression.** Your credentials, conversations, project files, terminal output and usage data are not sent to Team Depression.
+- **Works offline.** With a local model, the agent can run without an internet connection. The project is open source, so you can inspect exactly what it does.
+- **Project data stays local.** Project files, terminal output, source code and tool results stay on your machine. Only the prompt/context you send to a configured remote LLM leaves the machine.
+- **Conversations stay private.** Team Depression does not store your conversation history. Locally saved sessions remain on your device, and your conversations are not linked to your Gmail account.
 - **Sign-in is optional.** `depression --nosignin` runs the full agent with a local guest profile and requires no Google account.
-- **No data is sold or shared by Team Depression.** Your credentials, project data and login details are not published or disclosed to third parties. Data sent to a remote LLM provider is governed by that provider's policy (see below).
-- **Google/Gmail login data is not disclosed.** If you choose to sign in, the Google identity is used only for optional authentication and product-level usage identification. Your Gmail content, project files and terminal activity are never read or shared. If you use `--nosignin`, no Google login data is created at all.
+- **Nothing is sold, shared or disclosed.** Your credentials, project data, conversations and login details are not published, sold or shared with any third party. Data sent to a remote LLM provider is governed by that provider's policy (see below).
+- **Google/Gmail login is only for personalization.** If you choose to sign in, Google provides basic profile information (such as your name and email) so the agent can personalize your experience. That profile data is stored locally on your device, is not disclosed by Team Depression to anyone, and your Gmail content is never read. If you use `--nosignin`, no Google login data is created at all.
 
 ### Remote LLM providers
 
@@ -1728,7 +1734,7 @@ With a local model, inference stays on your machine or network instead of going 
 
 Google/Gmail login is **not the agent backend**.
 
-It is used only for optional authentication and to understand product usage, such as how many people use or install the package.
+It is optional. If you sign in, Google shares basic profile information (such as your name and email) so the agent can personalize your experience. This profile data is stored locally on your device and is not sent to Team Depression.
 
 Signing in does **not** give Team Depression remote access to your terminal, project directory or local files.
 
@@ -1740,7 +1746,7 @@ Signing in does **not** give Team Depression remote access to your terminal, pro
 
 Sign-in is optional. Start with `depression --nosignin` to enter the TUI immediately with a local guest profile (`local-guest`); you can sign in with Google later from the profile panel. Gmail-specific features remain disabled for guest profiles.
 
-Google/Gmail login data is not disclosed to anyone: the Google identity (name, email and profile metadata) is used only for optional authentication and product-level usage identification. It is not published, sold or shared with third parties, and your Gmail content is never accessed. If you use `--nosignin`, no Google login data is created at all.
+Team Depression does not disclose your Google/Gmail login data or personalization details to anyone. They are stored locally, and Team Depression does not publish, sell or share them with third parties. Sign-in itself is handled by Google/Firebase. Your Gmail content is never accessed, your conversation history is not stored by Team Depression, and your conversations are not linked to your Gmail account. If you use `--nosignin`, no Google login data is created at all.
 
 Login and agent execution are separate:
 
@@ -1756,6 +1762,13 @@ depression.ai Agent
 
 Signing in with Google does not make your project data available to Team Depression.
 
+### Conversation storage
+
+- **Chats are not stored by Team Depression.** Team Depression does not keep your conversation history.
+- **Local sessions stay on your device.** If you save or resume a session, that data remains on your machine.
+- **Chats are not linked to Gmail.** Your conversations are not connected to your Google/Gmail account.
+- **No conversation data is disclosed.** Your chats are not published, sold or shared with anyone.
+
 ### Open source & auditability
 
 The project is open source. Anyone can inspect and audit the code.
@@ -1767,6 +1780,9 @@ Be realistic about security: **no software can guarantee perfect safety**. Revie
 `depression.ai` focuses on:
 
 - Local-first agent execution
+- Offline operation with local models
+- Credentials and profile data stored on your device
+- No conversation data sent to or stored by Team Depression
 - Explicit permission handling for sensitive operations
 - Sensitive-file protection
 - Secret redaction / scanning mechanisms where implemented
@@ -1898,12 +1914,12 @@ https://github.com/rnaveenpatil/depression.ai
 
 <p align="center">
   <a href="https://youtu.be/Q10rkTMS4yY">
-    <img src="https://img.youtube.com/vi/Q10rkTMS4yY/maxresdefault.jpg" alt="Watch the depression.ai demo on YouTube" width="900">
+    <img src="https://raw.githubusercontent.com/rnaveenpatil/depression.ai/main/assets/youtube-demo-thumbnail.png" alt="▶ Play the depression.ai demo on YouTube" width="900">
   </a>
 </p>
 
 <p align="center">
-  <b>▶ <a href="https://youtu.be/Q10rkTMS4yY">Watch the full 11-minute walkthrough on YouTube</a></b>
+  <b><a href="https://youtu.be/Q10rkTMS4yY">▶ Watch the full 11-minute walkthrough on YouTube</a></b>
 </p>
 
 See the complete setup and agent workflow in the official `depression.ai` demo — install with one command, connect your API credentials and start working with the agent on any machine.

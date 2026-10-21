@@ -272,6 +272,7 @@ class Cache:
         subdir = self.cache_dir / (namespace or "_")
         if subdir.exists():
             def _rm():
+                nonlocal removed
                 for p in subdir.glob("*.json"):
                     try:
                         p.unlink()

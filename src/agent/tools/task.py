@@ -44,6 +44,10 @@ class TaskTool(BaseTool):
     }
     timeout = 999999.0
 
+    read_only = False
+    mutating = True
+    category = "misc"
+
     def __init__(self, agent: Any = None):
         self.agent = agent
         self.runs: Dict[str, TaskRun] = {}

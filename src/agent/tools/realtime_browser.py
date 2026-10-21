@@ -176,6 +176,10 @@ class RealtimeBrowserTool(BaseTool):
     }
     timeout = 120.0
 
+    read_only = False
+    mutating = True
+    category = "net"
+
     def __init__(self, config: Optional[Dict[str, Any]] = None):
         cfg = config or {}
         self.headless: bool = cfg.get("headless", True)

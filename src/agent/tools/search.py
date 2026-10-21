@@ -43,6 +43,10 @@ class SearchTool(BaseTool):
     }
     timeout = 60.0
 
+    read_only = True
+    mutating = False
+    category = "inspect"
+
     def __init__(self, workspace: Any = None):
         self.workspace = workspace
 

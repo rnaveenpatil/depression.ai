@@ -303,7 +303,11 @@ async def test_loop_executes_tool_call_through_registry():
     agent = ExecAgent()
     loop = AgentLoop(
         agent, registry, FakeToolRegistry(), None,
-        {"enable_intent_classification": False, "enable_planning": False},
+        {
+            "enable_intent_classification": False,
+            "enable_planning": False,
+            "require_demo_offer": False,
+        },
     )
     result = await loop.run("store a note")
 

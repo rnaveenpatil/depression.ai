@@ -942,6 +942,7 @@ class AgentLoop:
                 temperature=0.0,
                 max_tokens=32,
             )
+            self._record_usage(getattr(response, "usage", None))
             raw = (getattr(response, "content", "") or "").strip().lower()
             word = raw.split()[0].strip(".,:;!?") if raw else ""
             if word in (

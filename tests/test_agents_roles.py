@@ -157,9 +157,9 @@ async def test_process_query_requires_initialization():
 @pytest.mark.asyncio
 async def test_agent_loop_executes_tool_and_returns_final_response():
     """
-    A single successful tool call with readable output takes the loop's
-    fast path: the tool result is returned directly and no second LLM
-    turn is consumed. This documents that behavior.
+    A single successful read-only tool call with readable output takes the
+    loop's fast path: the tool result is returned directly and no second
+    LLM turn is consumed. This documents that behavior.
     """
     agent = _agent(AgentRole.BUILD)
     llm = ScriptedLLM([
@@ -167,7 +167,9 @@ async def test_agent_loop_executes_tool_and_returns_final_response():
             content="",
             model="test/model",
             provider="test",
-            tool_calls=[ToolCall(id="1", name="write", arguments={"content": "ok"})],
+            tool_calls=[
+                ToolCall(id="1", name="read", arguments={"filePath": "a.txt"})
+            ],
             usage={"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
         ),
         LLMResponse(content="finished", model="test/model", provider="test"),
@@ -185,7 +187,7 @@ async def test_agent_loop_executes_tool_and_returns_final_response():
     )
     agent.llm = llm
     agent.loop = loop
-    result = await loop.run("write something")
+    result = await loop.run("read a.txt")
     assert result["success"] is True, result
     # Fast path: the tool's `content` ("ok") is returned directly.
     assert result["response"] == "ok"
@@ -214,7 +216,9 @@ async def test_agent_loop_continues_when_tool_output_has_no_readable_text():
             content="",
             model="test/model",
             provider="test",
-            tool_calls=[ToolCall(id="1", name="write", arguments={"content": "x"})],
+            tool_calls=[
+                ToolCall(id="1", name="read", arguments={"filePath": "a.txt"})
+            ],
             usage={"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
         ),
         LLMResponse(content="finished", model="test/model", provider="test"),
@@ -228,11 +232,12 @@ async def test_agent_loop_continues_when_tool_output_has_no_readable_text():
             "enable_planning": False,
             "enable_intent_classification": False,
             "enable_qa_verification": False,
+            "require_demo_offer": False,
         },
     )
     agent.llm = llm
     agent.loop = loop
-    result = await loop.run("write something")
+    result = await loop.run("read a.txt")
     assert result["success"] is True, result
     assert result["response"] == "finished"
     assert result["tool_calls"] == 1

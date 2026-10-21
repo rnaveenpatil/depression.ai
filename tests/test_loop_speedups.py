@@ -21,10 +21,11 @@ def clean_runtime(monkeypatch, tmp_path):
     reset_llm_registry()
 
 
-def test_runtime_provider_fails_fast():
+def test_runtime_provider_uses_configured_timeout():
     registry = get_llm_registry()
     provider = configure_runtime_provider(registry, "https://llm.example/v1", "dummy-key", "vendor/custom")
-    assert provider.timeout == 30.0
+    # Long-running agent calls are intentionally not cut off by a short timeout.
+    assert provider.timeout == 999999.0
     assert provider.max_retries == 2
 
 
@@ -56,7 +57,9 @@ async def test_project_context_is_cached():
     second = await loop._get_project_context()
     assert first == second
     assert Agent.workspace.list_count == 1
-    assert Agent.workspace.git_count == 1
+    # Git info is intentionally not fetched for the prompt context; doing so
+    # on every launch adds latency without changing the model's task.
+    assert Agent.workspace.git_count == 0
 
 
 class ReadLLM:
@@ -143,7 +146,11 @@ async def test_read_with_intermediate_content_continues():
     llm = ReadLLM(with_content=True)
     loop = AgentLoop(
         ExecAgent(), llm, SimpleNamespace(tools={}), None,
-        {"enable_intent_classification": False, "enable_planning": False},
+        {
+            "enable_intent_classification": False,
+            "enable_planning": False,
+            "require_demo_offer": False,
+        },
     )
     result = await loop.run("read a.txt")
     assert result["success"] is True, result

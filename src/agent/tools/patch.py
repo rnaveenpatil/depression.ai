@@ -54,6 +54,10 @@ class PatchTool(BaseTool):
     }
     timeout = 30.0
 
+    read_only = False
+    mutating = True
+    category = "edit"
+
     def __init__(self, workspace: Any = None):
         self.workspace = workspace
 

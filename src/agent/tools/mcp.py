@@ -30,6 +30,10 @@ class MCPTool(BaseTool):
     }
     timeout = 120.0
 
+    read_only = False
+    mutating = True
+    category = "misc"
+
     def __init__(self, mcp_client: Any = None):
         self.mcp_client = mcp_client
 

@@ -109,10 +109,12 @@ class BaseAgent:
             "output_tokens": 0,
             "llm_calls": 0,
             "cost": 0.0,
+            "duration": 0.0,
             "tool_calls": 0,
             "tools_used": {},
             "errors": [],
         }
+        self._query_started_at = 0.0
         self.is_shutting_down = False
         self._shutdown_done = False
         self._initialized = False
@@ -231,6 +233,7 @@ class BaseAgent:
             "output_tokens": self.context.get("output_tokens", 0),
             "llm_calls": self.context.get("llm_calls", 0),
             "cost": self.context.get("cost", 0.0),
+            "duration": self.context.get("duration", 0.0),
             "tools_used": dict(self.context.get("tools_used", {}) or {}),
         }
 
@@ -511,6 +514,7 @@ class BaseAgent:
         record_user: bool = True,
     ) -> Dict[str, Any]:
         start = time.time()
+        self._query_started_at = start
         try:
             self.status = "thinking"
             self.context["turn_count"] = self.context.get("turn_count", 0) + 1
@@ -561,6 +565,7 @@ class BaseAgent:
             self.context["output_tokens"] = self.context.get("output_tokens", 0) + output_tokens
             self.context["llm_calls"] = self.context.get("llm_calls", 0) + llm_calls
             self.context["cost"] = self.context.get("cost", 0.0) + cost
+            self.context["duration"] = self.context.get("duration", 0.0) + elapsed
 
             self.metrics["total_tokens"] += tokens
             self.metrics["total_tool_calls"] += int(result.get("tool_calls", 0) or 0)
@@ -594,6 +599,8 @@ class BaseAgent:
             self.status = "error"
             logger.error("Query failed: %s", e, exc_info=True)
             return {"success": False, "error": format_error(e)}
+        finally:
+            self._query_started_at = 0.0
 
     async def _handle_subagent_invocations(
         self,

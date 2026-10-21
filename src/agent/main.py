@@ -64,7 +64,7 @@ from agent.context.manager import ContextManager
 from agent.permissions.manager import PermissionManager
 from agent.project.workspace import WorkspaceManager
 from agent.mcp.client import MCPClient
-from agent.agent.dual_agent import create_dual_agent_system, AgentCoordinator
+from agent.agent.dual_agent import BaseAgent, create_dual_agent_system, AgentCoordinator
 
 
 logger = get_logger(__name__)
@@ -96,7 +96,7 @@ class CLIAgent:
         self.context_manager: Optional[ContextManager] = None
         self.permission_manager: Optional[PermissionManager] = None
         self.mcp_client: Optional[MCPClient] = None
-        self.agent: Optional[Agent] = None
+        self.agent: Optional[BaseAgent] = None
 
         # Config
         self.config_dict: dict = {}
