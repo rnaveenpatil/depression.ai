@@ -1,7 +1,7 @@
 # depression.ai — Project File Listing
 
-Generated: 2026-10-21 19:35:59
-Repo: e8702a8  Branch: main
+Generated: 2026-10-21 21:04:01
+Repo: a1d5438  Branch: main
 
 ## Summary
 
@@ -90,7 +90,7 @@ src/agent/depression/ (nested venv), .mypy_cache/, .pytest_cache/,
         65  .opencode/package.json
      14634  .opencode/package-lock.json
       2017  pyproject.toml
-     46245  README.md
+     48593  README.md
      28156  src/agent/agent/agent.py
      43887  src/agent/agent/dual_agent.py
       1124  src/agent/agent/__init__.py
