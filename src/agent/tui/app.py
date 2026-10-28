@@ -806,7 +806,10 @@ class LLMPanel(Vertical):
     LLMPanel Button:hover, LLMPanel Button:focus {{
         background: {RAISED}; color: {GREEN_GLOW}; border: round {GREEN_GLOW};
     }}
-    LLMPanel .system {{ color: {MUTED}; margin-bottom: 1; }}
+    LLMPanel #connect {{ text-style: bold; }}
+    LLMPanel #llm-actions {{ height: auto; }}
+    LLMPanel #llm-actions Button {{ width: 1fr; min-width: 0; margin-top: 0; }}
+    LLMPanel .system {{ margin-bottom: 1; }}
     """
 
     def __init__(self, app_ref: "DepressionApp", **kwargs: Any):
@@ -830,8 +833,11 @@ class LLMPanel(Vertical):
             allow_blank=True, id="model-select",
         )
         yield Button("CONNECT", id="connect")
-        yield Button("TEST CONNECTION", id="llm-test")
-        yield Button("DISCOVER /models", id="discover")
+        yield Horizontal(
+            Button("TEST", id="llm-test"),
+            Button("MODELS", id="discover"),
+            id="llm-actions",
+        )
         yield Static("", id="llm-status", classes="system")
         yield Static("", id="llm-provider", classes="system")
 
@@ -1022,13 +1028,13 @@ class TodoPanel(Vertical):
                 )
                 return
             self.query_one("#todo-body", Static).update(
-                self._render(self._entries)
+                self._format_entries(self._entries)
             )
         except Exception:
             pass
 
     @staticmethod
-    def _render(entries: list[dict]) -> str:
+    def _format_entries(entries: list[dict]) -> str:
         icons = {
             "completed": f"[{GREEN}]✓[/]",
             "in_progress": f"[{AMBER}]▸[/]",
