@@ -140,7 +140,7 @@ def test_search_preview_hints_at_hidden_matches():
     widget = _search_widget(9)
     collapsed = _plain(widget._render_search(widget._result))
 
-    assert "press e" in collapsed
+    assert "press ctrl+e" in collapsed
     assert "f8.py" not in collapsed, "rows beyond the preview window leaked through"
 
 
@@ -154,7 +154,7 @@ def test_search_expand_is_strictly_larger_and_drops_the_hint():
 
     assert "f8.py" in expanded, "expansion failed to reveal the hidden rows"
     assert expanded.count("\n") > collapsed.count("\n")
-    assert "press e" not in expanded
+    assert "press ctrl+e" not in expanded
 
 
 def test_search_reports_matches_withheld_by_the_tool_payload():
@@ -174,7 +174,7 @@ def test_long_tool_error_is_preserved_and_flagged():
     err = "E" * 3000
 
     collapsed = widget._render_error(err)
-    assert "press e" in collapsed
+    assert "press ctrl+e" in collapsed
     assert "more char" in collapsed
     assert len(_plain(collapsed)) < 2000, "collapsed error should stay compact"
 
@@ -192,7 +192,7 @@ def test_aws_error_path_uses_discoverable_truncation():
 
     rendered = _plain(widget._render_aws(result))
     assert "AccessDenied" in rendered
-    assert "press e" in rendered
+    assert "press ctrl+e" in rendered
 
 
 def test_web_body_expands_to_full_text():
@@ -206,9 +206,96 @@ def test_web_body_expands_to_full_text():
         "content": "line\n" * 60,
     }
 
-    assert "press e" in _plain(widget._render_web(widget._result))
+    assert "press ctrl+e" in _plain(widget._render_web(widget._result))
 
     widget._expanded = True
     expanded = _plain(widget._render_web(widget._result))
-    assert "press e" not in expanded
+    assert "press ctrl+e" not in expanded
     assert expanded.count("line") >= 60
+
+
+@pytest.mark.asyncio
+async def test_modal_tab_does_not_cycle_app_mode():
+    modal = PermissionModal(
+        PermissionRequest(tool="bash", action="execute", params={"command": "echo ok"}),
+        PermissionVerdict.ask("test", risk=RiskLevel.MEDIUM),
+    )
+    app = DepressionApp(coordinator=None)
+    async with app.run_test() as pilot:
+        before = app.current_mode
+        app.push_screen(modal)
+        await pilot.pause()
+        await pilot.press("tab")
+        await pilot.pause()
+        assert app.current_mode == before
+
+
+@pytest.mark.asyncio
+async def test_onboarding_runs_inside_a_worker(monkeypatch):
+    from textual.worker import get_current_worker
+
+    seen = []
+
+    async def fake_push(app, **kwargs):
+        seen.append(get_current_worker())
+        return None
+
+    monkeypatch.setattr(
+        "agent.tui.onboarding.welcome.push_welcome_if_new_user",
+        fake_push,
+    )
+    app = DepressionApp(coordinator=None)
+    async with app.run_test() as pilot:
+        for _ in range(20):
+            await pilot.pause()
+            if seen:
+                break
+
+    assert seen, "onboarding did not run"
+
+
+@pytest.mark.asyncio
+async def test_concurrent_stream_tokens_create_one_widget():
+    from agent.tui.events import AgentEvent
+
+    app = DepressionApp(coordinator=None)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await asyncio.gather(
+            app._on_token(AgentEvent("on_token", {"delta": "a"})),
+            app._on_token(AgentEvent("on_token", {"delta": "b"})),
+        )
+        await pilot.pause()
+        widgets = [
+            w for w in app.query("*") if type(w).__name__ == "StreamingOutput"
+        ]
+        assert len(widgets) == 1
+
+
+def test_stop_phrase_requests_graceful_loop_stop():
+    from types import SimpleNamespace
+
+    class _FakeLoop:
+        stopped = False
+
+        def stop(self):
+            self.stopped = True
+
+    fake_loop = _FakeLoop()
+    coordinator = SimpleNamespace(
+        plan_agent=SimpleNamespace(loop=fake_loop),
+        build_agent=None,
+    )
+    app = DepressionApp(coordinator=coordinator)
+    app.busy = True
+
+    app.submit_prompt_text("ok stop")
+
+    assert fake_loop.stopped is True
+    assert app._prompt_queue == []
+
+
+def test_default_turn_timeout_is_one_hour(monkeypatch):
+    monkeypatch.delenv("TUI_TURN_TIMEOUT", raising=False)
+    app = DepressionApp(coordinator=None)
+    assert app.turn_timeout == 3600.0

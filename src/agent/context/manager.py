@@ -13,6 +13,7 @@ from agent.context.project import ProjectContext
 from agent.context.files import FileContext
 from agent.context.compaction import Compactor, _estimate_message_tokens
 from agent.context.summary_store import SummaryStore
+from agent.context.read_cache import ReadCache  # [READ-CACHE]
 
 logger = get_logger(__name__)
 
@@ -226,6 +227,20 @@ class ContextManager:
         self.summary_store = SummaryStore(
             root=self.config.get("summary_dir") or None
         )
+
+        # [READ-CACHE] Session-scoped read cache: content, index, slice store.
+        self.read_cache = ReadCache(
+            content_budget_bytes=self.config.get(
+                "read_cache_bytes", 8 * 1024 * 1024
+            ),
+            content_entries=self.config.get("read_cache_entries", 200),
+            index_entries=self.config.get("read_index_entries", 500),
+            slice_budget_bytes=self.config.get(
+                "slice_store_bytes", 8 * 1024 * 1024
+            ),
+            slice_entries=self.config.get("slice_store_entries", 50),
+        )
+
         self._session_id = self._resolve_session_id()
 
     # ------------------------------------------------------------------
@@ -471,6 +486,14 @@ class ContextManager:
             for t in recent
         ]
 
+    # [READ-CACHE] Called by the loop after a successful write/edit so the
+    # next read of that path sees the new bytes.
+    def note_file_written(self, path: str) -> None:
+        try:
+            self.read_cache.invalidate(path)
+        except Exception:
+            pass
+
     # ------------------------------------------------------------------
     # FILE / PROJECT CONTEXT
     # ------------------------------------------------------------------
@@ -702,6 +725,8 @@ class ContextManager:
           - Summarise everything older into a running summary.
           - Replace old tool payloads with one-line outcome stubs before
             they enter the summary text, so the summary is compact.
+          - Pin a "files already read" index so the model does not re-read
+            files it has already seen. [READ-CACHE]
         """
         from agent.context.runtime import repair_context
 
@@ -785,6 +810,21 @@ class ContextManager:
             merged.append(summary_msg)
             merged.extend(keep_verbatim)
             merged.sort(key=lambda m: getattr(m, "timestamp", 0))
+
+            # [READ-CACHE] Survive compaction: pin a summary of files
+            # already read this session so the model does not re-read them.
+            index_text = self.read_cache.index_summary()
+            if index_text:
+                merged.insert(
+                    1,
+                    ContextMessage(
+                        role="system",
+                        content=index_text,
+                        tokens=self._estimate_tokens(index_text),
+                        metadata={"read_index": True},
+                        pinned=True,
+                    ),
+                )
 
             self.messages = merged
             repair_context(self, fill_missing=True)
@@ -879,6 +919,7 @@ class ContextManager:
                 if keep_system else []
             )
             self.tool_outputs.clear()
+            self.read_cache.clear()  # [READ-CACHE]
             await self.file_context.clear()
 
     async def get_stats(self) -> Dict[str, Any]:

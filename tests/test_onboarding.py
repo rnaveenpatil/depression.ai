@@ -1433,3 +1433,45 @@ def _web_config() -> FirebaseConfig:
         project_id="depression-571e0",
         app_id="1:952406227868:web:44b56e6f1dbdec4d20e659",
     )
+
+
+async def test_welcome_token_enter_submits_token_not_google(store):
+    seen = {}
+
+    class _TokenAuth(FirebaseGoogleAuth):
+        async def sign_in_with_id_token(self, token: str) -> FirebaseUser:
+            seen["token"] = token
+            return FirebaseUser(
+                uid="uid-token",
+                email="token@example.com",
+                name="Token User",
+                provider="password",
+            )
+
+        async def sign_in_with_google(self, timeout: float = 180.0) -> FirebaseUser:
+            seen["google"] = True
+            raise AssertionError("Enter in the token field must not start Google sign-in")
+
+    app = _HostApp()
+    async with app.run_test() as pilot:
+        screen = WelcomeScreen(
+            config=CONFIG,
+            store=store,
+            auth=_TokenAuth(CONFIG),
+            countdown=0,
+            enable_oauth=False,
+        )
+        app.push_screen(screen)
+        await pilot.pause()
+        await pilot.press("t")
+        await pilot.pause()
+        assert screen.query_one("#welcome-input").has_focus
+        await pilot.press("a", "b", "c")
+        await pilot.press("enter")
+        for _ in range(12):
+            await pilot.pause()
+            if seen.get("token"):
+                break
+
+    assert seen.get("token") == "abc"
+    assert "google" not in seen

@@ -2,21 +2,38 @@
 from __future__ import annotations
 
 import asyncio
+import difflib
+import importlib.util
+import json
 import os as _os
 import platform
 import re
+import shutil
 import subprocess
+import sys
 import time
+from datetime import datetime
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import httpx
 from textual import on, work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
+from textual.command import Hit, Hits, Provider
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.reactive import reactive
 from textual.screen import ModalScreen
-from textual.widgets import Button, Footer, Input, Static, TextArea
+from textual.widgets import (
+    Button,
+    Footer,
+    Input,
+    OptionList,
+    Select,
+    Static,
+    TextArea,
+)
+from textual.widgets.option_list import Option
 
 from agent.agent.dual_agent import AgentCoordinator
 from agent.llm.runtime import (
@@ -26,9 +43,7 @@ from agent.llm.runtime import (
     plan_runtime,
 )
 from agent.utils.env_manager import (
-    EnvManager,
     get_aws_credentials,
-    set_aws_credentials,
 )
 
 from agent.tui.events import AgentEvent, EventBridge
@@ -51,7 +66,7 @@ SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇",
 MODE_ICONS = {"plan": "◇", "build": "◆", "auto": "◈"}
 MODE_ORDER = ["build", "plan", "auto"]
 
-DEFAULT_TURN_TIMEOUT = 900.0
+DEFAULT_TURN_TIMEOUT = 3600.0
 DEFAULT_AWS_REGION = "us-east-1"
 
 _PANEL_NAMES = ("llm", "aws", "profile", "context", "llmcost", "todo", "help")
@@ -60,6 +75,17 @@ _DIFF_TOOLS = {"write", "edit", "apply_patch", "filesystem", "patch"}
 
 _PROMPT_MIN_ROWS = 1
 _PROMPT_MAX_ROWS = 10
+
+_STOP_REQUESTS = {
+    "stop", "stop it", "stop now", "ok stop", "okay stop", "please stop",
+    "cancel", "cancel it", "abort", "abort it", "halt", "wait",
+    "enough", "that's enough", "thats enough", "quit",
+}
+
+
+def _is_stop_request(text: str) -> bool:
+    normalized = re.sub(r"[^a-z0-9' ]+", " ", str(text).lower())
+    return " ".join(normalized.split()) in _STOP_REQUESTS
 
 
 def _esc(text: Any) -> str:
@@ -252,8 +278,57 @@ class PromptArea(TextArea):
     def on_text_area_changed(self, event: TextArea.Changed) -> None:
         self._resize()
 
+    def set_prompt_text(self, text: str) -> None:
+        """Replace the prompt text and move the cursor to the end."""
+        self.text = text or ""
+        self._resize()
+        try:
+            loc = self.document.get_location_from_index(len(self.text))
+            self.cursor_location = loc
+        except Exception:
+            pass
+
+    def insert_file_reference(self, path: str) -> None:
+        """Insert @path at the cursor, replacing an unfinished @ token."""
+        text = self.text
+        try:
+            idx = self.document.get_index_from_location(self.cursor_location)
+        except Exception:
+            idx = len(text)
+        before = text[:idx]
+        start = idx
+        at = before.rfind("@")
+        if at >= 0 and (at == 0 or before[at - 1].isspace()):
+            token = before[at:]
+            if not any(c.isspace() for c in token):
+                start = at
+        ref = f"@{path} "
+        self.set_prompt_text(text[:start] + ref + text[idx:])
+        try:
+            loc = self.document.get_location_from_index(start + len(ref))
+            self.cursor_location = loc
+        except Exception:
+            pass
+
     async def _on_key(self, event) -> None:
         key = event.key
+
+        if key in ("up", "down"):
+            try:
+                at_edge = (
+                    self.cursor_at_first_line if key == "up"
+                    else self.cursor_at_last_line
+                )
+            except Exception:
+                at_edge = False
+            if at_edge:
+                handler = getattr(self.app, "navigate_prompt_history", None)
+                value = handler(-1 if key == "up" else 1) if handler else None
+                if value is not None:
+                    event.stop()
+                    event.prevent_default()
+                    self.set_prompt_text(value)
+                    return
 
         if key in ("shift+enter", "ctrl+j"):
             event.stop()
@@ -278,6 +353,431 @@ class PromptArea(TextArea):
 
 
 # ======================================================================
+# SMALL MODALS
+# ======================================================================
+
+class TextPromptModal(ModalScreen[Optional[str]]):
+    """A one-line text prompt used for renaming sessions."""
+
+    DEFAULT_CSS = f"""
+    TextPromptModal {{ align: center middle; background: {RAISED} 78%; }}
+    #tp-card {{
+        width: 64%; min-width: 44; height: auto;
+        border: thick {GREEN}; background: {PANEL}; padding: 1 2;
+    }}
+    #tp-title {{ color: {GREEN}; text-style: bold; margin-bottom: 1; }}
+    #tp-input {{
+        background: {BG}; border: round {BORDER}; color: {TEXT}; height: 3;
+    }}
+    #tp-input:focus {{ border: round {GREEN}; }}
+    #tp-buttons {{ height: 3; layout: horizontal; margin-top: 1; }}
+    #tp-buttons Button {{
+        width: 1fr; height: 3; background: transparent;
+        border: round {GREEN}; color: {GREEN}; margin-right: 1;
+    }}
+    #tp-buttons Button:focus {{ background: {GREEN}; color: {BG}; }}
+    """
+
+    BINDINGS = [Binding("escape", "cancel", "Cancel", priority=True)]
+
+    def __init__(self, title: str, value: str = "", placeholder: str = "",
+                 **kwargs: Any):
+        super().__init__(**kwargs)
+        self._title = title
+        self._value = value
+        self._placeholder = placeholder
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="tp-card"):
+            yield Static(_esc(self._title), id="tp-title", markup=True)
+            yield Input(self._value, placeholder=self._placeholder, id="tp-input")
+            with Horizontal(id="tp-buttons"):
+                yield Button("SAVE", id="tp-save")
+                yield Button("CANCEL", id="tp-cancel")
+
+    def on_mount(self) -> None:
+        inp = self.query_one("#tp-input", Input)
+        inp.focus()
+        try:
+            inp.cursor_position = len(inp.value)
+        except Exception:
+            pass
+
+    def _save(self) -> None:
+        value = self.query_one("#tp-input", Input).value.strip()
+        self.dismiss(value or None)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+    @on(Input.Submitted, "#tp-input")
+    def _submitted(self) -> None:
+        self._save()
+
+    @on(Button.Pressed, "#tp-save")
+    def _save_btn(self) -> None:
+        self._save()
+
+    @on(Button.Pressed, "#tp-cancel")
+    def _cancel_btn(self) -> None:
+        self.dismiss(None)
+
+
+class ConfirmModal(ModalScreen[bool]):
+    """Small yes/no confirmation dialog."""
+
+    DEFAULT_CSS = f"""
+    ConfirmModal {{ align: center middle; background: {RAISED} 78%; }}
+    #cf-card {{
+        width: 58%; min-width: 40; height: auto;
+        border: thick {ERROR}; background: {PANEL}; padding: 1 2;
+    }}
+    #cf-title {{ color: {ERROR}; text-style: bold; margin-bottom: 1; }}
+    #cf-body {{ color: {TEXT}; margin-bottom: 1; }}
+    #cf-buttons {{ height: 3; layout: horizontal; }}
+    #cf-buttons Button {{
+        width: 1fr; height: 3; background: transparent;
+        border: round {BORDER}; color: {TEXT}; margin-right: 1;
+    }}
+    #cf-yes {{ border: round {ERROR}; color: {ERROR}; }}
+    #cf-yes:focus {{ background: {ERROR}; color: {BG}; }}
+    """
+
+    BINDINGS = [
+        Binding("escape", "no", "No", priority=True),
+        Binding("n", "no", "No", priority=True),
+        Binding("y", "yes", "Yes", priority=True),
+    ]
+
+    def __init__(self, title: str, body: str = "", **kwargs: Any):
+        super().__init__(**kwargs)
+        self._title = title
+        self._body = body
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="cf-card"):
+            yield Static(_esc(self._title), id="cf-title", markup=True)
+            if self._body:
+                yield Static(_esc(self._body), id="cf-body", markup=True)
+            with Horizontal(id="cf-buttons"):
+                yield Button("YES", id="cf-yes")
+                yield Button("NO", id="cf-no")
+
+    def on_mount(self) -> None:
+        try:
+            self.query_one("#cf-no", Button).focus()
+        except Exception:
+            pass
+
+    def action_yes(self) -> None: self.dismiss(True)
+    def action_no(self) -> None: self.dismiss(False)
+
+    @on(Button.Pressed, "#cf-yes")
+    def _yes_btn(self) -> None: self.dismiss(True)
+
+    @on(Button.Pressed, "#cf-no")
+    def _no_btn(self) -> None: self.dismiss(False)
+
+
+class _PickerModal(ModalScreen[Optional[str]]):
+    """Shared filter/list picker used by history and file completion."""
+
+    DEFAULT_CSS = f"""
+    _PickerModal {{ align: center middle; background: {RAISED} 78%; }}
+    _PickerModal #pick-card {{
+        width: 76%; min-width: 46; height: 72%;
+        border: thick {GREEN}; background: {PANEL}; padding: 1 2;
+    }}
+    _PickerModal #pick-title {{ color: {GREEN}; text-style: bold; }}
+    _PickerModal #pick-filter {{
+        background: {BG}; border: round {BORDER}; color: {TEXT};
+        height: 3; margin: 1 0;
+    }}
+    _PickerModal #pick-filter:focus {{ border: round {GREEN}; }}
+    _PickerModal OptionList {{
+        height: 1fr; background: {BG}; color: {TEXT};
+        border: round {BORDER};
+    }}
+    _PickerModal OptionList > .option-list--option-highlighted {{
+        background: {GREEN_GLOW}; color: {BG};
+    }}
+    _PickerModal .pick-help {{ color: {MUTED}; height: 1; margin-top: 1; }}
+    """
+
+    BINDINGS = [Binding("escape", "cancel", "Cancel", priority=True)]
+
+    def __init__(self, title: str, items: List[str], placeholder: str = "filter",
+                 help_text: str = "type to filter · enter select · esc close",
+                 **kwargs: Any):
+        super().__init__(**kwargs)
+        self._title = title
+        self._items = list(items)
+        self._placeholder = placeholder
+        self._help_text = help_text
+        self._filtered = list(self._items)
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="pick-card"):
+            yield Static(_esc(self._title), id="pick-title", markup=True)
+            yield Input(placeholder=self._placeholder, id="pick-filter")
+            yield OptionList(id="pick-results")
+            yield Static(self._help_text, classes="pick-help")
+
+    def on_mount(self) -> None:
+        self._refresh("")
+        try:
+            self.query_one("#pick-filter", Input).focus()
+        except Exception:
+            pass
+
+    def _refresh(self, query: str) -> None:
+        q = query.strip().lower()
+        self._filtered = [item for item in self._items if q in item.lower()]
+        options = [Option(item, id=str(i)) for i, item in enumerate(self._filtered)]
+        if not options:
+            options = [Option("(no matches)", id="__none__", disabled=True)]
+        try:
+            self.query_one("#pick-results", OptionList).clear_options()
+            self.query_one("#pick-results", OptionList).add_options(options)
+        except Exception:
+            pass
+
+    def _selected(self) -> Optional[str]:
+        try:
+            opt = self.query_one("#pick-results", OptionList).highlighted_option
+        except Exception:
+            return None
+        if opt is None or opt.id == "__none__":
+            return None
+        try:
+            return self._filtered[int(str(opt.id))]
+        except Exception:
+            return None
+
+    def _choose(self, value: Optional[str]) -> None:
+        self.dismiss(value)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+    @on(Input.Changed, "#pick-filter")
+    def _filter_changed(self, event: Input.Changed) -> None:
+        self._refresh(event.value)
+
+    @on(Input.Submitted, "#pick-filter")
+    def _filter_submitted(self) -> None:
+        value = self._selected()
+        if value is None and self._filtered:
+            value = self._filtered[0]
+        self._choose(value)
+
+    @on(OptionList.OptionSelected, "#pick-results")
+    def _option_selected(self, event: OptionList.OptionSelected) -> None:
+        if event.option.id == "__none__":
+            return
+        try:
+            self._choose(self._filtered[int(str(event.option.id))])
+        except Exception:
+            pass
+
+
+class HistorySearchModal(_PickerModal):
+    def __init__(self, prompts: List[str], **kwargs: Any):
+        super().__init__(
+            "PROMPT HISTORY",
+            items=list(reversed(prompts)),
+            placeholder="search history",
+            help_text="enter select · esc close · ctrl+r reopen",
+            **kwargs,
+        )
+
+
+class FilePickerModal(_PickerModal):
+    def __init__(self, files: List[str], **kwargs: Any):
+        super().__init__(
+            "ATTACH A FILE",
+            items=files,
+            placeholder="filter project files",
+            help_text="enter insert @path · esc close",
+            **kwargs,
+        )
+
+
+class SessionPickerModal(ModalScreen[Optional[tuple[str, str]]]):
+    """List sessions and let the user open, rename, or delete one."""
+
+    DEFAULT_CSS = f"""
+    SessionPickerModal {{ align: center middle; background: {RAISED} 78%; }}
+    #sp-card {{
+        width: 76%; min-width: 48; height: 72%;
+        border: thick {GREEN}; background: {PANEL}; padding: 1 2;
+    }}
+    #sp-title {{ color: {GREEN}; text-style: bold; }}
+    #sp-list {{
+        height: 1fr; margin-top: 1; background: {BG}; color: {TEXT};
+        border: round {BORDER};
+    }}
+    #sp-list > .option-list--option-highlighted {{
+        background: {GREEN_GLOW}; color: {BG};
+    }}
+    #sp-buttons {{ height: 3; layout: horizontal; margin-top: 1; }}
+    #sp-buttons Button {{
+        width: 1fr; height: 3; background: transparent;
+        border: round {GREEN}; color: {GREEN}; margin-right: 1;
+    }}
+    #sp-buttons Button:focus {{ background: {GREEN}; color: {BG}; }}
+    #sp-delete {{ border: round {ERROR}; color: {ERROR}; }}
+    #sp-help {{ color: {MUTED}; height: 1; margin-top: 1; }}
+    """
+
+    BINDINGS = [
+        Binding("escape", "cancel", "Close", priority=True),
+        Binding("o", "open_selected", "Open", priority=True),
+        Binding("r", "rename_selected", "Rename", priority=True),
+        Binding("d", "delete_selected", "Delete", priority=True),
+    ]
+
+    def __init__(self, sessions: List[Dict[str, Any]], **kwargs: Any):
+        super().__init__(**kwargs)
+        self._sessions = list(sessions)
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="sp-card"):
+            yield Static("SESSIONS", id="sp-title", markup=True)
+            yield OptionList(id="sp-list")
+            with Horizontal(id="sp-buttons"):
+                yield Button("OPEN", id="sp-open")
+                yield Button("RENAME", id="sp-rename")
+                yield Button("DELETE", id="sp-delete")
+            yield Static(
+                "enter open · r rename · d delete · esc close",
+                id="sp-help",
+            )
+
+    def on_mount(self) -> None:
+        options: List[Option] = []
+        for s in self._sessions:
+            sid = str(s.get("id") or "")
+            if not sid:
+                continue
+            name = str(s.get("name") or "session")
+            updated = s.get("updated_at") or 0
+            when = ""
+            try:
+                when = datetime.fromtimestamp(float(updated)).strftime("%m-%d %H:%M")
+            except Exception:
+                when = "—"
+            current = " *" if s.get("current") else ""
+            options.append(Option(
+                f"{name}{current}  ·  {when}  ·  {sid[:8]}", id=sid,
+            ))
+        if not options:
+            options = [Option("(no saved sessions)", id="__none__", disabled=True)]
+        lst = self.query_one("#sp-list", OptionList)
+        lst.add_options(options)
+        lst.focus()
+
+    def _selected_id(self) -> Optional[str]:
+        try:
+            opt = self.query_one("#sp-list", OptionList).highlighted_option
+        except Exception:
+            return None
+        if opt is None or opt.id == "__none__":
+            return None
+        return str(opt.id)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+    def action_open_selected(self) -> None:
+        sid = self._selected_id()
+        if sid:
+            self.dismiss(("open", sid))
+
+    def action_rename_selected(self) -> None:
+        sid = self._selected_id()
+        if sid:
+            self.dismiss(("rename", sid))
+
+    def action_delete_selected(self) -> None:
+        sid = self._selected_id()
+        if sid:
+            self.dismiss(("delete", sid))
+
+    @on(OptionList.OptionSelected, "#sp-list")
+    def _list_selected(self, event: OptionList.OptionSelected) -> None:
+        if event.option.id != "__none__":
+            self.dismiss(("open", str(event.option.id)))
+
+    @on(Button.Pressed, "#sp-open")
+    def _open_btn(self) -> None: self.action_open_selected()
+
+    @on(Button.Pressed, "#sp-rename")
+    def _rename_btn(self) -> None: self.action_rename_selected()
+
+    @on(Button.Pressed, "#sp-delete")
+    def _delete_btn(self) -> None: self.action_delete_selected()
+
+
+class TranscriptSearchModal(TextPromptModal):
+    def __init__(self, **kwargs: Any):
+        super().__init__(
+            "SEARCH TRANSCRIPT",
+            placeholder="text to find",
+            **kwargs,
+        )
+
+
+# ======================================================================
+# COMMAND PALETTE
+# ======================================================================
+
+class AgentCommandProvider(Provider):
+    """Expose slash commands in Textual's ctrl+p command palette."""
+
+    COMMANDS = [
+        ("/connect", "Configure the LLM connection"),
+        ("/model", "Open the LLM panel and discover models"),
+        ("/models", "Discover models from the provider"),
+        ("/sessions", "Open saved sessions"),
+        ("/retry", "Retry the last prompt"),
+        ("/continue", "Continue after a timeout or stop"),
+        ("/copy", "Copy the last agent reply"),
+        ("/export", "Export the transcript as Markdown"),
+        ("/search", "Search the transcript"),
+        ("/doctor", "Run local diagnostics"),
+        ("/aws", "Open AWS credentials"),
+        ("/profile", "Open profile"),
+        ("/context", "Open context usage"),
+        ("/llmcost", "Open token and API cost"),
+        ("/todo", "Open the todo list"),
+        ("/run", "Run a shell command"),
+        ("/shot", "Open an image with the OS viewer"),
+        ("/plan", "Switch to plan mode"),
+        ("/build", "Switch to build mode"),
+        ("/auto", "Switch to auto mode"),
+        ("/clear", "Clear the transcript"),
+        ("/help", "Open help"),
+        ("/quit", "Quit"),
+    ]
+
+    async def search(self, query: str) -> Hits:
+        matcher = self.matcher(query)
+        for slash, help_text in self.COMMANDS:
+            name = slash.lstrip("/")
+            score = matcher.match(name)
+            if score <= 0:
+                continue
+            yield Hit(
+                score,
+                f"{slash}  ·  {help_text}",
+                lambda s=slash: self.app.run_slash_command(s),
+                text=slash,
+                help=help_text,
+            )
+
+
+# ======================================================================
 # LLM PANEL
 # ======================================================================
 
@@ -293,6 +793,11 @@ class LLMPanel(Vertical):
         color: {TEXT}; margin: 0 0 1 0; height: 3; width: 100%;
     }}
     LLMPanel Input:focus {{ border: round {GREEN}; }}
+    LLMPanel Select {{
+        background: {PANEL}; border: round {BORDER};
+        color: {TEXT}; margin: 0 0 1 0; height: 3; width: 100%;
+    }}
+    LLMPanel Select:focus {{ border: round {GREEN}; }}
     LLMPanel Button {{
         width: 1fr; min-width: 12;
         background: transparent; border: round {GREEN};
@@ -319,9 +824,16 @@ class LLMPanel(Vertical):
         yield Static("Model ID", classes="label")
         yield Input(value=self._app.cfg["model"], id="model-id",
                     placeholder="provider/model-id")
+        yield Static("Discovered Models", classes="label")
+        yield Select(
+            [], prompt="discover models to choose",
+            allow_blank=True, id="model-select",
+        )
         yield Button("CONNECT", id="connect")
+        yield Button("TEST CONNECTION", id="llm-test")
         yield Button("DISCOVER /models", id="discover")
         yield Static("", id="llm-status", classes="system")
+        yield Static("", id="llm-provider", classes="system")
 
 
 # ======================================================================
@@ -1087,6 +1599,13 @@ class HelpPanel(Vertical):
         yield Static("/context   open context panel", classes="help-row")
         yield Static("/llmcost   open token + api cost panel", classes="help-row")
         yield Static("/todo      open todo panel", classes="help-row")
+        yield Static("/sessions  open, rename or delete saved sessions", classes="help-row")
+        yield Static("/retry     retry the last prompt", classes="help-row")
+        yield Static("/continue  continue after a timeout or stop", classes="help-row")
+        yield Static("/copy      copy the last agent reply", classes="help-row")
+        yield Static("/export    export the transcript as Markdown", classes="help-row")
+        yield Static("/search    search the transcript", classes="help-row")
+        yield Static("/doctor    run local diagnostics", classes="help-row")
         yield Static("/run CMD   run a shell command and show output", classes="help-row")
         yield Static("/shot PATH open a screenshot with the OS viewer", classes="help-row")
         yield Static("/plan      switch mode → plan", classes="help-row")
@@ -1100,10 +1619,16 @@ class HelpPanel(Vertical):
         yield Static("Enter      submit prompt", classes="help-row")
         yield Static("Shift+Ent  newline inside the prompt", classes="help-row")
         yield Static("Ctrl+J     newline (fallback)", classes="help-row")
+        yield Static("Up / Down  browse prompt history", classes="help-row")
+        yield Static("Ctrl+R     search prompt history", classes="help-row")
+        yield Static("Ctrl+P     command palette", classes="help-row")
+        yield Static("Ctrl+Space complete @file references", classes="help-row")
+        yield Static("Ctrl+F     search the transcript", classes="help-row")
+        yield Static("F2         pause / resume transcript auto-scroll", classes="help-row")
         yield Static("Tab        focus prompt / cycle mode", classes="help-row")
         yield Static("Ctrl+B     show / hide the sidebar", classes="help-row")
         yield Static("Esc        interrupt running agent", classes="help-row")
-        yield Static("e          expand / collapse the last tool block", classes="help-row")
+        yield Static("Ctrl+E     expand / collapse the last tool block", classes="help-row")
         yield Static("Ctrl+L     clear transcript", classes="help-row")
         yield Static("Ctrl+C     interrupt if busy, quit if idle", classes="help-row")
         yield Static("Ctrl+Q     quit", classes="help-row")
@@ -1113,24 +1638,35 @@ class HelpPanel(Vertical):
 # PERMISSION MODAL
 # ======================================================================
 
-class PermissionModal(ModalScreen[bool]):
+class PermissionModal(ModalScreen[Optional[str]]):
+    """Ask for permission and return once/session/deny."""
+
     DEFAULT_CSS = f"""
     PermissionModal {{
         align: center middle;
         background: {RAISED} 78%;
     }}
     #perm-card {{
-        width: 68%; min-width: 46; min-height: 12; max-height: 20;
+        width: 76%; min-width: 48; height: 78%;
         border: thick {GREEN}; background: {PANEL};
         padding: 1 2; layout: vertical;
     }}
-    #perm-body {{ height: 1fr; overflow-y: auto; }}
+    #perm-body {{
+        height: 1fr; width: 100%;
+        background: {BG}; border: round {BORDER};
+        padding: 0 1; scrollbar-size-vertical: 1;
+    }}
     #perm-buttons {{ height: 3; layout: horizontal; margin-top: 1; }}
     #perm-allow {{
         width: 1fr; height: 3; background: transparent;
         border: round {GREEN}; color: {GREEN}; text-style: bold; margin-right: 1;
     }}
     #perm-allow:focus {{ background: {GREEN}; color: {BG}; }}
+    #perm-allow-session {{
+        width: 1fr; height: 3; background: transparent;
+        border: round {AMBER}; color: {AMBER}; text-style: bold; margin-right: 1;
+    }}
+    #perm-allow-session:focus {{ background: {AMBER}; color: {BG}; }}
     #perm-deny {{
         width: 1fr; height: 3; background: transparent;
         border: round {ERROR}; color: {ERROR}; text-style: bold;
@@ -1139,8 +1675,9 @@ class PermissionModal(ModalScreen[bool]):
     """
 
     BINDINGS = [
-        Binding("y", "allow", "Allow", priority=True),
-        Binding("a", "allow", "Allow", priority=True),
+        Binding("y", "allow", "Allow once", priority=True),
+        Binding("a", "allow", "Allow once", priority=True),
+        Binding("s", "allow_session", "Allow tool", priority=True),
         Binding("n", "deny",  "Deny",  priority=True),
         Binding("d", "deny",  "Deny",  priority=True),
         Binding("escape", "deny", "Deny", priority=True),
@@ -1152,6 +1689,49 @@ class PermissionModal(ModalScreen[bool]):
         self._request = request
         self._verdict = verdict
         self._done = False
+
+    @staticmethod
+    def _details(request: Any) -> str:
+        params = getattr(request, "params", None) or {}
+        if not isinstance(params, dict):
+            return str(params)
+
+        command = (
+            params.get("command") or params.get("cmd")
+            or params.get("script") or params.get("shell")
+        )
+        if command:
+            return f"$ {command}"
+
+        old = next((params.get(k) for k in (
+            "old_string", "oldString", "old_content", "before", "oldText",
+        ) if isinstance(params.get(k), str)), None)
+        new = next((params.get(k) for k in (
+            "new_string", "newString", "new_content", "content", "after",
+            "newText",
+        ) if isinstance(params.get(k), str)), None)
+        path = params.get("path") or params.get("file") or params.get("filepath")
+
+        if old is not None and new is not None:
+            diff = list(difflib.unified_diff(
+                old.splitlines(), new.splitlines(),
+                fromfile="before", tofile="after", lineterm="", n=3,
+            ))
+            body = "\n".join(diff[:160])
+            if path:
+                body = f"{path}\n{body}"
+            return body or "(no changes)"
+
+        if path and new is not None:
+            lines = new.splitlines()
+            body = "\n".join(lines[:160])
+            more = "" if len(lines) <= 160 else "\n…"
+            return f"{path}\n{body}{more}"
+
+        try:
+            return json.dumps(params, indent=2, default=str)[:8000]
+        except Exception:
+            return str(params)[:8000]
 
     def compose(self) -> ComposeResult:
         req, v = self._request, self._verdict
@@ -1166,20 +1746,24 @@ class PermissionModal(ModalScreen[bool]):
         ]
         if getattr(v, "reason", None):
             lines.append(f"[{MUTED}]{_esc(v.reason)}[/]")
-        if getattr(req, "params", None):
-            for k, val in list(req.params.items())[:4]:
-                sval = str(val)
-                if len(sval) > 60:
-                    sval = sval[:57] + "…"
-                lines.append(f"[{DIM}]{_esc(k)}: {_esc(sval)}[/]")
+        details = self._details(req)
+        if details:
+            lines.append("")
+            lines.append(f"[{BORDER}]" + "─" * 56 + "[/]")
+            lines.append(f"[{TEXT}]{_esc(details)}[/]")
         lines.append("")
-        lines.append(f"[{MUTED}][A] allow   [D] deny   (enter = default)[/]")
+        lines.append(
+            f"[{MUTED}][A] allow once   [S] allow this tool for the session   "
+            f"[D] deny[/]"
+        )
 
         with Vertical(id="perm-card"):
-            yield Static("\n".join(lines), id="perm-body", markup=True)
+            with VerticalScroll(id="perm-body"):
+                yield Static("\n".join(lines), markup=True)
             with Horizontal(id="perm-buttons"):
-                yield Button("ALLOW [A]", id="perm-allow")
-                yield Button("DENY  [D]", id="perm-deny")
+                yield Button("ALLOW ONCE [A]", id="perm-allow")
+                yield Button("ALLOW TOOL [S]", id="perm-allow-session")
+                yield Button("DENY [D]", id="perm-deny")
 
     def on_mount(self) -> None:
         self._focus_default()
@@ -1197,30 +1781,44 @@ class PermissionModal(ModalScreen[bool]):
         except Exception:
             pass
 
-    def _finish(self, allowed: bool) -> None:
+    def _finish(self, result: str) -> None:
         if self._done:
             return
         self._done = True
         try:
-            self.dismiss(allowed)
+            self.dismiss(result)
         except Exception:
             pass
 
-    def action_allow(self) -> None: self._finish(True)
-    def action_deny(self) -> None:  self._finish(False)
+    def action_allow(self) -> None:
+        self._finish("once")
+
+    def action_allow_session(self) -> None:
+        self._finish("session")
+
+    def action_deny(self) -> None:
+        self._finish("deny")
 
     def action_default_action(self) -> None:
         focused = self.focused
         if isinstance(focused, Button) and focused.id == "perm-deny":
-            self._finish(False)
+            self._finish("deny")
+        elif isinstance(focused, Button) and focused.id == "perm-allow-session":
+            self._finish("session")
         else:
-            self._finish(True)
+            self._finish("once")
 
     @on(Button.Pressed, "#perm-allow")
-    def _allow_btn(self, event: Button.Pressed) -> None: self._finish(True)
+    def _allow_btn(self, event: Button.Pressed) -> None:
+        self._finish("once")
+
+    @on(Button.Pressed, "#perm-allow-session")
+    def _allow_session_btn(self, event: Button.Pressed) -> None:
+        self._finish("session")
 
     @on(Button.Pressed, "#perm-deny")
-    def _deny_btn(self, event: Button.Pressed) -> None: self._finish(False)
+    def _deny_btn(self, event: Button.Pressed) -> None:
+        self._finish("deny")
 
 
 # ======================================================================
@@ -1293,9 +1891,16 @@ class DepressionApp(App):
         Binding("escape", "interrupt", "Interrupt", priority=False),
         Binding("ctrl+l", "clear", "Clear", priority=True),
         Binding("ctrl+b", "toggle_sidebar", "Sidebar", priority=True),
+        Binding("ctrl+p", "command_palette", "Commands", priority=True),
+        Binding("ctrl+r", "history_search", "History", priority=True),
+        Binding("ctrl+f", "search_transcript", "Search", priority=True),
+        Binding("ctrl+space", "complete_file", "Files", priority=True),
+        Binding("f2", "toggle_auto_scroll", "Follow", priority=True),
         Binding("tab", "tab_or_mode", "Mode", priority=True),
-        Binding("e", "toggle_expand_tool", "Expand", priority=False),
+        Binding("ctrl+e", "toggle_expand_tool", "Expand", priority=False),
     ]
+
+    COMMANDS = {AgentCommandProvider}
 
     current_mode: reactive[str] = reactive("build")
     tokens_used: reactive[int] = reactive(0)
@@ -1316,15 +1921,27 @@ class DepressionApp(App):
         self,
         coordinator: Optional[AgentCoordinator] = None,
         skip_onboarding: bool = False,
+        session_manager: Any = None,
         **kwargs: Any,
     ):
         super().__init__(**kwargs)
         self.coordinator = coordinator
         self.skip_onboarding = skip_onboarding
+        self.session_manager = session_manager
         self.cfg = load_runtime_config()
         self.aws = get_aws_credentials()
 
         self._user_name: str = ""
+        self._prompt_history: List[str] = []
+        self._history_index = -1
+        self._history_draft = ""
+        self._last_prompt = ""
+        self._last_output = ""
+        self._transcript_log: List[Dict[str, Any]] = []
+        self._auto_scroll = True
+        self._search_cursor = 0
+        self._session_allowed_tools: set[str] = set()
+        self._turn_started = 0.0
 
         self.busy = False
         self._active_panel = "llm"
@@ -1337,6 +1954,7 @@ class DepressionApp(App):
         self._plan_view: Optional[PlanView] = None
         self._plan_signature: Optional[tuple] = None
         self._streaming_widget: Optional[StreamingOutput] = None
+        self._stream_lock: Optional[asyncio.Lock] = None
 
         try:
             self.turn_timeout = float(
@@ -1382,8 +2000,9 @@ class DepressionApp(App):
                 yield PromptArea(id="prompt")
             yield Static(self._mode_chip(), id="mode-chip", markup=True)
             yield Static(
-                f"[{DIM}]enter submit  ·  shift+enter newline  ·  tab focus/mode  ·  "
-                f"ctrl+b sidebar  ·  esc interrupt  ·  e expand  ·  ctrl+q quit[/]",
+                f"[{DIM}]enter submit · shift+enter newline · ctrl+p commands · "
+                f"ctrl+r history · ctrl+space @files · ctrl+f search · "
+                f"f2 follow · ctrl+b sidebar · ctrl+q quit[/]",
                 id="hint", markup=True,
             )
             yield Static(self._token_bar(), id="token-bar", markup=True)
@@ -1432,13 +2051,25 @@ class DepressionApp(App):
         self._refresh_aws_status()
         self._refresh_token_bar()
         self._refresh_llmcost_panel()
+        self._refresh_setup_status()
+        self._apply_sidebar_layout()
 
         # [Spinner fix] Animate the mode chip independently of message_count.
         self.set_interval(0.12, self._tick_spinner)
 
         self._mounted = True
 
-        self.call_later(self._maybe_onboard)
+        self.run_worker(self._maybe_onboard(), group="onboarding")
+
+    def on_resize(self, event: Any) -> None:
+        self._apply_sidebar_layout()
+
+    def _apply_sidebar_layout(self) -> None:
+        try:
+            sidebar = self.query_one("#sidebar", Sidebar)
+            sidebar.apply_responsive(self.size.width, self.size.height)
+        except Exception:
+            pass
 
     def _tick_spinner(self) -> None:
         if not self.busy:
@@ -1463,6 +2094,7 @@ class DepressionApp(App):
                 pass
             self._refresh_mode_chip()
             self._refresh_banner_welcome()
+            self._refresh_setup_status()
 
     def _refresh_banner_welcome(self) -> None:
         try:
@@ -1510,17 +2142,9 @@ class DepressionApp(App):
                     self._sync_identity(profile)
             return
 
-        # Normal mode: check for real user profile before deciding to show welcome
-        from agent.tui.onboarding.profile import ProfileStore
-        store = ProfileStore()
-        existing_profile = store.load()
-        
-        if existing_profile and self._is_real_user_profile(existing_profile):
-            # Real signed-in user exists, skip welcome
-            self._sync_identity(existing_profile)
-            return
-
-        # No real user profile (no profile, guest, or placeholder) -> show welcome
+        # Let the onboarding gate decide (it also honors
+        # DEPRESSION_ONBOARDING=force/reset). It returns the stored profile for
+        # returning users, so identity still gets synced on every launch.
         from agent.tui.onboarding.welcome import push_welcome_if_new_user
 
         prompt = None
@@ -1588,6 +2212,7 @@ class DepressionApp(App):
         except Exception:
             pass
         self._refresh_banner_welcome()
+        self._refresh_setup_status()
         try:
             self.query_one("#panel-profile", ProfilePanel).refresh_profile()
         except Exception:
@@ -1633,6 +2258,19 @@ class DepressionApp(App):
         except Exception:
             _do()
 
+    def check_action(
+        self, action: str, parameters: tuple[object, ...]
+    ) -> bool | None:
+        # Modals own their keys; app shortcuts must not fire behind them.
+        if isinstance(self.screen, ModalScreen) and action in {
+            "tab_or_mode",
+            "toggle_expand_tool",
+            "toggle_sidebar",
+            "clear",
+        }:
+            return False
+        return True
+
     def on_key(self, event) -> None:
         if not self._mounted:
             return
@@ -1650,6 +2288,8 @@ class DepressionApp(App):
                 return
 
             if len(key) == 1 and key.isprintable() and key != " ":
+                if key in self.active_bindings:
+                    return
                 prompt.focus()
                 prompt.insert(key)
                 event.stop()
@@ -1685,23 +2325,30 @@ class DepressionApp(App):
 
         self._show_transcript()
 
-        # Ensure a streaming widget exists.
-        if self._streaming_widget is None or not self._streaming_widget.is_mounted:
-            try:
-                transcript = self.query_one("#transcript", VerticalScroll)
-            except Exception:
-                return
-            widget = StreamingOutput()
-            try:
-                await transcript.mount(widget)
-            except Exception:
-                return
-            self._streaming_widget = widget
+        # Ensure a streaming widget exists. Tokens can arrive as concurrent
+        # tasks, so guard the check/create/mount sequence with a lock.
+        if self._stream_lock is None:
+            self._stream_lock = asyncio.Lock()
+        async with self._stream_lock:
+            if (
+                self._streaming_widget is None
+                or not self._streaming_widget.is_mounted
+            ):
+                try:
+                    transcript = self.query_one("#transcript", VerticalScroll)
+                except Exception:
+                    return
+                widget = StreamingOutput()
+                try:
+                    await transcript.mount(widget)
+                except Exception:
+                    return
+                self._streaming_widget = widget
 
         self._streaming_widget.append_token(delta)
         try:
             transcript = self.query_one("#transcript", VerticalScroll)
-            self.call_after_refresh(lambda: transcript.scroll_end(animate=False))
+            self._scroll_transcript_end()
         except Exception:
             pass
 
@@ -1749,7 +2396,7 @@ class DepressionApp(App):
             cached=cached,
         )
         self._active_tool_widget = widget
-        self.call_after_refresh(lambda: transcript.scroll_end(animate=False))
+        self._scroll_transcript_end()
 
         self._sync_tokens_from_loop()
         self._refresh_llmcost_panel()
@@ -1950,7 +2597,7 @@ class DepressionApp(App):
             except Exception:
                 pass
 
-        self.call_after_refresh(lambda: transcript.scroll_end(animate=False))
+        self._scroll_transcript_end()
 
     @staticmethod
     def _render_plan_fallback(entries: list) -> str:
@@ -2065,8 +2712,198 @@ class DepressionApp(App):
         except Exception:
             pass
 
+    def _clear_transcript(self) -> None:
+        try:
+            self.query_one("#transcript", VerticalScroll).remove_children()
+        except Exception:
+            pass
+        self._plan_view = None
+        self._plan_signature = None
+        self._streaming_widget = None
+        self._transcript_log.clear()
+        self._search_cursor = 0
+        self._has_messages = False
+        self._auto_scroll = True
+        try:
+            self.query_one("#empty-banner", EmptyBanner).display = True
+        except Exception:
+            pass
+        try:
+            self.query_one("#transcript", VerticalScroll).display = False
+        except Exception:
+            pass
+        self.live_input_tokens = 0
+        self.live_output_tokens = 0
+        self.live_total_tokens = 0
+        self._refresh_token_bar()
+
     # ------------------------------------------------------------------
     # PERMISSION CONFIRMATION
+    # ------------------------------------------------------------------
+
+    def is_tool_allowed_for_session(self, tool: str) -> bool:
+        return str(tool or "") in self._session_allowed_tools
+
+    def allow_tool_for_session(self, tool: str) -> None:
+        name = str(tool or "").strip()
+        if name:
+            self._session_allowed_tools.add(name)
+
+    def run_slash_command(self, command: str) -> None:
+        self.submit_prompt_text(str(command or ""))
+
+    # ------------------------------------------------------------------
+    # PROMPT HISTORY / QUICK PICKERS
+    # ------------------------------------------------------------------
+
+    def _remember_prompt(self, text: str) -> None:
+        value = (text or "").strip()
+        if not value or value.startswith("/"):
+            return
+        if not self._prompt_history or self._prompt_history[-1] != value:
+            self._prompt_history.append(value)
+            if len(self._prompt_history) > 200:
+                del self._prompt_history[:-200]
+        self._history_index = -1
+        self._history_draft = ""
+
+    def navigate_prompt_history(self, direction: int) -> Optional[str]:
+        if not self._prompt_history:
+            return None
+        try:
+            current = self.query_one("#prompt", PromptArea).text
+        except Exception:
+            current = ""
+        if self._history_index == -1:
+            if direction > 0:
+                return None
+            self._history_draft = current
+            self._history_index = len(self._prompt_history) - 1
+        else:
+            self._history_index += direction
+        if self._history_index < 0:
+            self._history_index = 0
+        if self._history_index >= len(self._prompt_history):
+            self._history_index = -1
+            return self._history_draft
+        return self._prompt_history[self._history_index]
+
+    def action_history_search(self) -> None:
+        if not self._prompt_history:
+            self._system("prompt history is empty")
+            return
+
+        def selected(value: Optional[str]) -> None:
+            if value is None:
+                return
+            try:
+                self.query_one("#prompt", PromptArea).set_prompt_text(value)
+                self.query_one("#prompt", PromptArea).focus()
+            except Exception:
+                pass
+
+        self.push_screen(HistorySearchModal(self._prompt_history), selected)
+
+    def _project_root(self) -> Path:
+        if self.coordinator is not None:
+            for attr in ("plan_agent", "build_agent"):
+                agent = getattr(self.coordinator, attr, None)
+                workspace = getattr(agent, "workspace", None) if agent else None
+                root = getattr(workspace, "project_dir", None) if workspace else None
+                if root:
+                    return Path(str(root))
+        return Path.cwd()
+
+    def _project_files(self, limit: int = 2500) -> List[str]:
+        root = self._project_root()
+        skip = {
+            ".git", "node_modules", "__pycache__", ".venv", "venv",
+            "dist", "build", ".mypy_cache", ".pytest_cache", ".ruff_cache",
+            "src/agent/depression",
+        }
+        files: List[str] = []
+        try:
+            for dirpath, dirnames, filenames in _os.walk(root):
+                rel_dir = _os.path.relpath(dirpath, root)
+                dirnames[:] = [
+                    d for d in dirnames
+                    if d not in skip and not d.startswith(".tox")
+                ]
+                for name in filenames:
+                    if name.startswith(".") and name not in (".env.example",):
+                        continue
+                    rel = name if rel_dir == "." else _os.path.join(rel_dir, name)
+                    files.append(rel.replace(_os.sep, "/"))
+                    if len(files) >= limit:
+                        return sorted(files)
+        except Exception:
+            pass
+        return sorted(files)
+
+    def action_complete_file(self) -> None:
+        files = self._project_files()
+        if not files:
+            self._error("no project files found")
+            return
+
+        def selected(value: Optional[str]) -> None:
+            if value is None:
+                return
+            try:
+                prompt = self.query_one("#prompt", PromptArea)
+                prompt.insert_file_reference(value)
+                prompt.focus()
+            except Exception:
+                pass
+
+        self.push_screen(FilePickerModal(files), selected)
+
+    def action_search_transcript(self) -> None:
+        if not self._transcript_log:
+            self._system("transcript is empty")
+            return
+
+        def selected(value: Optional[str]) -> None:
+            if value:
+                self._search_transcript(value)
+
+        self.push_screen(TranscriptSearchModal(), selected)
+
+    def _search_transcript(self, query: str) -> None:
+        needle = query.strip().lower()
+        if not needle:
+            return
+        total = len(self._transcript_log)
+        for offset in range(total):
+            idx = (self._search_cursor + offset) % total
+            entry = self._transcript_log[idx]
+            if needle not in str(entry.get("text", "")).lower():
+                continue
+            widget = entry.get("widget")
+            self._search_cursor = idx + 1
+            self._auto_scroll = False
+            try:
+                widget.scroll_visible(animate=True)
+            except Exception:
+                pass
+            self._system(f"match {idx + 1}/{total}: {query}")
+            return
+        self._system(f"no transcript match: {query}")
+
+    def action_toggle_auto_scroll(self) -> None:
+        self._auto_scroll = not self._auto_scroll
+        state = "on" if self._auto_scroll else "paused"
+        self._system(f"transcript follow {state}")
+        if self._auto_scroll:
+            self._scroll_transcript_end()
+
+    def on_mouse_scroll_up(self, event: Any) -> None:
+        if self._auto_scroll:
+            self._auto_scroll = False
+            self._system("transcript follow paused — F2 to resume")
+
+    # ------------------------------------------------------------------
+    # PERMISSION CONFIRMATION HELPERS
     # ------------------------------------------------------------------
 
     def install_permission_callback(self, callback) -> None:
@@ -2099,6 +2936,10 @@ class DepressionApp(App):
         if self.busy:
             spin = SPINNER_FRAMES[self.spinner_tick % len(SPINNER_FRAMES)]
             prefix = f"[{AMBER}]{spin}[/] "
+            if self._turn_started:
+                elapsed = max(0.0, time.time() - self._turn_started)
+                mins, secs = divmod(int(elapsed), 60)
+                prefix += f"[{MUTED}]{mins:02d}:{secs:02d}[/]  "
 
         pct = (self.tokens_used / max(1, self.context_window)) * 100.0
         ctx = f"[{MUTED}]ctx {pct:.0f}%[/]"
@@ -2153,6 +2994,24 @@ class DepressionApp(App):
     def _refresh_aws_status(self) -> None:
         try:
             self.query_one("#panel-aws", AWSPanel).refresh_mcp_status()
+        except Exception:
+            pass
+
+    def _refresh_setup_status(self) -> None:
+        try:
+            llm_ready = bool(
+                str(self.cfg.get("model") or "").strip()
+                and str(self.cfg.get("base_url") or "").strip()
+            )
+            aws_ready = bool(
+                self.aws.get("access_key")
+                or self.aws.get("secret_key")
+                or _os.environ.get("AWS_ACCESS_KEY_ID")
+            )
+            profile_ready = bool(self._user_name)
+            self.query_one("#empty-banner", EmptyBanner).set_setup(
+                llm=llm_ready, aws=aws_ready, profile=profile_ready,
+            )
         except Exception:
             pass
 
@@ -2213,6 +3072,23 @@ class DepressionApp(App):
     def _strip_ctrl(self, text: str) -> str:
         return self._CTRL_RE.sub("", str(text))
 
+    def _scroll_transcript_end(self) -> None:
+        if not self._auto_scroll:
+            return
+        try:
+            transcript = self.query_one("#transcript", VerticalScroll)
+        except Exception:
+            return
+        try:
+            transcript.scroll_end(animate=False)
+        except Exception:
+            return
+
+    def _log_transcript(self, kind: str, text: str, widget: Any) -> None:
+        self._transcript_log.append({
+            "kind": kind, "text": str(text), "widget": widget,
+        })
+
     def _write(self, text: str, cls: str = "agent", markup: bool = False) -> None:
         if self._is_shutting_down:
             return
@@ -2222,11 +3098,14 @@ class DepressionApp(App):
         except Exception:
             return
         safe = self._strip_ctrl(text) if markup else self._sanitize(text)
+        widget = Static(safe, classes=cls, markup=True)
         try:
-            transcript.mount(Static(safe, classes=cls, markup=True))
+            transcript.mount(widget)
         except Exception:
-            transcript.mount(Static(str(text), classes=cls, markup=False))
-        self.call_after_refresh(lambda: transcript.scroll_end(animate=False))
+            widget = Static(str(text), classes=cls, markup=False)
+            transcript.mount(widget)
+        self._log_transcript(cls, text, widget)
+        self._scroll_transcript_end()
 
     def _system(self, text: str) -> None:
         self._write(f"· {text}", "system")
@@ -2246,17 +3125,19 @@ class DepressionApp(App):
         except Exception:
             return
         safe = _esc(text)
+        stamp = time.strftime("%H:%M")
+        widget = Static(
+            f"[{DIM}]{stamp}[/] [bold {GREEN}]›[/] [bold {TEXT}]{safe}[/]",
+            classes="user", markup=True,
+        )
         try:
-            transcript.mount(
-                Static(
-                    f"[bold {GREEN}]›[/] [bold {TEXT}]{safe}[/]",
-                    classes="user", markup=True,
-                )
-            )
+            transcript.mount(widget)
         except Exception:
-            transcript.mount(Static(f"› {text}", classes="user", markup=False))
+            widget = Static(f"{stamp} › {text}", classes="user", markup=False)
+            transcript.mount(widget)
+        self._log_transcript("user", text, widget)
         self.message_count = self.message_count + 1
-        self.call_after_refresh(lambda: transcript.scroll_end(animate=False))
+        self._scroll_transcript_end()
 
     # ------------------------------------------------------------------
     # INPUT / COMMANDS
@@ -2269,6 +3150,10 @@ class DepressionApp(App):
 
         if text.startswith("/"):
             self._slash(text)
+            return
+
+        if (self.busy or self._draining) and _is_stop_request(text):
+            self._request_agent_stop()
             return
 
         if self.busy or self._draining:
@@ -2321,6 +3206,23 @@ class DepressionApp(App):
         elif command == "/todo":
             self._show_panel("todo")
             self._dump_todos()
+        elif command == "/sessions":
+            self._open_sessions()
+        elif command == "/copy":
+            self._copy_last_output()
+        elif command == "/export":
+            self._export_transcript(arg)
+        elif command == "/retry":
+            self._retry_last()
+        elif command == "/continue":
+            self._continue_last()
+        elif command == "/search":
+            if arg.strip():
+                self._search_transcript(arg)
+            else:
+                self.action_search_transcript()
+        elif command == "/doctor":
+            self._doctor()
         elif command == "/help":
             self._show_panel("help")
         elif command == "/run":
@@ -2328,37 +3230,308 @@ class DepressionApp(App):
         elif command == "/shot":
             self._open_shot(arg)
         elif command == "/clear":
-            try:
-                self.query_one("#transcript", VerticalScroll).remove_children()
-            except Exception:
-                pass
-            self._plan_view = None
-            self._plan_signature = None
-            self._streaming_widget = None
-            self._has_messages = False
-            try:
-                self.query_one("#empty-banner", EmptyBanner).display = True
-            except Exception:
-                pass
-            try:
-                self.query_one("#transcript", VerticalScroll).display = False
-            except Exception:
-                pass
-            self.live_input_tokens = 0
-            self.live_output_tokens = 0
-            self.live_total_tokens = 0
-            self._refresh_token_bar()
+            self._clear_transcript()
         elif command == "/plan":
             self._switch_mode("plan")
         elif command == "/build":
             self._switch_mode("build")
         elif command == "/auto":
             self._switch_mode("auto")
+        elif command in ("/stop", "/interrupt"):
+            self._request_agent_stop()
         elif command in ("/quit", "/exit"):
             self._is_shutting_down = True
             self.exit()
         else:
             self._error(f"unknown command: {command}")
+
+    # ------------------------------------------------------------------
+    # SESSIONS
+    # ------------------------------------------------------------------
+
+    def _open_sessions(self) -> None:
+        self.run_worker(self._load_sessions(), group="sessions")
+
+    async def _load_sessions(self) -> None:
+        if self.session_manager is None:
+            self._error("session manager is unavailable")
+            return
+        try:
+            sessions = await self.session_manager.list_sessions()
+        except Exception as exc:
+            self._error(f"could not list sessions: {exc}")
+            return
+        if not sessions:
+            self._system("no saved sessions")
+            return
+        self.push_screen(SessionPickerModal(sessions), self._session_selected)
+
+    def _session_selected(self, result: Any) -> None:
+        if not result:
+            return
+        action, session_id = result
+        if action == "open":
+            self.run_worker(self._resume_session(session_id), group="sessions")
+        elif action == "rename":
+            self._prompt_rename_session(session_id)
+        elif action == "delete":
+            self._confirm_delete_session(session_id)
+
+    def _session_title(self, session: Any) -> str:
+        return str(getattr(session, "name", None) or "session")
+
+    def _prompt_rename_session(self, session_id: str) -> None:
+        async def load_and_prompt() -> None:
+            try:
+                session = await self.session_manager.load_session(session_id)
+            except Exception as exc:
+                self._error(f"could not load session: {exc}")
+                return
+            if session is None:
+                self._error("session not found")
+                return
+
+            def renamed(name: Optional[str]) -> None:
+                if name:
+                    self.run_worker(
+                        self._rename_session(session, name), group="sessions",
+                    )
+
+            self.push_screen(
+                TextPromptModal("RENAME SESSION", self._session_title(session)),
+                renamed,
+            )
+
+        self.run_worker(load_and_prompt(), group="sessions")
+
+    async def _rename_session(self, session: Any, name: str) -> None:
+        try:
+            session.name = name
+            ok = await self.session_manager.save_session(session)
+            if ok:
+                self._system(f"session renamed: {name}")
+            else:
+                self._error("session rename failed")
+        except Exception as exc:
+            self._error(f"session rename failed: {exc}")
+
+    def _confirm_delete_session(self, session_id: str) -> None:
+        def confirmed(yes: bool) -> None:
+            if yes:
+                self.run_worker(
+                    self._delete_session(session_id), group="sessions",
+                )
+
+        self.push_screen(
+            ConfirmModal(
+                "DELETE SESSION",
+                "This removes the saved session transcript. Continue?",
+            ),
+            confirmed,
+        )
+
+    async def _delete_session(self, session_id: str) -> None:
+        if self.session_manager is None:
+            return
+        try:
+            ok = await self.session_manager.delete_session(session_id)
+            if ok:
+                self._system(f"deleted session {session_id[:8]}")
+            else:
+                self._error("session delete failed")
+        except Exception as exc:
+            self._error(f"session delete failed: {exc}")
+
+    async def _resume_session(self, session_id: str) -> None:
+        if self.session_manager is None or self.coordinator is None:
+            self._error("sessions are unavailable")
+            return
+        try:
+            session = await self.session_manager.load_session(session_id)
+        except Exception as exc:
+            self._error(f"could not load session: {exc}")
+            return
+        if session is None:
+            self._error("session not found")
+            return
+
+        for attr in ("plan_agent", "build_agent"):
+            agent = getattr(self.coordinator, attr, None)
+            if agent is None:
+                continue
+            agent.session = session
+            manager = getattr(agent, "context_manager", None)
+            if manager is not None and hasattr(manager, "load_from_session"):
+                try:
+                    await manager.load_from_session(session)
+                except Exception:
+                    pass
+
+        history = getattr(session, "history", None)
+        count = len(history.all()) if hasattr(history, "all") else len(history or [])
+        self._clear_transcript()
+        self.message_count = count
+        self._last_output = ""
+        self._last_prompt = ""
+        self._show_transcript()
+        self._system(
+            f"resumed session {self._session_title(session)} "
+            f"({count} message(s)); prior context loaded"
+        )
+        self._refresh_context_panel()
+        self._refresh_token_bar()
+        self._refresh_llmcost_panel()
+        self._refresh_mode_chip()
+        self._refocus_prompt()
+
+    # ------------------------------------------------------------------
+    # TRANSCRIPT ACTIONS
+    # ------------------------------------------------------------------
+
+    def _copy_last_output(self) -> None:
+        if not self._last_output:
+            self._system("nothing to copy yet")
+            return
+        try:
+            self.copy_to_clipboard(self._last_output)
+            chars = len(self._last_output)
+            self._system(f"copied last reply ({chars:,} chars) to the clipboard")
+        except Exception as exc:
+            self._error(f"clipboard copy failed: {exc}")
+
+    def _export_transcript(self, path: str = "") -> None:
+        if not self._transcript_log:
+            self._system("transcript is empty")
+            return
+        target = (path or "").strip().strip("'\"")
+        if target:
+            out = Path(target).expanduser()
+        else:
+            stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+            out = self._project_root() / f"depression-transcript-{stamp}.md"
+        if not out.is_absolute():
+            out = self._project_root() / out
+        lines = [
+            "# depression.ai transcript",
+            "",
+            f"- exported: {datetime.now().isoformat(timespec='seconds')}",
+            f"- model: {self.cfg.get('model') or '—'}",
+            f"- mode: {self.current_mode}",
+            "",
+        ]
+        for entry in self._transcript_log:
+            kind = str(entry.get("kind") or "agent")
+            text = str(entry.get("text") or "")
+            if kind == "user":
+                lines.extend(["## You", "", text, ""])
+            elif kind == "agent":
+                lines.extend(["## depression.ai", "", text, ""])
+            else:
+                lines.extend([f"> {text}", ""])
+        try:
+            out.parent.mkdir(parents=True, exist_ok=True)
+            out.write_text("\n".join(lines), encoding="utf-8")
+            self._system(f"exported transcript → {out}")
+        except Exception as exc:
+            self._error(f"export failed: {exc}")
+
+    # ------------------------------------------------------------------
+    # RETRY / CONTINUE / DIAGNOSTICS
+    # ------------------------------------------------------------------
+
+    def _retry_last(self) -> None:
+        if self.is_agent_busy():
+            self._error("agent is busy; stop or wait before retrying")
+            return
+        if not self._last_prompt:
+            self._system("no previous prompt to retry")
+            return
+        prompt = self._last_prompt
+        self._system("retrying the last prompt")
+        self.submit_prompt_text(prompt)
+
+    def _continue_last(self) -> None:
+        if self.is_agent_busy():
+            self._error("agent is busy; stop or wait before continuing")
+            return
+        if not self._last_prompt:
+            self._system("nothing to continue")
+            return
+        self._system("continuing from the previous work")
+        self.submit_prompt_text(
+            "Continue the previous task from where it stopped. "
+            "Review the transcript, do not start over, and finish the "
+            "remaining work."
+        )
+
+    def _timeout_summary(self, timeout: float) -> str:
+        if self.coordinator is None:
+            return ""
+        for attr in ("plan_agent", "build_agent"):
+            agent = getattr(self.coordinator, attr, None)
+            loop = getattr(agent, "loop", None) if agent else None
+            if loop is None or not hasattr(loop, "_format_stop_summary"):
+                continue
+            try:
+                summary = str(loop._format_stop_summary())
+            except Exception:
+                continue
+            if summary:
+                minutes = timeout / 60.0
+                first = f"Timed out after {minutes:.0f} min."
+                if summary.startswith("Stopped as requested."):
+                    summary = summary.replace(
+                        "Stopped as requested.", first, 1,
+                    )
+                else:
+                    summary = first + "\n" + summary
+                return summary
+        return ""
+
+    def _doctor(self) -> None:
+        self._show_panel("help")
+        self._system("diagnostics")
+        checks: list[tuple[str, bool, str]] = []
+        checks.append(("python", sys.version_info >= (3, 10),
+                       platform.python_version()))
+        try:
+            root = self._project_root()
+            writable = _os.access(root, _os.W_OK)
+        except Exception:
+            root, writable = Path.cwd(), False
+        checks.append(("workspace", writable, f"{root}"))
+        model = str(self.cfg.get("model") or "")
+        base = str(self.cfg.get("base_url") or "")
+        checks.append(("llm config", bool(model and base),
+                       f"{model or '—'} @ {base or '—'}"))
+        api_key = str(self.cfg.get("api_key") or "")
+        checks.append(("api key", bool(api_key),
+                       "set" if api_key else "missing (Ollama may not need one)"))
+        aws = bool(self.aws.get("access_key"))
+        checks.append(("aws credentials", aws,
+                       self.aws.get("region") or DEFAULT_AWS_REGION))
+        checks.append(("session manager", self.session_manager is not None,
+                       "available" if self.session_manager else "unavailable"))
+        checks.append(("coordinator", self.coordinator is not None,
+                       "ready" if self.coordinator else "unavailable"))
+        checks.append(("git", shutil.which("git") is not None,
+                       shutil.which("git") or "not found"))
+        checks.append(("ripgrep", shutil.which("rg") is not None,
+                       shutil.which("rg") or "not found"))
+        playwright = importlib.util.find_spec("playwright") is not None
+        checks.append(("playwright", playwright,
+                       "installed" if playwright else "optional"))
+        checks.append(("turn timeout", True, f"{self.turn_timeout / 60:.0f} min"))
+        for name, ok, detail in checks:
+            mark = "✓" if ok else "×"
+            self._write(
+                f"  {mark} {name:<18} {detail}",
+                "system" if ok else "error",
+            )
+
+    # ------------------------------------------------------------------
+    # SHELL / IMAGES
+    # ------------------------------------------------------------------
 
     def _open_shot(self, path: str) -> None:
         if not path:
@@ -2410,6 +3583,29 @@ class DepressionApp(App):
         except Exception as exc:
             self._error(f"run failed: {exc}")
 
+    def _request_agent_stop(self) -> None:
+        """Ask the running loop to stop gracefully and summarize its work."""
+        if not (self.busy or self._draining):
+            self._system("nothing is running")
+            return
+        self._prompt_queue.clear()
+        self.queue_depth = 0
+        self._system("stop requested — wrapping up with a summary…")
+        stopped = False
+        if self.coordinator is not None:
+            for attr in ("plan_agent", "build_agent"):
+                agent = getattr(self.coordinator, attr, None)
+                loop = getattr(agent, "loop", None) if agent else None
+                if loop is not None and hasattr(loop, "stop"):
+                    try:
+                        loop.stop()
+                        stopped = True
+                    except Exception:
+                        pass
+        if not stopped:
+            self.cancel_current_agent()
+        self._refresh_mode_chip()
+
     def _switch_mode(self, mode: str) -> None:
         if mode not in MODE_ORDER:
             return
@@ -2429,6 +3625,9 @@ class DepressionApp(App):
     @work(exclusive=True, group="agent")
     async def _run_agent(self, text: str) -> None:
         self.busy = True
+        self._turn_started = time.time()
+        self._remember_prompt(text)
+        self._last_prompt = text
         self._set_busy_visual(True)
         self._refresh_mode_chip()
         self._user(text)
@@ -2489,17 +3688,26 @@ class DepressionApp(App):
                 self._refresh_context_panel()
                 self._refresh_mode_chip()
             else:
+                output = result.get("execution") or result.get("response")
+                if output:
+                    await self._render_output(str(output), started)
                 self._error(str(result.get("error", "agent request failed")))
         except asyncio.TimeoutError:
             mins = self.turn_timeout / 60.0
+            summary = self._timeout_summary(self.turn_timeout)
+            if summary:
+                await self._render_output(summary, started)
             self._error(
-                f"agent timed out after {mins:.0f} min with no result. "
-                "Raise TUI_TURN_TIMEOUT in the environment to extend."
+                f"agent timed out after {mins:.0f} min. "
+                "Partial work is preserved above; use /continue to resume, "
+                "/retry to rerun, or raise TUI_TURN_TIMEOUT."
             )
+            self._preserve_prompt(text)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
             self._error(f"agent error: {exc}")
+            self._preserve_prompt(text)
         finally:
             # Remove the streaming widget (its content is now part of the
             # structured OutputView).
@@ -2522,6 +3730,15 @@ class DepressionApp(App):
                 pass
             self._schedule_drain()
 
+    def _preserve_prompt(self, text: str) -> None:
+        try:
+            prompt = self.query_one("#prompt", PromptArea)
+            if not prompt.text.strip():
+                prompt.set_prompt_text(text)
+            prompt.focus()
+        except Exception:
+            pass
+
     async def _render_output(self, text: str, started: float) -> None:
         if self._is_shutting_down:
             return
@@ -2532,13 +3749,16 @@ class DepressionApp(App):
             return
 
         elapsed = time.time() - started
-        meta = f"{elapsed:.2f}s"
+        stamp = time.strftime("%H:%M:%S")
+        meta = f"{stamp} · {elapsed:.2f}s"
+        self._last_output = str(text)
         try:
             view = OutputView(text=text, header="◆ depression.ai", meta=meta)
             await transcript.mount(view)
+            self._log_transcript("agent", str(text), view)
         except Exception:
             self._write(text, "agent")
-        self.call_after_refresh(lambda: transcript.scroll_end(animate=False))
+        self._scroll_transcript_end()
 
     def _schedule_drain(self) -> None:
         if self._is_shutting_down:
@@ -2591,21 +3811,75 @@ class DepressionApp(App):
             status.update("base URL, API key and model are required")
             return
         try:
-            configure_runtime_provider(
+            provider = configure_runtime_provider(
                 get_llm_registry(), base_url, api_key, model
             )
             self.cfg = load_runtime_config()
+            name = getattr(provider, "name", None) or type(provider).__name__
             status.update(f"connected · {_esc(model)}")
+            try:
+                self.query_one("#llm-provider", Static).update(
+                    f"[{MUTED}]provider[/] [{TEXT}]{_esc(str(name))}[/]"
+                )
+            except Exception:
+                pass
             self._refresh_mode_chip()
             self._refresh_context_panel()
             self._refresh_llmcost_panel()
-            self._system(f"LLM connected: {base_url} · {model}")
+            self._refresh_setup_status()
+            self._system(f"LLM connected: {base_url} · {model} · {name}")
         except Exception as exc:
             status.update(f"error: {_esc(exc)}")
 
     @on(Button.Pressed, "#discover")
     def discover_llm(self) -> None:
         self._discover_models()
+
+    @on(Select.Changed, "#model-select")
+    def _model_selected(self, event: Select.Changed) -> None:
+        value = event.value
+        if value is Select.BLANK or value is None:
+            return
+        try:
+            self.query_one("#model-id", Input).value = str(value)
+            self.query_one("#llm-status", Static).update(
+                f"selected model · {_esc(str(value))}"
+            )
+        except Exception:
+            pass
+
+    @on(Button.Pressed, "#llm-test")
+    def test_llm_button(self) -> None:
+        self._test_llm()
+
+    @work(exclusive=True, group="llm-test")
+    async def _test_llm(self) -> None:
+        url = self.query_one("#base-url", Input).value.strip().rstrip("/")
+        key = self.query_one("#api-key", Input).value.strip()
+        model = self.query_one("#model-id", Input).value.strip()
+        status = self.query_one("#llm-status", Static)
+        if not url:
+            status.update("enter a base URL first")
+            return
+        status.update("testing connection…")
+        started = time.time()
+        try:
+            base = plan_runtime(url, key, model).base_url or url
+            async with httpx.AsyncClient(timeout=15) as client:
+                headers = ({"Authorization": f"Bearer {key}"} if key else {})
+                response = await client.get(f"{base}/models", headers=headers)
+                response.raise_for_status()
+            elapsed = time.time() - started
+            status.update(f"connection ok · {elapsed * 1000:.0f} ms")
+            try:
+                spec = plan_runtime(url, key, model)
+                self.query_one("#llm-provider", Static).update(
+                    f"[{MUTED}]provider[/] [{TEXT}]{_esc(spec.family)}[/]"
+                )
+            except Exception:
+                pass
+        except Exception as exc:
+            status.update(f"connection failed: {_esc(exc)}")
 
     @work(exclusive=True, group="discover")
     async def _discover_models(self) -> None:
@@ -2625,8 +3899,15 @@ class DepressionApp(App):
                 models = response.json().get("data", [])
             ids = [str(m.get("id")) for m in models if m.get("id")]
             if ids:
-                self.query_one("#model-id", Input).value = ids[0]
-                status.update(f"discovered {len(ids)} model(s); selected {_esc(ids[0])}")
+                try:
+                    self.query_one("#model-select", Select).set_options(
+                        [(mid, mid) for mid in ids]
+                    )
+                except Exception:
+                    pass
+                status.update(
+                    f"discovered {len(ids)} model(s); choose one from the list"
+                )
                 self._system("models: " + ", ".join(ids[:12]))
             else:
                 status.update("/models returned no model IDs")
@@ -2683,6 +3964,7 @@ class DepressionApp(App):
         except Exception as exc:
             note = f" · MCP config refresh skipped: {_esc(exc)}"
         panel.refresh_mcp_status()
+        self._refresh_setup_status()
         self._system(
             f"AWS credentials saved to ~/.agent/env "
             f"({self.aws.get('region') or DEFAULT_AWS_REGION}){note}"
@@ -2781,26 +4063,7 @@ class DepressionApp(App):
             pass
 
     def action_clear(self) -> None:
-        try:
-            self.query_one("#transcript", VerticalScroll).remove_children()
-        except Exception:
-            pass
-        self._plan_view = None
-        self._plan_signature = None
-        self._streaming_widget = None
-        self._has_messages = False
-        try:
-            self.query_one("#empty-banner", EmptyBanner).display = True
-        except Exception:
-            pass
-        try:
-            self.query_one("#transcript", VerticalScroll).display = False
-        except Exception:
-            pass
-        self.live_input_tokens = 0
-        self.live_output_tokens = 0
-        self.live_total_tokens = 0
-        self._refresh_token_bar()
+        self._clear_transcript()
 
     def action_toggle_expand_tool(self) -> None:
         widget = self._active_tool_widget
@@ -2808,8 +4071,7 @@ class DepressionApp(App):
             return
         try:
             widget.toggle_expand()
-            transcript = self.query_one("#transcript", VerticalScroll)
-            self.call_after_refresh(lambda: transcript.scroll_end(animate=False))
+            self._scroll_transcript_end()
         except Exception:
             pass
 

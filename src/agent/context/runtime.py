@@ -21,15 +21,21 @@ Invariants enforced here (all required by OpenAI/Anthropic-compatible APIs):
     * [Size cap] Tool result payloads are capped by a model-scaled byte
       budget. Truncation keeps head + tail, never a byte slice that can
       land mid-UTF-8.
+    * [Slice store] When a read cache is available, the full body of a
+      truncated field is stored under a short token so the model can
+      retrieve any middle section without re-reading from disk.
 """
 from __future__ import annotations
 
 import json
 import uuid
-from typing import Any, List
+from typing import Any, List, Optional, TYPE_CHECKING
 
 from agent.llm.provider import Message
 from agent.utils.logging import get_logger
+
+if TYPE_CHECKING:
+    from agent.context.read_cache import ReadCache
 
 logger = get_logger(__name__)
 
@@ -85,7 +91,12 @@ def _tool_result_id(m: Any) -> str:
     return str((getattr(m, "metadata", {}) or {}).get("tool_call_id") or "")
 
 
-def _truncate_payload(payload: Any, cap: int = DEFAULT_TOOL_RESULT_BYTE_CAP) -> Any:
+def _truncate_payload(
+    payload: Any,
+    cap: int = DEFAULT_TOOL_RESULT_BYTE_CAP,
+    read_cache: Optional["ReadCache"] = None,
+    path_hint: Optional[str] = None,
+) -> Any:
     """
     Cap a tool result payload to `cap` bytes of JSON.
 
@@ -93,6 +104,10 @@ def _truncate_payload(payload: Any, cap: int = DEFAULT_TOOL_RESULT_BYTE_CAP) -> 
     model sees the beginning (imports, signatures) and the end (output,
     trace) of the value. Adds a `_truncated` marker and a hint so the
     model knows it is looking at a partial payload.
+
+    When a read cache is provided, the full body of the largest string
+    field is stored under a slice token so the middle is retrievable
+    without touching disk.
     """
     if not isinstance(payload, dict):
         try:
@@ -154,6 +169,25 @@ def _truncate_payload(payload: Any, cap: int = DEFAULT_TOOL_RESULT_BYTE_CAP) -> 
             f"grep/find to locate the specific section if you need the "
             f"middle."
         )
+
+        # Store the full body under a slice token so the middle is
+        # reachable without touching disk.
+        if read_cache is not None:
+            try:
+                from agent.context.read_cache import _hash_str
+                sha = _hash_str(s)
+                cache_path = path_hint or trimmed.get("path") or ""
+                token = read_cache.store_slice(cache_path, sha, s)
+                trimmed["slice_token"] = token
+                trimmed["_truncated_hint"] = (
+                    f"Original field '{k}' was {s_bytes} bytes; only the "
+                    f"first and last portions are shown. Call read with "
+                    f"{{slice_token: '{token}', offset: N, limit: M}} to view "
+                    f"any middle section without re-reading the file."
+                )
+            except Exception:
+                pass
+
         try:
             if len(json.dumps(trimmed, default=str).encode("utf-8")) <= cap:
                 return trimmed
@@ -456,11 +490,26 @@ async def add_tool_call(
     )
 
 
+def _derive_path_hint(call: Any) -> Optional[str]:
+    try:
+        args = getattr(call, "arguments", {}) or {}
+        if not isinstance(args, dict):
+            return None
+        for k in ("path", "filePath", "file_path", "filename", "file"):
+            v = args.get(k)
+            if isinstance(v, str) and v.strip():
+                return v.strip()
+    except Exception:
+        return None
+    return None
+
+
 async def add_tool_result(
     context_manager: Any,
     call: Any,
     result: Any,
     context_window: int = 0,
+    read_cache: Optional["ReadCache"] = None,
 ) -> None:
     """
     Persist a tool result.
@@ -473,6 +522,11 @@ async def add_tool_result(
 
     The size cap is computed from `context_window` so a 1M-token model
     can receive payloads that are far larger than the 8 KB floor.
+
+    When a read cache is supplied:
+      * truncated bodies are stored under a slice token so the middle is
+        retrievable without re-reading from disk, and
+      * the file is recorded in the read index that survives compaction.
     """
     cid = getattr(call, "id", None)
     if not cid:
@@ -483,7 +537,32 @@ async def add_tool_result(
         if context_window and context_window > 0
         else DEFAULT_TOOL_RESULT_BYTE_CAP
     )
-    payload = _truncate_payload(result, cap=cap)
+
+    path_hint = _derive_path_hint(call)
+    payload = _truncate_payload(
+        result, cap=cap, read_cache=read_cache, path_hint=path_hint,
+    )
+
+    # Record this file in the read index so compaction can pin a reminder.
+    if read_cache is not None and path_hint:
+        try:
+            from agent.context.read_cache import _hash_str
+            body = None
+            if isinstance(payload, dict):
+                body = payload.get("content")
+            if isinstance(body, str):
+                sha = _hash_str(body)
+                read_cache.record_read(
+                    path_hint,
+                    sha=sha,
+                    tokens=max(1, len(body) // 4),
+                    size=len(body.encode("utf-8")),
+                    truncated=bool(
+                        isinstance(payload, dict) and payload.get("_truncated")
+                    ),
+                )
+        except Exception:
+            pass
 
     await context_manager.add_message(
         role="tool",

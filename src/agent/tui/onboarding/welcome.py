@@ -46,7 +46,6 @@ from agent.tui.theme import (
     ERROR,
     GREEN,
     GREEN_DIM,
-    GREEN_GLOW,
     MUTED,
     PANEL,
     TEXT,
@@ -210,9 +209,11 @@ class WelcomeScreen(ModalScreen[Optional[UserProfile]]):
     """
 
     BINDINGS = [
-        Binding("enter", "sign_in", "Sign in", priority=True),
-        Binding("g", "sign_in", "Sign in", priority=True),
-        Binding("t", "manual", "Paste token", priority=True),
+        # Do not use priority for printable keys or Enter: they must reach the
+        # focused Input (token paste) instead of triggering sign-in shortcuts.
+        Binding("enter", "sign_in", "Sign in"),
+        Binding("g", "sign_in", "Sign in"),
+        Binding("t", "manual", "Paste token"),
         Binding("escape", "clear_status", "Clear message", priority=True),
     ]
 

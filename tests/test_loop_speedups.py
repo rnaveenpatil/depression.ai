@@ -25,7 +25,7 @@ def test_runtime_provider_uses_configured_timeout():
     registry = get_llm_registry()
     provider = configure_runtime_provider(registry, "https://llm.example/v1", "dummy-key", "vendor/custom")
     # Long-running agent calls are intentionally not cut off by a short timeout.
-    assert provider.timeout == 999999.0
+    assert provider.timeout == 99999.0
     assert provider.max_retries == 2
 
 

@@ -20,12 +20,13 @@ from __future__ import annotations
 
 import re
 import unicodedata
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, List, Optional, Tuple
 
+from rich.syntax import Syntax
 from textual.app import ComposeResult
-from textual.containers import Vertical
-from textual.widgets import Static
+from textual.containers import Horizontal, Vertical
+from textual.widgets import Button, Static
 
 GREEN = "#00ff66"
 GREEN_DIM = "#00aa44"
@@ -36,6 +37,8 @@ TEXT = "#aaffcc"
 MUTED = "#3d8c5c"
 DIM = "#1a5c33"
 BORDER = "#0a3d20"
+BG = "#000000"
+PANEL = "#03140a"
 
 
 # ----------------------------------------------------------------------
@@ -228,7 +231,7 @@ def _parse_table(
     if not _is_separator_row(lines[1]):
         return None, None
     header = _parse_table_row(lines[0])
-    rows = [_parse_table_row(l) for l in lines[2:]]
+    rows = [_parse_table_row(row_line) for row_line in lines[2:]]
     return header, rows
 
 
@@ -456,6 +459,80 @@ def _render_block(b: Block) -> str:
 # ----------------------------------------------------------------------
 
 
+class CodeBlock(Vertical):
+    """A fenced code block with syntax highlighting and a copy button."""
+
+    DEFAULT_CSS = f"""
+    CodeBlock {{
+        height: auto;
+        width: 100%;
+        margin: 0 0 1 0;
+        border: round {BORDER};
+        background: {BG};
+    }}
+    CodeBlock .code-head {{
+        height: 1;
+        width: 100%;
+        background: {PANEL};
+        color: {MUTED};
+    }}
+    CodeBlock .code-lang {{
+        width: 1fr;
+        height: 1;
+        padding: 0 1;
+        color: {MUTED};
+    }}
+    CodeBlock .code-copy {{
+        width: 10;
+        min-width: 10;
+        height: 1;
+        background: transparent;
+        border: none;
+        color: {GREEN_DIM};
+        text-style: bold;
+    }}
+    CodeBlock .code-copy:hover {{ color: {GREEN_GLOW}; }}
+    CodeBlock .code-body {{
+        height: auto;
+        width: 100%;
+        padding: 0 1;
+        background: {BG};
+    }}
+    """
+
+    def __init__(self, code: str, lang: str = "", **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self._code = code or ""
+        self._lang = lang or ""
+
+    def compose(self) -> ComposeResult:
+        copy = Button("COPY", classes="code-copy")
+        copy.can_focus = False
+        with Horizontal(classes="code-head"):
+            yield Static(_esc(self._lang or "code"), classes="code-lang", markup=True)
+            yield copy
+        lexer = self._lang or "text"
+        try:
+            body = Syntax(
+                self._code, lexer, theme="monokai", word_wrap=True,
+                line_numbers=False, background_color="default",
+            )
+        except Exception:
+            body = self._code
+        yield Static(body, classes="code-body")
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if "code-copy" not in event.button.classes:
+            return
+        event.stop()
+        try:
+            self.app.copy_to_clipboard(self._code)
+            event.button.label = "COPIED"
+            self.set_timer(1.2, lambda: setattr(event.button, "label", "COPY"))
+        except Exception:
+            event.button.label = "FAILED"
+
+
 class OutputView(Vertical):
     """A single structured agent reply."""
 
@@ -494,9 +571,12 @@ class OutputView(Vertical):
         yield Static(f"[{BORDER}]" + "─" * 56 + "[/]", markup=True)
 
         for b in _parse_blocks(self._text):
+            if b.kind == "code":
+                yield CodeBlock(b.text, b.lang)
+                continue
             markup = _render_block(b)
             if markup:
                 yield Static(markup, markup=True)
 
 
-__all__ = ["OutputView", "Block", "_parse_blocks", "_render_block"]
+__all__ = ["OutputView", "CodeBlock", "Block", "_parse_blocks", "_render_block"]

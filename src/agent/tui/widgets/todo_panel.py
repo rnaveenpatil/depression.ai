@@ -59,16 +59,16 @@ def _esc(text: Any) -> str:
 
 
 class TodoPanel(Vertical):
-    DEFAULT_CSS = f"""
-    TodoPanel {{
+    DEFAULT_CSS = """
+    TodoPanel {
         height: auto;
         width: 100%;
         padding: 0 1;
-    }}
-    TodoPanel > Static {{
+    }
+    TodoPanel > Static {
         height: auto;
         width: 100%;
-    }}
+    }
     """
 
     def __init__(self, app_ref: Any = None, session: Any = None, **kwargs: Any):

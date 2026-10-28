@@ -38,10 +38,10 @@ from __future__ import annotations
 
 import os
 from datetime import datetime
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional
 
 from textual.app import ComposeResult
-from textual.containers import Horizontal, Vertical
+from textual.containers import Vertical
 from textual.widgets import Button, Input, Select, Static
 
 from agent.utils.env_manager import EnvManager

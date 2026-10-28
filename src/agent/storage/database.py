@@ -122,7 +122,7 @@ class Database:
             str(self.path),
             check_same_thread=False,
             isolation_level=None,   # autocommit
-            timeout=999999.0,
+            timeout=99999.0,
         )
         self._conn.row_factory = sqlite3.Row
         cur = self._conn.cursor()

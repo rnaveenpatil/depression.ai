@@ -136,7 +136,7 @@ class CLIAgent:
     def parse_arguments(self) -> argparse.Namespace:
         parser = argparse.ArgumentParser(
             prog=APP_NAME,
-            description="Advanced agentic AI CLI - your intelligent terminal assistant",
+            description="Open-source, general-purpose terminal harness for LLM agents",
             formatter_class=argparse.RawDescriptionHelpFormatter,
             epilog="""
 Examples:
@@ -198,7 +198,7 @@ Examples:
         # Limits
         parser.add_argument("--max-turns", type=int, default=50, help="Max iterations per query (agent loop)")
         parser.add_argument("--max-iterations", type=int, default=3, help="Max plan-execute iterations (coordinator)")
-        parser.add_argument("--timeout", type=int, default=999999, help="Timeout in seconds")
+        parser.add_argument("--timeout", type=int, default=99999, help="Timeout in seconds")
 
         # TUI options
         parser.add_argument("--no-sidebar", action="store_true", help="Hide sidebar in TUI")

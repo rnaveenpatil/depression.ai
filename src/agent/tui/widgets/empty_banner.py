@@ -29,6 +29,7 @@ from textual.widgets import Static
 GREEN = "#00ff66"
 GREEN_DIM = "#00aa44"
 GREEN_GLOW = "#88ffbb"
+AMBER = "#ffcc44"
 RED = "#ff3355"
 RED_GLOW = "#ff8899"
 RED_PULSE = "#ffd0d8"
@@ -223,6 +224,13 @@ class EmptyBanner(Static):
         color: {MUTED};
         margin-top: 1;
     }}
+    EmptyBanner .banner-setup {{
+        width: auto;
+        height: auto;
+        text-align: center;
+        color: {MUTED};
+        margin-top: 1;
+    }}
     EmptyBanner .banner-hint {{
         width: auto;
         height: 1;
@@ -239,7 +247,9 @@ class EmptyBanner(Static):
         self._sub_widget: Static | None = None
         self._welcome_widget: Static | None = None
         self._note_widget: Static | None = None
+        self._setup_widget: Static | None = None
         self._hint_widget: Static | None = None
+        self._setup = {"llm": False, "aws": False, "profile": False}
         self._reveal_count = 0
         self._reveal_done = False
         self._scan_tick = 0
@@ -249,6 +259,13 @@ class EmptyBanner(Static):
         """Update the welcome line without rebuilding the widget."""
         self._welcome_name = (name or "").strip()
         self._render_welcome()
+
+    def set_setup(self, llm: bool, aws: bool, profile: bool) -> None:
+        """Update the first-run setup checklist."""
+        self._setup = {
+            "llm": bool(llm), "aws": bool(aws), "profile": bool(profile),
+        }
+        self._render_setup()
 
     def compose(self) -> ComposeResult:
         with Middle():
@@ -268,16 +285,19 @@ class EmptyBanner(Static):
                 yield self._welcome_widget
 
                 self._note_widget = Static(
-                    f"[{MUTED}]AI agent capable of doing everything — "
-                    f"development, analysis, system handling AWS deployment,[/]",
+                    f"[{MUTED}]A general-purpose terminal harness for LLM agents — "
+                    f"code, analysis, automation, AWS, and more.[/]",
                     classes="banner-note",
                     markup=True,
                 )
                 yield self._note_widget
 
+                self._setup_widget = Static("", classes="banner-setup", markup=True)
+                yield self._setup_widget
+
                 self._hint_widget = Static(
-                    f"[{DIM}]type a prompt to begin  ·  ctrl+b for sidebar  ·  "
-                    f"ctrl+q to quit[/]",
+                    f"[{DIM}]type a prompt  ·  ctrl+p commands  ·  "
+                    f"ctrl+b sidebar  ·  ctrl+q quit[/]",
                     classes="banner-hint",
                     markup=True,
                 )
@@ -291,6 +311,7 @@ class EmptyBanner(Static):
         # Initial paint so the widget isn't blank for one frame.
         self._render_wordmark()
         self._render_welcome()
+        self._render_setup()
 
     def on_unmount(self) -> None:
         self._alive = False
@@ -327,11 +348,37 @@ class EmptyBanner(Static):
             try:
                 caret = "▮" if (self._scan_tick // 4) % 2 == 0 else " "
                 self._hint_widget.update(
-                    f"[{DIM}]type a prompt to begin  ·  ctrl+b for sidebar  ·  "
-                    f"ctrl+q to quit[/]  [{GREEN}]{caret}[/]"
+                    f"[{DIM}]type a prompt  ·  ctrl+p commands  ·  "
+                    f"ctrl+b sidebar  ·  ctrl+q quit[/]  [{GREEN}]{caret}[/]"
                 )
             except Exception:
                 pass
+
+    def _render_setup(self) -> None:
+        if self._setup_widget is None:
+            return
+        if all(self._setup.values()):
+            text = (
+                f"[{GREEN}]✓ setup complete[/]  "
+                f"[{DIM}]·  /doctor for diagnostics[/]"
+            )
+        else:
+            labels = (
+                ("llm", "LLM", "/connect"),
+                ("aws", "AWS", "/aws"),
+                ("profile", "profile", "/profile"),
+            )
+            parts = []
+            for key, label, command in labels:
+                if self._setup[key]:
+                    parts.append(f"[{GREEN}]✓ {label}[/]")
+                else:
+                    parts.append(f"[{AMBER}]○ {label}[/] [{DIM}]{command}[/]")
+            text = "   ".join(parts)
+        try:
+            self._setup_widget.update(text)
+        except Exception:
+            pass
 
     def _render_welcome(self) -> None:
         """Paint the welcome line under the subtitle."""

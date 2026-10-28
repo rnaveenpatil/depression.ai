@@ -41,6 +41,15 @@ class Sidebar(Vertical):
         width: 46;
         min-width: 46;
     }}
+    Sidebar.compact.open {{
+        width: 34;
+        min-width: 34;
+        max-width: 34;
+    }}
+    Sidebar.overlay {{
+        position: absolute;
+        height: 1fr;
+    }}
     Sidebar #side-title {{
         height: 1;
         padding: 0 1;
@@ -80,6 +89,9 @@ class Sidebar(Vertical):
     def __init__(self, panels: list, **kwargs):
         super().__init__(**kwargs)
         self._panel_widgets = panels  # [(name, widget), ...]
+        self._screen_width = 120
+        self._compact = False
+        self._overlay = False
 
     def compose(self) -> ComposeResult:
         yield Static("▌ SIDEBAR", id="side-title", markup=True)
@@ -98,6 +110,54 @@ class Sidebar(Vertical):
                 self.add_class("open")
             else:
                 self.remove_class("open")
+        except Exception:
+            pass
+        self._apply_size()
+
+    def apply_responsive(self, width: int, height: int) -> None:
+        """Compact on mid-width terminals and overlay on narrow ones."""
+        self._screen_width = max(1, int(width))
+        compact = self._screen_width < 110
+        overlay = self._screen_width < 90
+        if compact != self._compact or overlay != self._overlay:
+            self._compact = compact
+            self._overlay = overlay
+            try:
+                if compact:
+                    self.add_class("compact")
+                else:
+                    self.remove_class("compact")
+                if overlay:
+                    self.add_class("overlay")
+                else:
+                    self.remove_class("overlay")
+            except Exception:
+                pass
+        self._apply_size()
+
+    def _apply_size(self) -> None:
+        try:
+            if not self.is_open:
+                self.styles.width = 0
+                self.styles.min_width = 0
+                self.styles.max_width = 46
+                self.styles.offset = (0, 0)
+                self.styles.height = "1fr"
+                return
+            side = 34 if self._compact else 46
+            if self._overlay:
+                side = min(40, max(28, self._screen_width - 10))
+                self.styles.width = side
+                self.styles.min_width = side
+                self.styles.max_width = side
+                self.styles.offset = (max(0, self._screen_width - side), 0)
+            else:
+                self.styles.width = side
+                self.styles.min_width = side
+                self.styles.max_width = 46
+                self.styles.offset = (0, 0)
+            self.styles.height = "1fr"
+            self.refresh(layout=True)
         except Exception:
             pass
 

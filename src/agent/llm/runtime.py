@@ -129,7 +129,7 @@ _FAMILY_FALLBACKS: Dict[str, Dict[str, Any]] = {
 
 # Fail fast: one hung request should not stall the whole turn for two
 # minutes. Matches the documented "30s x 2 retries" behaviour.
-_DEFAULT_TIMEOUT = 999999.0
+_DEFAULT_TIMEOUT = 99999.0
 _DEFAULT_MAX_RETRIES = 2
 
 

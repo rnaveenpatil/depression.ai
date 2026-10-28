@@ -520,7 +520,7 @@ class ToolCallWidget(Vertical):
         body = f"[{ERROR}]{_esc(text[:limit])}[/]"
         if len(text) > limit:
             hidden = len(text) - limit
-            hint = "" if self._expanded else " · press e"
+            hint = "" if self._expanded else " · press ctrl+e"
             body += (
                 f"\n[{AMBER}]… {hidden} more char"
                 f"{'s' if hidden != 1 else ''}{hint}[/]"
@@ -576,7 +576,7 @@ class ToolCallWidget(Vertical):
                 hidden = len(body_lines) - 6
                 lines.append(
                     f"[{AMBER}]… {hidden} more line"
-                    f"{'s' if hidden != 1 else ''} · press e[/]"
+                    f"{'s' if hidden != 1 else ''} · press ctrl+e[/]"
                 )
         else:
             lines.append(f"[{MUTED}]no output[/]")
@@ -618,7 +618,7 @@ class ToolCallWidget(Vertical):
                 hidden = len(out_lines) - _BASH_PREVIEW_LINES
                 lines.append(
                     f"[{AMBER}]… {hidden} more line"
-                    f"{'s' if hidden != 1 else ''} · press e[/]"
+                    f"{'s' if hidden != 1 else ''} · press ctrl+e[/]"
                 )
         if exit_code not in (None, 0):
             lines.append(f"[{ERROR}]exit {exit_code}[/]")
@@ -642,7 +642,7 @@ class ToolCallWidget(Vertical):
             hidden = len(lines) - 4
             body += (
                 f"\n[{AMBER}]… {hidden} more line"
-                f"{'s' if hidden != 1 else ''} · press e[/]"
+                f"{'s' if hidden != 1 else ''} · press ctrl+e[/]"
             )
         return header + "\n" + body
 
@@ -665,7 +665,7 @@ class ToolCallWidget(Vertical):
         shown = min(available, limit)
         hidden = available - shown
         if hidden > 0:
-            hint = "" if self._expanded else " · press e"
+            hint = "" if self._expanded else " · press ctrl+e"
             lines.append(
                 f"[{AMBER}]… {hidden} more "
                 f"match{'es' if hidden != 1 else ''}{hint}[/]"
@@ -696,7 +696,7 @@ class ToolCallWidget(Vertical):
         preview = _esc(stripped.replace("\n", " ")[:180])
         out = head + f"\n[{TEXT}]{preview}[/]"
         if len(stripped) > 180:
-            out += f"\n[{AMBER}]… more text · press e[/]"
+            out += f"\n[{AMBER}]… more text · press ctrl+e[/]"
         return out
 
     def _render_generic(self, result: Dict[str, Any]) -> str:
@@ -723,6 +723,6 @@ class ToolCallWidget(Vertical):
             hidden = len(lines) - _GENERIC_PREVIEW_LINES
             body += (
                 f"\n[{AMBER}]… {hidden} more line"
-                f"{'s' if hidden != 1 else ''} · press e[/]"
+                f"{'s' if hidden != 1 else ''} · press ctrl+e[/]"
             )
         return body

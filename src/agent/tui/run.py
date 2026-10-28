@@ -2,12 +2,8 @@
 from __future__ import annotations
 
 import asyncio
-import os
-import signal
 import sys
 import threading
-from concurrent.futures import Future
-from functools import partial
 from pathlib import Path
 from typing import Any
 
@@ -46,12 +42,18 @@ def main() -> None:
 
         from agent.tui.app import DepressionApp, PermissionModal
 
-        app = DepressionApp(coordinator=cli.agent_coordinator, skip_onboarding=args.nosignin)
+        app = DepressionApp(
+            coordinator=cli.agent_coordinator,
+            skip_onboarding=args.nosignin,
+            session_manager=getattr(cli, "session_manager", None),
+        )
 
         # One-at-a-time permission bridge, resolved on the UI loop.
         pending: dict[str, Any] = {"fut": None}
 
         async def tui_confirm(request: Any, verdict: Any) -> bool:
+            if app.is_tool_allowed_for_session(getattr(request, "tool", "")):
+                return True
             if pending["fut"] is not None:
                 return False
 
@@ -64,8 +66,17 @@ def main() -> None:
                 modal = PermissionModal(request, verdict)
 
                 def finished(result: Any) -> None:
-                    if not fut.done():
-                        fut.set_result(bool(result))
+                    if fut.done():
+                        return
+                    value = str(result or "").lower()
+                    if value == "session":
+                        try:
+                            app.allow_tool_for_session(request.tool)
+                        except Exception:
+                            pass
+                        fut.set_result(True)
+                    else:
+                        fut.set_result(value in ("once", "allow", "true") or result is True)
 
                 try:
                     app.push_screen(modal, callback=finished)
@@ -87,10 +98,20 @@ def main() -> None:
             except asyncio.TimeoutError:
                 if not fut.done():
                     fut.set_result(False)
-                try:
-                    app.call_from_thread(app.pop_screen)
-                except Exception:
-                    pass
+
+                def close_modal() -> None:
+                    try:
+                        app.pop_screen()
+                    except Exception:
+                        pass
+
+                if threading.current_thread() is threading.main_thread():
+                    close_modal()
+                else:
+                    try:
+                        app.call_from_thread(close_modal)
+                    except Exception:
+                        pass
                 return False
             except asyncio.CancelledError:
                 if not fut.done():

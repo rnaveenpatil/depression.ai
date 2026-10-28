@@ -25,7 +25,7 @@ from textual.app import ComposeResult
 from textual.containers import Vertical
 from textual.widgets import Static
 
-from agent.tui.onboarding.profile import ProfileStore, UserProfile
+from agent.tui.onboarding.profile import ProfileStore
 
 
 GREEN = "#00ff66"

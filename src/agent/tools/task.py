@@ -42,7 +42,7 @@ class TaskTool(BaseTool):
         },
         "required": ["action"],
     }
-    timeout = 999999.0
+    timeout = 99999.0
 
     read_only = False
     mutating = True

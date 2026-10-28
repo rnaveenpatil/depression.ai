@@ -143,8 +143,8 @@ def render_diff(
     header_parts = []
     if path:
         header_parts.append(f"[bold {AMBER}]{path}[/]")
-    added = sum(1 for l in lines if l.kind == "add")
-    removed = sum(1 for l in lines if l.kind == "del")
+    added = sum(1 for dl in lines if dl.kind == "add")
+    removed = sum(1 for dl in lines if dl.kind == "del")
     header_parts.append(f"[{GREEN}]+{added}[/] [{RED}]-{removed}[/]")
     out = ["  " + "  ".join(header_parts)]
 
@@ -154,7 +154,6 @@ def render_diff(
             continue
         old = f"{line.old_no:>4}" if line.old_no is not None else "    "
         new = f"{line.new_no:>4}" if line.new_no is not None else "    "
-        prefix = "  "
         body = line.text.replace("[", r"\[")
         if line.kind == "del":
             out.append(f"[{RED_DIM}]{old}[/] [{RED_DIM}]{new}[/] [{RED}]- {body}[/]")
