@@ -2535,33 +2535,33 @@ class DepressionApp(App):
 
     @staticmethod
     def _shape_diff_payload(tool: str, params: dict, result: dict) -> dict:
+        """Normalize supplied snapshots without inventing file changes.
+
+        Read/list results often include 'content' or 'output'. Such values
+        cannot be interpreted as a post-edit snapshot without a real before.
+        """
         r = dict(result)
-
-        before = None
-        for key in ("before", "content_before", "old_content"):
-            v = r.get(key)
-            if isinstance(v, str):
-                before = v
-                break
-
-        after = None
-        for key in ("after", "content", "new_content", "text", "output"):
-            v = r.get(key)
-            if isinstance(v, str):
-                after = v
-                break
-
-        if before is not None:
+        if tool == "filesystem" and params.get("action") not in (
+            "write", "append", "edit", "delete",
+        ):
+            return r
+        if isinstance(r.get("results"), list):
+            # Multi-file patch snapshots live in individual result entries.
+            return r
+        before = next((
+            r[key] for key in ("before", "content_before", "old_content")
+            if isinstance(r.get(key), str)
+        ), None)
+        after = next((
+            r[key] for key in ("after", "content_after", "new_content")
+            if isinstance(r.get(key), str)
+        ), None)
+        if before is not None and after is not None:
             r["before"] = before
-        if after is not None:
             r["after"] = after
-
-        if before is None and after is not None:
-            r["diff_source"] = "tool:add-only"
-        elif before is None and after is None:
-            r["diff_source"] = "tool:none"
-        else:
             r["diff_source"] = "tool"
+        else:
+            r["diff_source"] = "tool:none"
         return r
 
     # ------------------------------------------------------------------
