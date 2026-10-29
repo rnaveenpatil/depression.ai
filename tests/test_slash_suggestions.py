@@ -28,9 +28,8 @@ async def test_slash_menu_filters_as_user_types():
     async with app.run_test() as pilot:
         prompt = app.query_one("#prompt", PromptArea)
         prompt.set_prompt_text("/")
-        immediate = (app._command_menu_open, prompt.text, app._command_suggestion_matches)
         await pilot.pause()
-        assert app._command_menu_open, repr((immediate, prompt.text, app._command_suggestion_matches, app._command_suppressed_text))
+        assert app._command_menu_open
         assert app.query_one("#command-menu").display is True
         prompt.set_prompt_text("/mcp")
         await pilot.pause()
@@ -88,7 +87,9 @@ async def test_escape_dismisses_menu_without_interrupting_agent():
         prompt.set_prompt_text("/m")
         await pilot.pause()
         assert app._command_menu_open
-        assert app.check_action("interrupt", ()) is False
+        assert app.check_action("interrupt", ()) is True
+        assert app._command_menu_open  # availability check must not mutate UI
+        app.action_interrupt()
         assert not app._command_menu_open
         assert prompt.text == "/m"
         # Next character allows suggestions to open again.
