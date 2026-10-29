@@ -193,7 +193,11 @@ class ToolRegistry:
         logger.debug("Registered tool: %s", tool.name)
 
     def unregister_tool(self, name: str) -> bool:
-        return self.tools.pop(name, None) is not None
+        removed = self.tools.pop(name, None) is not None
+        removed = self._external.pop(name, None) is not None or removed
+        if removed:
+            self.stats.pop(name, None)
+        return removed
 
     def register_external(
         self,
