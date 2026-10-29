@@ -65,19 +65,20 @@ class Sidebar(Vertical):
         padding: 0 1;
     }}
     Sidebar .side-tab-row {{
-        height: 1;
+        height: 3;
         width: 100%;
         layout: horizontal;
     }}
     Sidebar .side-tab {{
         width: 1fr;
         min-width: 0;
-        height: 1;
-        background: transparent;
+        height: 3;
+        background: {BG};
         border: none;
         color: {MUTED};
         text-style: bold;
-        padding: 0 1;
+        padding: 0;
+        content-align: center middle;
     }}
     Sidebar .side-tab:hover {{
         background: {BORDER};
@@ -112,8 +113,8 @@ class Sidebar(Vertical):
 
     def compose(self) -> ComposeResult:
         yield Static("▌ SIDEBAR", id="side-title", markup=True)
-        # Two tabs per row: four compact rows instead of eight full rows.
-        # This gives pasteable connection forms much more usable height.
+        # Textual Button requires three rows for reliable label rendering.
+        # One-row buttons clipped their text, leaving green lines instead.
         with Vertical(id="side-tabs"):
             short_labels = {"llmcost": "COST", "context": "CONTEXT"}
             for i in range(0, len(self._panel_widgets), 2):
