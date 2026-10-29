@@ -1,15 +1,12 @@
-"""Read-only MCP overview for the Textual sidebar.
-
-Server lifecycle actions are dispatched by DepressionApp. The panel never
-executes an MCP tool, changes permissions, or displays auth credentials.
-"""
+"""Compact, paste-first MCP connection panel with collapsible connection details."""
 from __future__ import annotations
 
 from typing import Any
 
+from textual import on
 from textual.app import ComposeResult
 from textual.containers import Horizontal, Vertical
-from textual.widgets import Button, Static, Input, Select, TextArea
+from textual.widgets import Button, Static, Input, TextArea
 
 from agent.tui.theme import GREEN, MUTED, TEXT, PANEL, BORDER
 
@@ -37,12 +34,68 @@ class MCPPanel(Vertical):
         color: {MUTED};
         margin-bottom: 1;
     }}
-    MCPPanel .mcp-label {{ color: {MUTED}; height: 1; margin-top: 1; }}
-    MCPPanel Input, MCPPanel Select, MCPPanel TextArea {{
-        border: round {BORDER}; background: {PANEL}; color: {TEXT}; width: 100%;
+    MCPPanel .mcp-label {{
+        color: {MUTED};
+        height: 1;
+        margin-top: 1;
     }}
-    MCPPanel Input, MCPPanel Select {{ height: 3; }}
-    MCPPanel #mcp-paste {{ height: 6; }}
+    MCPPanel Input, MCPPanel TextArea {{
+        border: round {BORDER};
+        background: {PANEL};
+        color: {TEXT};
+        width: 100%;
+    }}
+    MCPPanel Input {{ height: 3; }}
+    MCPPanel Input:focus, MCPPanel TextArea:focus {{
+        border: round {GREEN};
+    }}
+    MCPPanel #mcp-mode-row {{
+        height: 3;
+        layout: horizontal;
+        margin-bottom: 1;
+    }}
+    MCPPanel #mcp-mode-row Button {{
+        width: 1fr;
+        min-width: 0;
+        height: 3;
+        padding: 0;
+        border: round {BORDER};
+        background: {PANEL};
+        color: {MUTED};
+    }}
+    MCPPanel #mcp-mode-row Button.active {{
+        border: round {GREEN};
+        color: {GREEN};
+        text-style: bold;
+    }}
+    MCPPanel #mcp-json-fields, MCPPanel #mcp-manual-fields,
+    MCPPanel #mcp-remote-fields, MCPPanel #mcp-local-fields,
+    MCPPanel #mcp-details {{
+        height: auto;
+        width: 100%;
+    }}
+    MCPPanel #mcp-json-fields, MCPPanel #mcp-local-fields,
+    MCPPanel #mcp-details {{
+        display: none;
+    }}
+    MCPPanel #mcp-paste {{ height: 7; }}
+    MCPPanel #mcp-save {{
+        height: 3;
+        width: 100%;
+        border: round {GREEN};
+        background: {PANEL};
+        color: {GREEN};
+        text-style: bold;
+        margin: 1 0;
+    }}
+    MCPPanel #mcp-details-toggle {{
+        width: 100%;
+        height: 3;
+        border: round {BORDER};
+        background: transparent;
+        color: {MUTED};
+        margin-top: 1;
+    }}
     MCPPanel #mcp-actions {{
         height: 3;
         layout: horizontal;
@@ -61,54 +114,144 @@ class MCPPanel(Vertical):
     def __init__(self, host_app: Any, **kwargs: Any) -> None:
         super().__init__(**kwargs)
         self._host_app = host_app
+        self._entry_mode = "http"
+        self._details_expanded = False
 
     def compose(self) -> ComposeResult:
-        yield Static("▌ MCP SERVERS", classes="mcp-heading", markup=False)
-        yield Static("Paste URL, API token, command or JSON, then save.", classes="mcp-muted", markup=False)
-        yield Static("Server name", classes="mcp-label")
-        yield Input(id="mcp-name", placeholder="my-server")
-        yield Static("Transport", classes="mcp-label")
-        yield Select([
-            ("HTTP", "streamable-http"), ("SSE", "sse"),
-            ("Cloud", "cloud"), ("Local command", "stdio"),
-        ], id="mcp-transport", value="streamable-http", allow_blank=False)
-        yield Static("MCP URL", classes="mcp-label")
-        yield Input(id="mcp-url", placeholder="https://example.com/mcp")
-        yield Static("API token (optional)", classes="mcp-label")
-        yield Input(id="mcp-token", password=True, placeholder="Paste API token")
-        yield Static("Local executable (stdio)", classes="mcp-label")
-        yield Input(id="mcp-command", placeholder="npx / uvx / python")
-        yield Static("Arguments (stdio)", classes="mcp-label")
-        yield Input(id="mcp-args", placeholder="-y @package/server")
-        yield Static("Or paste MCP server JSON", classes="mcp-label")
-        yield TextArea("", id="mcp-paste", soft_wrap=True, show_line_numbers=False)
-        yield Button("SAVE & CONNECT", id="mcp-save")
-        yield Static("", id="mcp-save-status", classes="mcp-muted", markup=False)
-        yield Static("Checking MCP…", id="mcp-status", classes="mcp-detail", markup=False)
-        yield Static("", id="mcp-servers", classes="mcp-detail", markup=False)
-        yield Static("", id="mcp-tools", classes="mcp-muted", markup=False)
-        with Horizontal(id="mcp-actions"):
-            yield Button("REFRESH", id="mcp-refresh")
-            yield Button("RECONNECT", id="mcp-reconnect")
+        yield Static("▌ CONNECT MCP", classes="mcp-heading", markup=False)
         yield Static(
-            "Paste one Claude-style mcpServers JSON object, or enter a URL. "
-            "Existing servers remain. Reload reconnects configured servers.",
-            classes="mcp-muted",
-            markup=False,
+            "Paste connection details directly. No suggestions or presets.",
+            classes="mcp-muted", markup=False,
         )
+        with Horizontal(id="mcp-mode-row"):
+            yield Button("HTTP", id="mcp-mode-http", classes="mcp-mode active")
+            yield Button("SSE", id="mcp-mode-sse", classes="mcp-mode")
+            yield Button("LOCAL", id="mcp-mode-local", classes="mcp-mode")
+            yield Button("JSON", id="mcp-mode-json", classes="mcp-mode")
+        with Vertical(id="mcp-manual-fields"):
+            yield Static("Server name", classes="mcp-label")
+            yield Input(id="mcp-name", placeholder="my-server")
+            with Vertical(id="mcp-remote-fields"):
+                yield Static("MCP server URL", classes="mcp-label")
+                yield Input(id="mcp-url", placeholder="https://example.com/mcp")
+                yield Static("API token (optional)", classes="mcp-label")
+                yield Input(
+                    id="mcp-token", password=True,
+                    placeholder="Paste token; stored privately",
+                )
+            with Vertical(id="mcp-local-fields"):
+                yield Static("Executable", classes="mcp-label")
+                yield Input(id="mcp-command", placeholder="npx, uvx or python")
+                yield Static("Arguments", classes="mcp-label")
+                yield Input(id="mcp-args", placeholder="-y @package/server")
+        with Vertical(id="mcp-json-fields"):
+            yield Static(
+                "Paste one MCP server JSON object or mcpServers config.",
+                classes="mcp-muted", markup=False,
+            )
+            yield TextArea(
+                "", id="mcp-paste",
+                soft_wrap=True, show_line_numbers=False,
+            )
+        yield Button("SAVE & CONNECT", id="mcp-save")
+        yield Static(
+            "", id="mcp-save-status",
+            classes="mcp-detail", markup=False,
+        )
+        yield Static(
+            "Connection status: not checked", id="mcp-status",
+            classes="mcp-muted", markup=False,
+        )
+        yield Button("CONNECTION DETAILS  ▾", id="mcp-details-toggle")
+        with Vertical(id="mcp-details"):
+            yield Static(
+                "", id="mcp-servers",
+                classes="mcp-detail", markup=False,
+            )
+            yield Static(
+                "", id="mcp-tools",
+                classes="mcp-muted", markup=False,
+            )
+            with Horizontal(id="mcp-actions"):
+                yield Button("REFRESH", id="mcp-refresh")
+                yield Button("RECONNECT", id="mcp-reconnect")
 
     def on_mount(self) -> None:
+        self.set_entry_mode(self._entry_mode)
         self.refresh_status()
 
+    def set_entry_mode(self, mode: str) -> None:
+        """Show only relevant paste inputs; never wipe drafts."""
+        if mode not in ("http", "sse", "local", "json"):
+            return
+        self._entry_mode = mode
+        if not self.is_mounted:
+            return
+        self.query_one("#mcp-manual-fields", Vertical).display = mode != "json"
+        self.query_one("#mcp-json-fields", Vertical).display = mode == "json"
+        self.query_one("#mcp-remote-fields", Vertical).display = mode in ("http", "sse")
+        self.query_one("#mcp-local-fields", Vertical).display = mode == "local"
+        for name in ("http", "sse", "local", "json"):
+            button = self.query_one(f"#mcp-mode-{name}", Button)
+            button.set_class(name == mode, "active")
+        self.refresh(layout=True)
+
+    @on(Button.Pressed, ".mcp-mode")
+    def _select_mode(self, event: Button.Pressed) -> None:
+        self.set_entry_mode(event.button.id.removeprefix("mcp-mode-"))
+        self.focus_entry_field()
+
+    @on(Button.Pressed, "#mcp-details-toggle")
+    def _toggle_details(self) -> None:
+        self._details_expanded = not self._details_expanded
+        self.query_one("#mcp-details", Vertical).display = self._details_expanded
+        self.query_one("#mcp-details-toggle", Button).label = (
+            "CONNECTION DETAILS  ▴" if self._details_expanded
+            else "CONNECTION DETAILS  ▾"
+        )
+        if self._details_expanded:
+            self.refresh_status()
+
+    def focus_entry_field(self) -> None:
+        target = (
+            "#mcp-paste" if self._entry_mode == "json"
+            else "#mcp-command" if self._entry_mode == "local"
+            else "#mcp-url"
+        )
+        widget = self.query_one(target)
+        widget.focus()
+        widget.scroll_visible(animate=False)
+
     def connection_values(self) -> dict[str, str]:
+        """Use only the current entry mode to avoid stale hidden inputs."""
         return {
-            "name": self.query_one("#mcp-name", Input).value,
-            "transport": str(self.query_one("#mcp-transport", Select).value),
-            "url": self.query_one("#mcp-url", Input).value,
-            "api_key": self.query_one("#mcp-token", Input).value,
-            "command": self.query_one("#mcp-command", Input).value,
-            "args": self.query_one("#mcp-args", Input).value,
-            "json": self.query_one("#mcp-paste", TextArea).text,
+            "name": self.query_one("#mcp-name", Input).value.strip(),
+            "transport": {
+                "http": "streamable-http",
+                "sse": "sse",
+                "local": "stdio",
+                "json": "streamable-http",
+            }[self._entry_mode],
+            "url": (
+                self.query_one("#mcp-url", Input).value.strip()
+                if self._entry_mode in ("http", "sse") else ""
+            ),
+            "api_key": (
+                self.query_one("#mcp-token", Input).value.strip()
+                if self._entry_mode in ("http", "sse") else ""
+            ),
+            "command": (
+                self.query_one("#mcp-command", Input).value.strip()
+                if self._entry_mode == "local" else ""
+            ),
+            "args": (
+                self.query_one("#mcp-args", Input).value
+                if self._entry_mode == "local" else ""
+            ),
+            "json": (
+                self.query_one("#mcp-paste", TextArea).text
+                if self._entry_mode == "json" else ""
+            ),
         }
 
     def set_save_status(self, message: str) -> None:
