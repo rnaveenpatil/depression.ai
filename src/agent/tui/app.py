@@ -57,7 +57,7 @@ from agent.tui.widgets.empty_banner import EmptyBanner
 from agent.tui.widgets.output_view import OutputView
 from agent.tui.widgets.plan_view import PlanView
 from agent.tui.widgets.profile_panel import ProfilePanel
-from agent.tui.widgets.sidebar import Sidebar
+from agent.tui.widgets.sidebar import Sidebar, SidebarTab
 from agent.tui.widgets.mcp_panel import MCPPanel
 from agent.tui.widgets.thinking import ThinkingIndicator
 from agent.tui.widgets.tool_call import ToolCallWidget
@@ -3419,9 +3419,9 @@ class DepressionApp(App):
         except Exception:
             pass
 
-    @on(Button.Pressed, ".side-tab")
-    def _on_tab(self, event: Button.Pressed) -> None:
-        panel = event.button.id.replace("tab-", "")
+    @on(SidebarTab.Pressed, ".side-tab")
+    def _on_tab(self, event: SidebarTab.Pressed) -> None:
+        panel = event.tab.id.replace("tab-", "")
         self._set_active_panel(panel)
         # Connection panels should focus their first editable field.
         # Do not unexpectedly force the user back to the chat input.
