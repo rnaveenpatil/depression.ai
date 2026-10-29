@@ -58,6 +58,7 @@ from agent.tui.widgets.output_view import OutputView
 from agent.tui.widgets.plan_view import PlanView
 from agent.tui.widgets.profile_panel import ProfilePanel
 from agent.tui.widgets.sidebar import Sidebar
+from agent.tui.widgets.mcp_panel import MCPPanel
 from agent.tui.widgets.thinking import ThinkingIndicator
 from agent.tui.widgets.tool_call import ToolCallWidget
 
@@ -69,7 +70,7 @@ MODE_ORDER = ["build", "plan", "auto"]
 DEFAULT_TURN_TIMEOUT = 3600.0
 DEFAULT_AWS_REGION = "us-east-1"
 
-_PANEL_NAMES = ("llm", "aws", "profile", "context", "llmcost", "todo", "help")
+_PANEL_NAMES = ("llm", "aws", "mcp", "profile", "context", "llmcost", "todo", "help")
 
 _DIFF_TOOLS = {"write", "edit", "apply_patch", "filesystem", "patch"}
 
@@ -747,6 +748,7 @@ class AgentCommandProvider(Provider):
         ("/search", "Search the transcript"),
         ("/doctor", "Run local diagnostics"),
         ("/aws", "Open AWS credentials"),
+        ("/mcp", "Show MCP server status and tools"),
         ("/profile", "Open profile"),
         ("/context", "Open context usage"),
         ("/llmcost", "Open token and API cost"),
@@ -1601,6 +1603,7 @@ class HelpPanel(Vertical):
         yield Static("/model     open LLM panel + discover models", classes="help-row")
         yield Static("/models    discover models", classes="help-row")
         yield Static("/aws       open AWS panel", classes="help-row")
+        yield Static("/mcp       open MCP status and reconnect panel", classes="help-row")
         yield Static("/profile   open profile panel", classes="help-row")
         yield Static("/context   open context panel", classes="help-row")
         yield Static("/llmcost   open token + api cost panel", classes="help-row")
@@ -1991,6 +1994,7 @@ class DepressionApp(App):
                 panels=[
                     ("llm", LLMPanel(self, id="panel-llm")),
                     ("aws", AWSPanel(self, id="panel-aws")),
+                    ("mcp", MCPPanel(self, id="panel-mcp")),
                     ("profile", ProfilePanel(id="panel-profile")),
                     ("context", ContextPanel(self, id="panel-context")),
                     ("llmcost", LLMCostPanel(self, id="panel-llmcost")),
@@ -2409,6 +2413,9 @@ class DepressionApp(App):
 
         if tool in ("todo", "todowrite", "todoread"):
             self._refresh_todo_from_store(force=True)
+
+        if tool == "mcp" or tool.startswith("mcp__"):
+            self._refresh_mcp_status()
 
         if tool in ("aws",) or tool.startswith("mcp__aws__"):
             try:
@@ -2997,6 +3004,83 @@ class DepressionApp(App):
         except Exception:
             pass
 
+    def _refresh_mcp_status(self) -> None:
+        try:
+            self.query_one("#panel-mcp", MCPPanel).refresh_status()
+        except Exception:
+            pass
+
+    @on(Button.Pressed, "#mcp-refresh")
+    def _mcp_refresh(self) -> None:
+        self._refresh_mcp_status()
+
+    @on(Button.Pressed, "#mcp-reconnect")
+    def _mcp_reconnect(self) -> None:
+        self._reconnect_mcp()
+
+    @work(exclusive=True, group="mcp-reconnect")
+    async def _reconnect_mcp(self) -> None:
+        """Reconnect configured MCP servers only when the agent is idle.
+
+        Never changes configuration, grants permissions, or invokes MCP tools.
+        New tools are registered conservatively as mutating by default.
+        """
+        if self.busy or self._is_shutting_down:
+            self._system("MCP reconnect unavailable while the agent is running.")
+            return
+        panel = self.query_one("#panel-mcp", MCPPanel)
+        client = panel.get_client()
+        if client is None or not getattr(client, "enabled", False):
+            self._system("MCP is disabled; enable it in the config and restart.")
+            return
+        button = self.query_one("#mcp-reconnect", Button)
+        button.disabled = True
+        try:
+            self._system("Reconnecting configured MCP servers…")
+            await client.reload()
+
+            # MCPClient.reload() discovers tools, but the Build agent's
+            # registry originally receives them only during initialization.
+            coordinator = self.coordinator
+            build = getattr(coordinator, "build_agent", None)
+            registry = getattr(build, "tool_registry", None)
+            if registry is not None:
+                discovered = {
+                    tool["function"]["name"]: tool["function"]
+                    for tool in client.list_tools()
+                }
+                for name in list(registry.list_tools(include_disabled=True)):
+                    if name.startswith("mcp__") and name not in discovered:
+                        registry.unregister_tool(name)
+                for name, schema in discovered.items():
+                    async def _call(_name: str = name, **kwargs: Any) -> Any:
+                        return await client.call_tool(_name, kwargs)
+                    registry.register_external(
+                        name=name,
+                        handler=_call,
+                        description=str(schema.get("description") or ""),
+                        parameters=schema.get("parameters") or {
+                            "type": "object", "properties": {},
+                        },
+                        read_only=False,
+                        mutating=True,
+                        category="cloud" if name.startswith("mcp__aws__") else "misc",
+                    )
+
+                # Rebuild pinned system prompts after schema changes.
+                loop = getattr(build, "loop", None)
+                if loop is not None:
+                    loop._system_prompt_cache = None
+                    loop._system_prompt_fp = None
+
+            self._system("MCP reconnect finished; check server status for failures.")
+        except Exception as exc:
+            self._error("MCP reconnect failed: " + type(exc).__name__)
+        finally:
+            self._refresh_mcp_status()
+            if not self.busy and not self._is_shutting_down:
+                button.disabled = False
+
     def _refresh_aws_status(self) -> None:
         try:
             self.query_one("#panel-aws", AWSPanel).refresh_mcp_status()
@@ -3043,6 +3127,8 @@ class DepressionApp(App):
             self._refresh_context_panel()
         if which == "aws":
             self._refresh_aws_status()
+        if which == "mcp":
+            self._refresh_mcp_status()
         if which == "llmcost":
             self._refresh_llmcost_panel()
         if which == "profile":
@@ -3194,6 +3280,8 @@ class DepressionApp(App):
                 self.query_one("#aws-key", Input).focus()
             except Exception:
                 pass
+        elif command == "/mcp":
+            self._show_panel("mcp")
         elif command == "/connect":
             self._show_panel("llm")
             try:
