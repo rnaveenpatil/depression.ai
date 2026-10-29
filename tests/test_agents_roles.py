@@ -157,9 +157,8 @@ async def test_process_query_requires_initialization():
 @pytest.mark.asyncio
 async def test_agent_loop_executes_tool_and_returns_final_response():
     """
-    A single successful read-only tool call with readable output takes the
-    loop's fast path: the tool result is returned directly and no second
-    LLM turn is consumed. This documents that behavior.
+    Read-only tool output is returned to the LLM for interpretation before
+    the agent produces its final response.
     """
     agent = _agent(AgentRole.BUILD)
     llm = ScriptedLLM([
@@ -189,11 +188,9 @@ async def test_agent_loop_executes_tool_and_returns_final_response():
     agent.loop = loop
     result = await loop.run("read a.txt")
     assert result["success"] is True, result
-    # Fast path: the tool's `content` ("ok") is returned directly.
-    assert result["response"] == "ok"
+    assert result["response"].startswith("finished")
     assert result["tool_calls"] == 1
-    # Only one LLM turn was needed.
-    assert llm.calls == 1
+    assert llm.calls == 2
 
 
 @pytest.mark.asyncio

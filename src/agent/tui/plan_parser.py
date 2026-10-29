@@ -148,20 +148,18 @@ _EMOJI_PATTERNS = [
 
 _ALL_PATTERNS = _BRACKET_PATTERNS + _EMOJI_PATTERNS
 
-# Heuristic priorities based on position and keywords.
-_HIGH_KEYWORDS = ("first", "must", "critical", "verify", "test")
-_LOW_KEYWORDS = ("optionally", "nice to have", "if time", "later")
+# Priorities are assigned by the model with explicit annotations.
+# Unannotated entries stay neutral; wording alone does not set priority.
+_PRIORITY_ANNOTATION = re.compile(
+    r"\s+\[priority:\s*(high|medium|low)\]\s*$", re.IGNORECASE
+)
 
 
-def _priority_for(text: str, position: int) -> str:
-    low = text.lower()
-    if any(k in low for k in _LOW_KEYWORDS):
-        return "low"
-    if any(k in low for k in _HIGH_KEYWORDS):
-        return "high"
-    if position == 0:
-        return "high"
-    return "medium"
+def _extract_priority(text: str) -> tuple[str, str]:
+    m = _PRIORITY_ANNOTATION.search(text)
+    if m is None:
+        return text, "medium"
+    return text[:m.start()].rstrip(), m.group(1).lower()
 
 
 # ----------------------------------------------------------------------
@@ -195,7 +193,11 @@ def parse_plan_from_text(text: str) -> Optional[ParsedPlan]:
             if m:
                 content = m.group(1).strip()
                 if content:
-                    matched = PlanEntry(content=content, status=status)
+                    step, priority = _extract_priority(content)
+                    if step:
+                        matched = PlanEntry(
+                            content=step, status=status, priority=priority
+                        )
                 break
 
         if matched is not None:
@@ -216,10 +218,6 @@ def parse_plan_from_text(text: str) -> Optional[ParsedPlan]:
 
     if not entries:
         return None
-
-    # Assign priorities after we know the positions.
-    for i, e in enumerate(entries):
-        e.priority = _priority_for(e.content, i)
 
     return ParsedPlan(entries=entries, raw=text)
 

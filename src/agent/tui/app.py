@@ -58,6 +58,7 @@ from agent.tui.widgets.output_view import OutputView
 from agent.tui.widgets.plan_view import PlanView
 from agent.tui.widgets.profile_panel import ProfilePanel
 from agent.tui.widgets.sidebar import Sidebar
+from agent.tui.widgets.mcp_panel import MCPPanel
 from agent.tui.widgets.thinking import ThinkingIndicator
 from agent.tui.widgets.tool_call import ToolCallWidget
 
@@ -69,7 +70,7 @@ MODE_ORDER = ["build", "plan", "auto"]
 DEFAULT_TURN_TIMEOUT = 3600.0
 DEFAULT_AWS_REGION = "us-east-1"
 
-_PANEL_NAMES = ("llm", "aws", "profile", "context", "llmcost", "todo", "help")
+_PANEL_NAMES = ("llm", "aws", "mcp", "profile", "context", "llmcost", "todo", "help")
 
 _DIFF_TOOLS = {"write", "edit", "apply_patch", "filesystem", "patch"}
 
@@ -254,10 +255,7 @@ class PromptArea(TextArea):
         )
 
     def on_mount(self) -> None:
-        try:
-            self.wrap_mode = "none"
-        except Exception:
-            pass
+        # TextArea was configured with soft_wrap=True; do not override it.
         self._resize()
 
     def _resize(self) -> None:
@@ -282,6 +280,8 @@ class PromptArea(TextArea):
         """Replace the prompt text and move the cursor to the end."""
         self.text = text or ""
         self._resize()
+        # Programmatic updates don't always emit TextArea.Changed.
+        self.app._update_command_suggestions(self.text)
         try:
             loc = self.document.get_location_from_index(len(self.text))
             self.cursor_location = loc
@@ -312,6 +312,27 @@ class PromptArea(TextArea):
 
     async def _on_key(self, event) -> None:
         key = event.key
+        if getattr(self.app, "_command_menu_open", False):
+            if key in ("up", "down"):
+                event.stop()
+                event.prevent_default()
+                self.app._move_command_suggestion(-1 if key == "up" else 1)
+                return
+            if key == "escape":
+                event.stop()
+                event.prevent_default()
+                self.app._hide_command_suggestions(suppress=True)
+                return
+            if key == "tab":
+                event.stop()
+                event.prevent_default()
+                self.app._accept_command_suggestion(execute=False)
+                return
+            if key == "enter":
+                event.stop()
+                event.prevent_default()
+                if self.app._accept_command_suggestion(execute=True):
+                    return
 
         if key in ("up", "down"):
             try:
@@ -747,6 +768,7 @@ class AgentCommandProvider(Provider):
         ("/search", "Search the transcript"),
         ("/doctor", "Run local diagnostics"),
         ("/aws", "Open AWS credentials"),
+        ("/mcp", "Show MCP server status and tools"),
         ("/profile", "Open profile"),
         ("/context", "Open context usage"),
         ("/llmcost", "Open token and API cost"),
@@ -759,6 +781,9 @@ class AgentCommandProvider(Provider):
         ("/clear", "Clear the transcript"),
         ("/help", "Open help"),
         ("/quit", "Quit"),
+        ("/exit", "Quit (alias)"),
+        ("/stop", "Stop the running task"),
+        ("/interrupt", "Stop the running task (alias)"),
     ]
 
     async def search(self, query: str) -> Hits:
@@ -775,6 +800,42 @@ class AgentCommandProvider(Provider):
                 text=slash,
                 help=help_text,
             )
+
+
+# ======================================================================
+# INLINE SLASH-COMMAND MATCHING (same catalog as Ctrl+P)
+# ======================================================================
+
+_SLASH_ARGUMENT_COMMANDS = frozenset({"/run", "/shot", "/search", "/export"})
+_SLASH_SUGGESTION_LIMIT = 7
+
+
+def _slash_command_matches(
+    text: str, limit: int = _SLASH_SUGGESTION_LIMIT,
+) -> List[tuple[str, str]]:
+    """Rank actual slash commands by prefix, substring, then fuzzy match.
+
+    No LLM call and no speculative suggestions: every result is an
+    executable command in AgentCommandProvider.COMMANDS.
+    """
+    if not re.fullmatch(r"/[a-zA-Z0-9_-]*", text or ""):
+        return []
+    needle = text[1:].casefold()
+    found: List[tuple[int, int, str, str]] = []
+    for order, (command, description) in enumerate(AgentCommandProvider.COMMANDS):
+        word = command.lstrip("/").casefold()
+        if not needle or word.startswith(needle):
+            rank = 0
+        elif needle in word:
+            rank = 1
+        else:
+            chars = iter(word)
+            if not all(any(char == c for c in chars) for char in needle):
+                continue
+            rank = 2
+        found.append((rank, order, command, description))
+    found.sort(key=lambda item: (item[0], item[1]))
+    return [(command, description) for _, _, command, description in found[:max(1, limit)]]
 
 
 # ======================================================================
@@ -1601,6 +1662,7 @@ class HelpPanel(Vertical):
         yield Static("/model     open LLM panel + discover models", classes="help-row")
         yield Static("/models    discover models", classes="help-row")
         yield Static("/aws       open AWS panel", classes="help-row")
+        yield Static("/mcp       open MCP status and reconnect panel", classes="help-row")
         yield Static("/profile   open profile panel", classes="help-row")
         yield Static("/context   open context panel", classes="help-row")
         yield Static("/llmcost   open token + api cost panel", classes="help-row")
@@ -1872,6 +1934,33 @@ class DepressionApp(App):
         padding: 1 0 0 2; margin: 0 0 0 2;
     }}
     #prompt-row {{ height: auto; layout: horizontal; }}
+    #command-menu {{
+        display: none;
+        height: auto;
+        max-height: 10;
+        border: round {BORDER};
+        background: {PANEL};
+        padding: 0 1;
+        margin: 0 1 1 0;
+    }}
+    #command-menu-title {{
+        height: 1;
+        color: {GREEN};
+        text-style: bold;
+    }}
+    #command-options {{
+        height: auto;
+        max-height: 7;
+        background: {PANEL};
+        color: {TEXT};
+        border: none;
+        scrollbar-size-vertical: 1;
+    }}
+    #command-options > .option-list--option-highlighted {{
+        background: {GREEN_DIM};
+        color: {BG};
+        text-style: bold;
+    }}
     #prompt-sign {{
         width: 2; height: auto;
         color: {GREEN};
@@ -1941,6 +2030,10 @@ class DepressionApp(App):
         self._prompt_history: List[str] = []
         self._history_index = -1
         self._history_draft = ""
+        self._command_menu_open = False
+        self._command_suggestion_matches: List[tuple[str, str]] = []
+        self._command_suggestion_index = 0
+        self._command_suppressed_text: Optional[str] = None
         self._last_prompt = ""
         self._last_output = ""
         self._transcript_log: List[Dict[str, Any]] = []
@@ -1991,6 +2084,7 @@ class DepressionApp(App):
                 panels=[
                     ("llm", LLMPanel(self, id="panel-llm")),
                     ("aws", AWSPanel(self, id="panel-aws")),
+                    ("mcp", MCPPanel(self, id="panel-mcp")),
                     ("profile", ProfilePanel(id="panel-profile")),
                     ("context", ContextPanel(self, id="panel-context")),
                     ("llmcost", LLMCostPanel(self, id="panel-llmcost")),
@@ -2001,13 +2095,20 @@ class DepressionApp(App):
             )
 
         with Vertical(id="prompt-wrap"):
+            with Vertical(id="command-menu"):
+                yield Static(
+                    "COMMANDS  ·  ↑↓ select  ·  Tab insert  ·  Enter run  ·  Esc close",
+                    id="command-menu-title",
+                    markup=False,
+                )
+                yield OptionList(id="command-options")
             with Horizontal(id="prompt-row"):
                 yield Static("›", id="prompt-sign")
                 yield PromptArea(id="prompt")
             yield Static(self._mode_chip(), id="mode-chip", markup=True)
             yield Static(
                 f"[{DIM}]enter submit · shift+enter newline · ctrl+p commands · "
-                f"ctrl+r history · ctrl+space @files · ctrl+f search · "
+                f"type / for commands · ctrl+r history · ctrl+space @files · "
                 f"f2 follow · ctrl+b sidebar · ctrl+q quit[/]",
                 id="hint", markup=True,
             )
@@ -2034,7 +2135,9 @@ class DepressionApp(App):
 
         self._set_active_panel("llm")
 
-        for w in self.query("#sidebar Button, .side-tab"):
+        # Only panel tabs should be skipped during keyboard navigation.
+        # Panel controls (AWS save, MCP reconnect, etc.) must remain focusable.
+        for w in self.query("#sidebar .side-tab"):
             try:
                 w.can_focus = False
             except Exception:
@@ -2410,6 +2513,9 @@ class DepressionApp(App):
         if tool in ("todo", "todowrite", "todoread"):
             self._refresh_todo_from_store(force=True)
 
+        if tool == "mcp" or tool.startswith("mcp__"):
+            self._refresh_mcp_status()
+
         if tool in ("aws",) or tool.startswith("mcp__aws__"):
             try:
                 self.query_one("#panel-aws", AWSPanel).refresh_mcp_status()
@@ -2759,6 +2865,122 @@ class DepressionApp(App):
         self.submit_prompt_text(str(command or ""))
 
     # ------------------------------------------------------------------
+    # INLINE SLASH COMMANDS
+    # ------------------------------------------------------------------
+
+    @on(TextArea.Changed, "#prompt")
+    def _prompt_text_changed(self, event: TextArea.Changed) -> None:
+        """Handle actual typing and paste events from the prompt."""
+        self._update_command_suggestions(event.text_area.text)
+
+    def _update_command_suggestions(self, text: str) -> None:
+        """Update local command matches, without running any slash command."""
+        if text == self._command_suppressed_text:
+            self._hide_command_suggestions()
+            return
+        self._command_suppressed_text = None
+
+        matches = _slash_command_matches(text)
+        if not matches:
+            self._hide_command_suggestions()
+            return
+
+        self._command_suggestion_matches = matches
+        self._command_suggestion_index = 0
+        try:
+            menu = self.query_one("#command-menu", Vertical)
+            options = self.query_one("#command-options", OptionList)
+            options.clear_options()
+            options.add_options([
+                Option(f"{command:<12}  {description}", id=command)
+                for command, description in matches
+            ])
+            options.styles.height = len(matches)
+            options.highlighted = 0
+            menu.display = True
+            self._command_menu_open = True
+        except Exception as exc:
+            self._command_menu_open = False
+            # Visible in Textual / pytest diagnostics; do not swallow UI failures.
+            import logging
+            logging.getLogger(__name__).warning(
+                "Slash command menu update failed: %s", exc, exc_info=True
+            )
+
+    def _hide_command_suggestions(self, *, suppress: bool = False) -> None:
+        """Dismiss suggestions without changing the user's draft."""
+        if suppress:
+            try:
+                self._command_suppressed_text = self.query_one("#prompt", PromptArea).text
+            except Exception:
+                self._command_suppressed_text = None
+        self._command_menu_open = False
+        self._command_suggestion_matches = []
+        self._command_suggestion_index = 0
+        try:
+            self.query_one("#command-menu", Vertical).display = False
+        except Exception:
+            pass
+
+    def _move_command_suggestion(self, step: int) -> None:
+        if not self._command_menu_open or not self._command_suggestion_matches:
+            return
+        count = len(self._command_suggestion_matches)
+        self._command_suggestion_index = (
+            self._command_suggestion_index + step
+        ) % count
+        try:
+            self.query_one("#command-options", OptionList).highlighted = (
+                self._command_suggestion_index
+            )
+        except Exception:
+            pass
+
+    def _accept_command_suggestion(
+        self, command: Optional[str] = None, *, execute: bool = False,
+    ) -> bool:
+        """Fill with Tab; Enter/click executes safe built-in slash dispatch.
+
+        Argument-taking commands are always filled, never run with a
+        missing argument. A bare slash also only fills a suggestion.
+        """
+        matches = self._command_suggestion_matches
+        if not self._command_menu_open or not matches:
+            return False
+        available = {name for name, _ in matches}
+        selected = command if command in available else matches[
+            self._command_suggestion_index
+        ][0]
+        try:
+            prompt = self.query_one("#prompt", PromptArea)
+            draft = prompt.text
+            should_run = (
+                execute
+                and selected not in _SLASH_ARGUMENT_COMMANDS
+                and len(draft.strip()) > 1
+            )
+            replacement = selected + (
+                " " if selected in _SLASH_ARGUMENT_COMMANDS else ""
+            )
+            self._hide_command_suggestions()
+            self._command_suppressed_text = replacement if not should_run else ""
+            prompt.set_prompt_text("" if should_run else replacement)
+            if should_run:
+                self.submit_prompt_text(selected)
+            else:
+                prompt.focus()
+            return True
+        except Exception:
+            return False
+
+    @on(OptionList.OptionSelected, "#command-options")
+    def _command_option_selected(self, event: OptionList.OptionSelected) -> None:
+        selected = getattr(event.option, "id", None)
+        if selected:
+            self._accept_command_suggestion(str(selected), execute=True)
+
+
+    # ------------------------------------------------------------------
     # PROMPT HISTORY / QUICK PICKERS
     # ------------------------------------------------------------------
 
@@ -2997,6 +3219,83 @@ class DepressionApp(App):
         except Exception:
             pass
 
+    def _refresh_mcp_status(self) -> None:
+        try:
+            self.query_one("#panel-mcp", MCPPanel).refresh_status()
+        except Exception:
+            pass
+
+    @on(Button.Pressed, "#mcp-refresh")
+    def _mcp_refresh(self) -> None:
+        self._refresh_mcp_status()
+
+    @on(Button.Pressed, "#mcp-reconnect")
+    def _mcp_reconnect(self) -> None:
+        self._reconnect_mcp()
+
+    @work(exclusive=True, group="mcp-reconnect")
+    async def _reconnect_mcp(self) -> None:
+        """Reconnect configured MCP servers only when the agent is idle.
+
+        Never changes configuration, grants permissions, or invokes MCP tools.
+        New tools are registered conservatively as mutating by default.
+        """
+        if self.busy or self._is_shutting_down:
+            self._system("MCP reconnect unavailable while the agent is running.")
+            return
+        panel = self.query_one("#panel-mcp", MCPPanel)
+        client = panel.get_client()
+        if client is None or not getattr(client, "enabled", False):
+            self._system("MCP is disabled; enable it in the config and restart.")
+            return
+        button = self.query_one("#mcp-reconnect", Button)
+        button.disabled = True
+        try:
+            self._system("Reconnecting configured MCP servers…")
+            await client.reload()
+
+            # MCPClient.reload() discovers tools, but the Build agent's
+            # registry originally receives them only during initialization.
+            coordinator = self.coordinator
+            build = getattr(coordinator, "build_agent", None)
+            registry = getattr(build, "tool_registry", None)
+            if registry is not None:
+                discovered = {
+                    tool["function"]["name"]: tool["function"]
+                    for tool in client.list_tools()
+                }
+                for name in list(registry.list_tools(include_disabled=True)):
+                    if name.startswith("mcp__") and name not in discovered:
+                        registry.unregister_tool(name)
+                for name, schema in discovered.items():
+                    async def _call(_name: str = name, **kwargs: Any) -> Any:
+                        return await client.call_tool(_name, kwargs)
+                    registry.register_external(
+                        name=name,
+                        handler=_call,
+                        description=str(schema.get("description") or ""),
+                        parameters=schema.get("parameters") or {
+                            "type": "object", "properties": {},
+                        },
+                        read_only=False,
+                        mutating=True,
+                        category="cloud" if name.startswith("mcp__aws__") else "misc",
+                    )
+
+                # Rebuild pinned system prompts after schema changes.
+                loop = getattr(build, "loop", None)
+                if loop is not None:
+                    loop._system_prompt_cache = None
+                    loop._system_prompt_fp = None
+
+            self._system("MCP reconnect finished; check server status for failures.")
+        except Exception as exc:
+            self._error("MCP reconnect failed: " + type(exc).__name__)
+        finally:
+            self._refresh_mcp_status()
+            if not self.busy and not self._is_shutting_down:
+                button.disabled = False
+
     def _refresh_aws_status(self) -> None:
         try:
             self.query_one("#panel-aws", AWSPanel).refresh_mcp_status()
@@ -3043,6 +3342,8 @@ class DepressionApp(App):
             self._refresh_context_panel()
         if which == "aws":
             self._refresh_aws_status()
+        if which == "mcp":
+            self._refresh_mcp_status()
         if which == "llmcost":
             self._refresh_llmcost_panel()
         if which == "profile":
@@ -3194,6 +3495,8 @@ class DepressionApp(App):
                 self.query_one("#aws-key", Input).focus()
             except Exception:
                 pass
+        elif command == "/mcp":
+            self._show_panel("mcp")
         elif command == "/connect":
             self._show_panel("llm")
             try:
@@ -4013,6 +4316,9 @@ class DepressionApp(App):
     # ------------------------------------------------------------------
 
     def action_tab_or_mode(self) -> None:
+        if self._command_menu_open:
+            self._accept_command_suggestion(execute=False)
+            return
         try:
             prompt = self.query_one("#prompt", PromptArea)
             if not prompt.disabled and not prompt.has_focus:
@@ -4023,6 +4329,9 @@ class DepressionApp(App):
         self.action_cycle_mode()
 
     def action_interrupt(self) -> None:
+        if self._command_menu_open and not isinstance(self.screen, ModalScreen):
+            self._hide_command_suggestions(suppress=True)
+            return
         if isinstance(self.screen, PermissionModal):
             self.screen.action_deny()
             return
