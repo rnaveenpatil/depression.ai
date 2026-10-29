@@ -2370,11 +2370,6 @@ class DepressionApp(App):
     def check_action(
         self, action: str, parameters: tuple[object, ...]
     ) -> bool | None:
-        # Escape dismisses suggestions without interrupting a running agent.
-        if (action == "interrupt" and self._command_menu_open
-                and not isinstance(self.screen, ModalScreen)):
-            self._hide_command_suggestions(suppress=True)
-            return False
         # Modals own their keys; app shortcuts must not fire behind them.
         if isinstance(self.screen, ModalScreen) and action in {
             "tab_or_mode",
@@ -4334,6 +4329,9 @@ class DepressionApp(App):
         self.action_cycle_mode()
 
     def action_interrupt(self) -> None:
+        if self._command_menu_open and not isinstance(self.screen, ModalScreen):
+            self._hide_command_suggestions(suppress=True)
+            return
         if isinstance(self.screen, PermissionModal):
             self.screen.action_deny()
             return
