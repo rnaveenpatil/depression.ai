@@ -275,16 +275,16 @@ class PromptArea(TextArea):
 
     def on_text_area_changed(self, event: TextArea.Changed) -> None:
         self._resize()
-        # Forward live edits to the inline slash-command menu.
-        try:
-            self.app._update_command_suggestions(self.text)
-        except (AttributeError, LookupError):
-            pass
 
     def set_prompt_text(self, text: str) -> None:
         """Replace the prompt text and move the cursor to the end."""
         self.text = text or ""
         self._resize()
+        # Programmatic updates don't always emit TextArea.Changed.
+        try:
+            self.app._update_command_suggestions(self.text)
+        except (AttributeError, LookupError):
+            pass
         try:
             loc = self.document.get_location_from_index(len(self.text))
             self.cursor_location = loc
@@ -2875,6 +2875,11 @@ class DepressionApp(App):
     # ------------------------------------------------------------------
     # INLINE SLASH COMMANDS
     # ------------------------------------------------------------------
+
+    @on(TextArea.Changed, "#prompt")
+    def _prompt_text_changed(self, event: TextArea.Changed) -> None:
+        """Handle actual typing and paste events from the prompt."""
+        self._update_command_suggestions(event.text_area.text)
 
     def _update_command_suggestions(self, text: str) -> None:
         """Update local command matches, without running any slash command."""
