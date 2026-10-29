@@ -281,10 +281,7 @@ class PromptArea(TextArea):
         self.text = text or ""
         self._resize()
         # Programmatic updates don't always emit TextArea.Changed.
-        try:
-            self.app._update_command_suggestions(self.text)
-        except (AttributeError, LookupError):
-            pass
+        self.app._update_command_suggestions(self.text)
         try:
             loc = self.document.get_location_from_index(len(self.text))
             self.cursor_location = loc
