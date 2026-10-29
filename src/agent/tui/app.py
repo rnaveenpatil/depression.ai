@@ -758,7 +758,7 @@ class AgentCommandProvider(Provider):
 
     COMMANDS = [
         ("/connect", "Configure the LLM connection"),
-        ("/model", "Open the LLM panel and discover models"),
+        ("/model", "Paste your model ID into the LLM panel"),
         ("/models", "Discover models from the provider"),
         ("/sessions", "Open saved sessions"),
         ("/retry", "Retry the last prompt"),
@@ -888,17 +888,8 @@ class LLMPanel(Vertical):
         yield Static("Model ID", classes="label")
         yield Input(value=self._app.cfg["model"], id="model-id",
                     placeholder="provider/model-id")
-        yield Static("Discovered Models", classes="label")
-        yield Select(
-            [], prompt="discover models to choose",
-            allow_blank=True, id="model-select",
-        )
         yield Button("CONNECT", id="connect")
-        yield Horizontal(
-            Button("TEST", id="llm-test"),
-            Button("MODELS", id="discover"),
-            id="llm-actions",
-        )
+        yield Button("TEST CONNECTION", id="llm-test")
         yield Static("", id="llm-status", classes="system")
         yield Static("", id="llm-provider", classes="system")
 
@@ -1659,7 +1650,7 @@ class HelpPanel(Vertical):
         yield Static(f"[bold {GREEN}]▌ HELP[/]", markup=True)
         yield Static("Commands", classes="help-section")
         yield Static("/connect   open LLM panel", classes="help-row")
-        yield Static("/model     open LLM panel + discover models", classes="help-row")
+        yield Static("/model     edit LLM model ID", classes="help-row")
         yield Static("/models    discover models", classes="help-row")
         yield Static("/aws       open AWS panel", classes="help-row")
         yield Static("/mcp       open MCP status and reconnect panel", classes="help-row")
@@ -3233,6 +3224,54 @@ class DepressionApp(App):
     def _mcp_reconnect(self) -> None:
         self._reconnect_mcp()
 
+    @on(Button.Pressed, "#mcp-save")
+    def _mcp_save_pressed(self) -> None:
+        self._save_mcp_connection()
+
+    @work(exclusive=True, group="mcp-save")
+    async def _save_mcp_connection(self) -> None:
+        """Save pasted MCP connection safely; attempt live hookup if possible."""
+        panel = self.query_one("#panel-mcp", MCPPanel)
+        if self.busy or self._is_shutting_down:
+            panel.set_save_status("Stop the running agent before changing MCP servers.")
+            return
+        button = self.query_one("#mcp-save", Button)
+        button.disabled = True
+        try:
+            from agent.tui.mcp_config_ui import save_mcp_server
+            saved = save_mcp_server(panel.connection_values())
+            panel.set_save_status(f"Saved {saved['name']} ({saved['transport']}). Connecting…")
+            client = panel.get_client()
+            if client is None:
+                if self.coordinator is None:
+                    panel.set_save_status("Saved privately. Restart to activate MCP servers.")
+                    return
+                from agent.mcp.client import MCPClient
+                client = MCPClient(saved["config"])
+                for role in ("plan_agent", "build_agent"):
+                    agent = getattr(self.coordinator, role, None)
+                    if agent is not None:
+                        agent.mcp_client = client
+            else:
+                client.config = saved["config"]
+                client.enabled = True
+            await self._reload_mcp_client(client)
+            connected = saved["name"] in getattr(client, "transports", {})
+            if connected:
+                panel.set_save_status(f"Connected: {saved['name']}")
+            else:
+                panel.set_save_status(
+                    f"Saved {saved['name']}; server connection unsuccessful. "
+                    "Check URL, command, and credentials."
+                )
+        except ValueError as exc:
+            panel.set_save_status(f"Invalid connection: {exc}")
+        except Exception as exc:
+            panel.set_save_status(f"Could not save/connect: {type(exc).__name__}")
+        finally:
+            button.disabled = False
+            panel.refresh_status()
+
     @work(exclusive=True, group="mcp-reconnect")
     async def _reconnect_mcp(self) -> None:
         """Reconnect configured MCP servers only when the agent is idle.
@@ -3252,41 +3291,7 @@ class DepressionApp(App):
         button.disabled = True
         try:
             self._system("Reconnecting configured MCP servers…")
-            await client.reload()
-
-            # MCPClient.reload() discovers tools, but the Build agent's
-            # registry originally receives them only during initialization.
-            coordinator = self.coordinator
-            build = getattr(coordinator, "build_agent", None)
-            registry = getattr(build, "tool_registry", None)
-            if registry is not None:
-                discovered = {
-                    tool["function"]["name"]: tool["function"]
-                    for tool in client.list_tools()
-                }
-                for name in list(registry.list_tools(include_disabled=True)):
-                    if name.startswith("mcp__") and name not in discovered:
-                        registry.unregister_tool(name)
-                for name, schema in discovered.items():
-                    async def _call(_name: str = name, **kwargs: Any) -> Any:
-                        return await client.call_tool(_name, kwargs)
-                    registry.register_external(
-                        name=name,
-                        handler=_call,
-                        description=str(schema.get("description") or ""),
-                        parameters=schema.get("parameters") or {
-                            "type": "object", "properties": {},
-                        },
-                        read_only=False,
-                        mutating=True,
-                        category="cloud" if name.startswith("mcp__aws__") else "misc",
-                    )
-
-                # Rebuild pinned system prompts after schema changes.
-                loop = getattr(build, "loop", None)
-                if loop is not None:
-                    loop._system_prompt_cache = None
-                    loop._system_prompt_fp = None
+            await self._reload_mcp_client(client)
 
             self._system("MCP reconnect finished; check server status for failures.")
         except Exception as exc:
@@ -3295,6 +3300,45 @@ class DepressionApp(App):
             self._refresh_mcp_status()
             if not self.busy and not self._is_shutting_down:
                 button.disabled = False
+
+    async def _reload_mcp_client(self, client: Any) -> None:
+        """Reload MCP and sync Build tools without changing agent permissions."""
+        await client.reload()
+
+        # MCPClient.reload() discovers tools, but the Build agent's
+        # registry originally receives them only during initialization.
+        coordinator = self.coordinator
+        build = getattr(coordinator, "build_agent", None)
+        registry = getattr(build, "tool_registry", None)
+        if registry is not None:
+            discovered = {
+                tool["function"]["name"]: tool["function"]
+                for tool in client.list_tools()
+            }
+            for name in list(registry.list_tools(include_disabled=True)):
+                if name.startswith("mcp__") and name not in discovered:
+                    registry.unregister_tool(name)
+            for name, schema in discovered.items():
+                async def _call(_name: str = name, **kwargs: Any) -> Any:
+                    return await client.call_tool(_name, kwargs)
+                registry.register_external(
+                    name=name,
+                    handler=_call,
+                    description=str(schema.get("description") or ""),
+                    parameters=schema.get("parameters") or {
+                        "type": "object", "properties": {},
+                    },
+                    read_only=False,
+                    mutating=True,
+                    category="cloud" if name.startswith("mcp__aws__") else "misc",
+                )
+
+            # Rebuild pinned system prompts after schema changes.
+            loop = getattr(build, "loop", None)
+            if loop is not None:
+                loop._system_prompt_cache = None
+                loop._system_prompt_fp = None
+
 
     def _refresh_aws_status(self) -> None:
         try:
@@ -3503,7 +3547,13 @@ class DepressionApp(App):
                 self.query_one("#base-url", Input).focus()
             except Exception:
                 pass
-        elif command in ("/models", "/model"):
+        elif command == "/model":
+            self._show_panel("llm")
+            try:
+                self.query_one("#model-id", Input).focus()
+            except Exception:
+                pass
+        elif command == "/models":
             self._show_panel("llm")
             self._discover_models()
         elif command == "/profile":
@@ -4116,8 +4166,8 @@ class DepressionApp(App):
         api_key = key_input.value.strip()
         model = self.query_one("#model-id", Input).value.strip()
         status = self.query_one("#llm-status", Static)
-        if not base_url or not api_key or not model:
-            status.update("base URL, API key and model are required")
+        if not base_url or not model:
+            status.update("base URL and model ID are required (API key optional locally)")
             return
         try:
             provider = configure_runtime_provider(
@@ -4143,19 +4193,6 @@ class DepressionApp(App):
     @on(Button.Pressed, "#discover")
     def discover_llm(self) -> None:
         self._discover_models()
-
-    @on(Select.Changed, "#model-select")
-    def _model_selected(self, event: Select.Changed) -> None:
-        value = event.value
-        if value is Select.BLANK or value is None:
-            return
-        try:
-            self.query_one("#model-id", Input).value = str(value)
-            self.query_one("#llm-status", Static).update(
-                f"selected model · {_esc(str(value))}"
-            )
-        except Exception:
-            pass
 
     @on(Button.Pressed, "#llm-test")
     def test_llm_button(self) -> None:
@@ -4208,15 +4245,7 @@ class DepressionApp(App):
                 models = response.json().get("data", [])
             ids = [str(m.get("id")) for m in models if m.get("id")]
             if ids:
-                try:
-                    self.query_one("#model-select", Select).set_options(
-                        [(mid, mid) for mid in ids]
-                    )
-                except Exception:
-                    pass
-                status.update(
-                    f"discovered {len(ids)} model(s); choose one from the list"
-                )
+                status.update(f"discovered {len(ids)} model(s); paste the desired ID into Model ID")
                 self._system("models: " + ", ".join(ids[:12]))
             else:
                 status.update("/models returned no model IDs")
