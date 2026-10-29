@@ -289,15 +289,10 @@ class ToolRegistry:
         model tool selection) without ever hiding a tool the runtime can
         still dispatch.
         """
-        cats = set(INTENT_CATEGORIES.get(intent or "unknown", INTENT_CATEGORIES["unknown"]))
-        cats |= ALWAYS_VISIBLE_CATEGORIES
-
-        out: List[Dict[str, Any]] = []
-        for schema in self.get_schemas():
-            name = schema["function"]["name"]
-            if self.get_category(name) in cats:
-                out.append(schema)
-        return out or self.get_schemas()
+        # Intent is advisory, not an authority to hide tools. The model
+        # can change its approach as it learns more about the user's goal.
+        # Permission checks remain in the execution path, not here.
+        return self.get_schemas()
 
     def estimate_schema_tokens(self, schemas: Optional[List[Dict[str, Any]]] = None) -> int:
         """
