@@ -79,9 +79,9 @@ def test_all_credentials_share_one_private_file(tmp_path, monkeypatch):
 def test_global_credentials_override_legacy_project_file(tmp_path, monkeypatch):
     project = tmp_path / ".env"
     project.write_text(
-        "DEPRESSION_API_KEY=old-llm\\n"
-        "AWS_ACCESS_KEY_ID=OLD_ID\\n"
-        "AWS_SECRET_ACCESS_KEY=old-secret\\n"
+        "DEPRESSION_API_KEY=old-llm\n"
+        "AWS_ACCESS_KEY_ID=OLD_ID\n"
+        "AWS_SECRET_ACCESS_KEY=old-secret\n"
     )
     private_env = tmp_path / "env"
     em.write_env_file({
@@ -99,7 +99,7 @@ def test_global_credentials_override_legacy_project_file(tmp_path, monkeypatch):
 
 def test_legacy_project_credentials_remain_readable(tmp_path, monkeypatch):
     project = tmp_path / ".env"
-    project.write_text("DEPRESSION_API_KEY=legacy-llm\\n")
+    project.write_text("DEPRESSION_API_KEY=legacy-llm\n")
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(em, "GLOBAL_ENV_PATH", tmp_path / "not-yet-created")
     assert em.get_env_var("DEPRESSION_API_KEY") == "legacy-llm"
