@@ -2907,8 +2907,13 @@ class DepressionApp(App):
             options.highlighted = 0
             menu.display = True
             self._command_menu_open = True
-        except Exception:
+        except Exception as exc:
             self._command_menu_open = False
+            # Visible in Textual / pytest diagnostics; do not swallow UI failures.
+            import logging
+            logging.getLogger(__name__).warning(
+                "Slash command menu update failed: %s", exc, exc_info=True
+            )
 
     def _hide_command_suggestions(self, *, suppress: bool = False) -> None:
         """Dismiss suggestions without changing the user's draft."""
