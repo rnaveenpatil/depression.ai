@@ -168,19 +168,17 @@ def test_secret_field_is_prefilled_with_stored_secret():
 def _isolate_real_env_files(monkeypatch, tmp_path):
     """Belt-and-braces: no test in this module may touch the real .env."""
     monkeypatch.setattr(em, "find_env_file", lambda: tmp_path / ".env")
+    monkeypatch.setattr(em, "GLOBAL_ENV_PATH", tmp_path / "env")
     monkeypatch.setenv("HOME", str(tmp_path))
 
 
 def test_save_reports_secret_replaced(monkeypatch, tmp_path):
-    env = tmp_path / ".env"
+    env = tmp_path / "env"
     store = {}
     panel = _Panel(None, store)
 
-    # CRITICAL: redirect EnvManager's own write target too, not just the
-    # panel's verification path. save_aws_credentials() calls
-    # find_env_file() internally, which would otherwise write the real
-    # project .env.
-    monkeypatch.setattr(em, "find_env_file", lambda: env)
+    # The global user-store path is patched by the isolation fixture.
+    # Keep this override as verification against the exact save destination.
     monkeypatch.setattr(
         "agent.tui.widgets.aws_panel._written_env_path", lambda: str(env)
     )
@@ -216,7 +214,7 @@ def test_save_keeps_stored_secret_when_field_left_alone(monkeypatch, tmp_path):
     Because the field now holds the real stored value, 'unchanged' is
     detected by comparing the typed value to the canonical one.
     """
-    env = tmp_path / ".env"
+    env = tmp_path / "env"
     store = {
         "access_key": "AKIAKEEP",
         "secret_key": "keepme",
@@ -249,7 +247,7 @@ def test_save_keeps_stored_secret_when_field_left_alone(monkeypatch, tmp_path):
 
 
 def test_save_with_empty_secret_keeps_stored_one(monkeypatch, tmp_path):
-    env = tmp_path / ".env"
+    env = tmp_path / "env"
     store = {
         "access_key": "AKIAKEEP",
         "secret_key": "keepme",
