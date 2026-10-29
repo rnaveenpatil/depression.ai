@@ -41,6 +41,11 @@ class SidebarTab(Static):
             super().__init__()
             self.tab = tab
 
+        @property
+        def control(self) -> "SidebarTab":
+            """Source widget for Textual's @on selector matching."""
+            return self.tab
+
     def _activate(self) -> None:
         self.post_message(self.Pressed(self))
 
