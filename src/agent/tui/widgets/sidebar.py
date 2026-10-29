@@ -60,21 +60,38 @@ class Sidebar(Vertical):
     }}
     Sidebar #side-tabs {{
         height: auto;
-        layout: vertical;
         background: {BG};
         border-bottom: solid {BORDER};
+        padding: 0 1;
+    }}
+    Sidebar .side-tab-row {{
+        height: 1;
+        width: 100%;
+        layout: horizontal;
     }}
     Sidebar .side-tab {{
-        width: 100%;
+        width: 1fr;
         min-width: 0;
         height: 1;
         background: transparent;
         border: none;
-        color: {DIM};
+        color: {MUTED};
+        text-style: bold;
+        padding: 0 1;
+    }}
+    Sidebar .side-tab:hover {{
+        background: {BORDER};
+        color: {TEXT};
+    }}
+    Sidebar .side-tab:focus {{
+        background: {BORDER};
+        color: {GREEN_GLOW};
+    }}
+    Sidebar .side-tab.active {{
+        background: {BORDER};
+        color: {GREEN};
         text-style: bold;
     }}
-    Sidebar .side-tab:hover {{ color: {MUTED}; }}
-    Sidebar .side-tab.active {{ color: {GREEN}; }}
     Sidebar #side-content {{
         height: 1fr;
         overflow-y: auto;
@@ -95,11 +112,20 @@ class Sidebar(Vertical):
 
     def compose(self) -> ComposeResult:
         yield Static("▌ SIDEBAR", id="side-title", markup=True)
+        # Two tabs per row: four compact rows instead of eight full rows.
+        # This gives pasteable connection forms much more usable height.
         with Vertical(id="side-tabs"):
-            for i, (name, _widget) in enumerate(self._panel_widgets):
-                label = name.upper()[:12]
-                yield Button(label, id=f"tab-{name}",
-                             classes="side-tab" + (" active" if i == 0 else ""))
+            short_labels = {"llmcost": "COST", "context": "CONTEXT"}
+            for i in range(0, len(self._panel_widgets), 2):
+                with Horizontal(classes="side-tab-row"):
+                    for idx, (name, _widget) in enumerate(self._panel_widgets[i:i + 2]):
+                        label = short_labels.get(name, name.upper())
+                        yield Button(
+                            label, id=f"tab-{name}",
+                            classes="side-tab" + (
+                                " active" if i + idx == 0 else ""
+                            ),
+                        )
         with VerticalScroll(id="side-content"):
             for _name, widget in self._panel_widgets:
                 yield widget

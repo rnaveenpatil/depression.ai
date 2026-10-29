@@ -1,7 +1,7 @@
 """Paste-first MCP/LLM UI regression tests."""
 import json
 import pytest
-from textual.widgets import Button, Input, Select, TextArea
+from textual.widgets import Button, Input, TextArea
 from agent.tui.app import DepressionApp
 from agent.tui.mcp_config_ui import save_mcp_server
 
@@ -49,6 +49,8 @@ async def test_manual_llm_fields_and_mcp_form():
         assert app.query_one("#mcp-name", Input)
         assert app.query_one("#mcp-url", Input)
         assert app.query_one("#mcp-token", Input).password
-        assert app.query_one("#mcp-transport", Select)
+        assert app.query_one("#mcp-mode-http", Button)
+        assert app.query_one("#mcp-mode-local", Button)
+        assert app.query_one("#mcp-mode-json", Button)
         assert app.query_one("#mcp-paste", TextArea)
         assert app.query_one("#mcp-save", Button)
