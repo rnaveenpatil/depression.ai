@@ -1486,7 +1486,11 @@ For AWS work, set your AWS credentials and region in the same config.
 
 # 🔧 Environment Configuration
 
-You can use environment variables where supported:
+**Unified credential storage:** Credentials saved through the LLM, AWS, and MCP panels now live in the same private user file: `~/.agent/env` (owner-only permissions on supported systems). MCP server metadata such as URLs and command arguments remains in `~/.agent/config.json`, without plain-text tokens.
+
+Existing credentials in a project `.env` remain readable for compatibility. The agent does **not silently delete** legacy project secrets; after reconnecting/saving them to the unified file, review old project `.env` files and remove any duplicate secrets yourself. Keep both locations out of version control. These files are local, **not encrypted**, and remote providers still receive data necessary for their API calls.
+
+You can also use environment variables where supported:
 
 ```bash
 export DEPRESSION_PROVIDER=custom
