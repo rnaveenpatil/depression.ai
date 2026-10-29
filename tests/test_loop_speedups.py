@@ -123,17 +123,17 @@ class ExecAgent:
 
 
 @pytest.mark.asyncio
-async def test_single_read_tool_uses_fast_path():
+async def test_single_read_tool_uses_model_summary():
     llm = ReadLLM()
     loop = AgentLoop(
         ExecAgent(), llm, SimpleNamespace(tools={}), None,
-        {"enable_intent_classification": False, "enable_planning": False},
+        {"enable_intent_classification": False, "enable_planning": False, "require_demo_offer": False},
     )
     result = await loop.run("read a.txt")
     assert result["success"] is True, result
-    assert result["response"] == "hello world file content"
+    assert result["response"] == "final summary"
     assert result["tool_calls"] == 1
-    assert llm.calls == 1
+    assert llm.calls == 2
 
 
 @pytest.mark.asyncio
