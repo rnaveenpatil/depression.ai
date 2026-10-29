@@ -20,9 +20,8 @@ Secret field contract:
       from the stored one, "secret unchanged" otherwise.
 
 Storage contract:
-    * Credentials are written via EnvManager to the PROJECT env file
-      (find_env_file(), mode 0600) — the checkout owns its own
-      credentials.
+    * Credentials are written via EnvManager to the private USER env file
+      (~/.agent/env, mode 0600) shared with LLM and MCP credentials.
     * EnvManager mirrors them into os.environ and notifies subscribers,
       so the MCP client, aws_helper, and terminal subprocesses see the
       change without a restart.
@@ -134,23 +133,8 @@ def _global_env_path() -> Optional[str]:
 
 
 def _written_env_path() -> Optional[str]:
-    """
-    Return the env file that AWS credentials are actually WRITTEN to.
-
-    ``EnvManager.save_aws_credentials()`` persists creds to
-    ``find_env_file()`` (the project-scoped ``.env``), so verification must
-    target that same file. Checking ``~/.agent/env`` instead produced false
-    failures (creds saved fine but "env file was not created" / "missing
-    AWS_ACCESS_KEY_ID"), and false successes whenever a stale
-    ``AWS_ACCESS_KEY_ID=`` line was left behind in the global file.
-    """
-    try:
-        from agent.utils.env_manager import find_env_file  # type: ignore
-
-        return str(find_env_file())
-    except Exception:
-        return _global_env_path()
-
+    """Return the canonical private credential store used by all panels."""
+    return _global_env_path()
 
 def _parse_env_text(text: str) -> Dict[str, str]:
     """Parse raw ``KEY=VALUE`` env-file text into a dict."""
@@ -756,9 +740,7 @@ class AWSPanel(Vertical):
             }
 
         # --- verify the write actually landed on disk ---
-        # EnvManager.save_aws_credentials() writes to the PROJECT .env, so
-        # verify THAT file (falling back to the legacy global path only when
-        # the project path cannot be resolved).
+        # Verify the unified user-scoped credential file, not project .env.
         env_path = _written_env_path() or _global_env_path()
         if env_path:
             try:

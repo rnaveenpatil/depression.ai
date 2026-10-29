@@ -3,8 +3,11 @@
 Handles reading/writing .env files for persistent credential storage.
 
 Layout:
-    ~/.agent/env            <- GLOBAL, user-scoped (AWS creds, global toggles)
-    <project>/.env          <- PROJECT-scoped (project vars only, never creds)
+    ~/.agent/env            <- PRIVATE user-scoped LLM, AWS and MCP credentials
+    <project>/.env          <- legacy credentials (read-only fallback) and project vars
+
+All new credentials are saved to ~/.agent/env (mode 0600). Existing project
+.env values remain readable for compatibility; they are never erased silently.
 
 Public API:
     env_manager = EnvManager.get()
@@ -69,6 +72,18 @@ AWS_ENVS = {
 }
 
 SELECTED_MODEL_ENV = "DEPRESSION_SELECTED_MODEL"
+
+# Known application credentials/settings previously written to project .env.
+# Keep a legacy read fallback so updating does not lose existing connections.
+_LEGACY_AGENT_ENV_KEYS = (
+    set(AWS_ENVS.values())
+    | set(PROVIDER_API_KEY_ENVS.values())
+    | set(PROVIDER_BASE_URL_ENVS.values())
+    | {
+        "DEPRESSION_API_KEY", "DEPRESSION_BASE_URL",
+        "DEPRESSION_MODEL", "DEPRESSION_PROVIDER", SELECTED_MODEL_ENV,
+    }
+)
 
 
 # ======================================================================
@@ -224,10 +239,10 @@ class EnvManager:
     def _load_initial(self) -> None:
         """Merge global + project env, then mirror into os.environ."""
         merged: Dict[str, str] = {}
-        # Global first (lower priority)
-        merged.update(load_env_file(GLOBAL_ENV_PATH))
-        # Project overrides for non-secret vars (but NOT AWS — see get_aws_env)
+        # Project settings remain available, but credentials saved in the
+        # private user store always take precedence over legacy .env values.
         merged.update(load_env_file(find_env_file()))
+        merged.update(load_env_file(GLOBAL_ENV_PATH))
 
         for k, v in merged.items():
             os.environ.setdefault(k, v)
@@ -263,10 +278,8 @@ class EnvManager:
     # -- AWS: canonical source --------------------------------------------
 
     def _read_aws_from_disk(self) -> Dict[str, Optional[str]]:
-        """
-        Prefer the PROJECT ``.env`` (where ``save_aws_credentials`` writes),
-        falling back to the global file so pre-existing installs that only
-        have ``~/.agent/env`` keep working.
+        """Prefer the private global store; read old project keys only as
+        a backward-compatible fallback until the user saves them again.
         """
         creds: Dict[str, Optional[str]] = {
             "access_key": None,
@@ -275,7 +288,7 @@ class EnvManager:
             "session_token": None,
         }
 
-        for source in (find_env_file(), GLOBAL_ENV_PATH):
+        for source in (GLOBAL_ENV_PATH, find_env_file()):
             data = load_env_file(source)
             if data.get(AWS_ENVS["access_key"]) and data.get(AWS_ENVS["secret_key"]):
                 creds["access_key"] = data.get(AWS_ENVS["access_key"])
@@ -316,13 +329,10 @@ class EnvManager:
         region: Optional[str] = None,
         session_token: Optional[str] = None,
     ) -> None:
+        """Persist AWS credentials to the private user env file and
+        immediately refresh running AWS consumers.
         """
-        Persist AWS creds to the PROJECT ``.env`` (the checkout owns its own
-        credentials), mirror them into os.environ, bump the generation
-        counter, and notify subscribers.
-        """
-        # AWS creds are PROJECT-scoped: written next to the project's .env.
-        aws_env_path = find_env_file()
+        aws_env_path = GLOBAL_ENV_PATH
         env_vars = load_env_file(aws_env_path)
 
         def _set(key: str, value: Optional[str]) -> None:
@@ -359,7 +369,7 @@ class EnvManager:
         self._generation += 1
         self._notify()
 
-    # -- provider creds (project-scoped, unchanged behavior) -------------
+    # -- provider credentials (private user store by default) -------------
 
     def set_provider_credentials(
         self,
@@ -368,6 +378,7 @@ class EnvManager:
         base_url: Optional[str] = None,
         env_path: Optional[Path] = None,
     ) -> None:
+        env_path = env_path or GLOBAL_ENV_PATH
         env_vars = load_env_file(env_path)
         if api_key is not None:
             key_env = PROVIDER_API_KEY_ENVS.get(provider.lower())
@@ -383,7 +394,7 @@ class EnvManager:
                     env_vars[url_env] = base_url.rstrip("/")
                 else:
                     env_vars.pop(url_env, None)
-        write_env_file(env_vars, env_path)
+        write_env_file(env_vars, env_path, strict=True)
         # Mirror newly set provider vars into os.environ
         for k, v in env_vars.items():
             os.environ[k] = v
@@ -393,10 +404,11 @@ class EnvManager:
     def get_provider_credentials(
         self, provider: str, env_path: Optional[Path] = None
     ) -> Dict[str, Optional[str]]:
-        env_vars = load_env_file(env_path)
+        key_name = PROVIDER_API_KEY_ENVS.get(provider.lower(), "")
+        url_name = PROVIDER_BASE_URL_ENVS.get(provider.lower(), "")
         return {
-            "api_key": env_vars.get(PROVIDER_API_KEY_ENVS.get(provider.lower(), "")),
-            "base_url": env_vars.get(PROVIDER_BASE_URL_ENVS.get(provider.lower(), "")),
+            "api_key": get_env_var(key_name, env_path),
+            "base_url": get_env_var(url_name, env_path),
         }
 
     def set_selected_model(self, model: str, env_path: Optional[Path] = None) -> None:
@@ -412,21 +424,29 @@ class EnvManager:
 # ======================================================================
 
 def set_env_var(key: str, value: str, env_path: Optional[Path] = None) -> None:
-    env_vars = load_env_file(env_path)
+    """Save user-managed values in ~/.agent/env unless a path is explicit."""
+    target = env_path or GLOBAL_ENV_PATH
+    env_vars = load_env_file(target)
     if value:
         env_vars[key] = value
     else:
-        env_vars.pop(key, None)
-    write_env_file(env_vars, env_path)
-    if value:
-        os.environ[key] = value
-    else:
-        os.environ.pop(key, None)
+        # Preserve an explicit empty entry so stale project .env values cannot
+        # silently become active again after the user clears a credential.
+        env_vars[key] = ""
+    write_env_file(env_vars, target, strict=True)
+    os.environ[key] = value
 
 
 def get_env_var(key: str, env_path: Optional[Path] = None) -> Optional[str]:
-    env_vars = load_env_file(env_path)
-    return env_vars.get(key)
+    """Use private user settings first; support legacy project env read-only."""
+    if env_path is not None:
+        return load_env_file(env_path).get(key)
+    global_data = load_env_file(GLOBAL_ENV_PATH)
+    if key in global_data:
+        return global_data[key]
+    if key in _LEGACY_AGENT_ENV_KEYS:
+        return load_env_file(find_env_file()).get(key)
+    return None
 
 
 def set_provider_credentials(
@@ -456,7 +476,7 @@ def set_aws_credentials(
     access_key: Optional[str] = None,
     secret_key: Optional[str] = None,
     region: Optional[str] = None,
-    env_path: Optional[Path] = None,  # ignored for AWS — always global
+    env_path: Optional[Path] = None,  # kept for API compatibility; user store wins
     session_token: Optional[str] = None,
 ) -> None:
     EnvManager.get().save_aws_credentials(
@@ -477,8 +497,12 @@ def get_aws_env() -> Dict[str, str]:
 
 
 def load_into_os_environ(env_path: Optional[Path] = None) -> None:
-    """Load .env variables into os.environ (for subprocesses and late-binding)."""
-    env_vars = load_env_file(env_path)
+    """Load private user env values; legacy project values are fallback only."""
+    if env_path is not None:
+        env_vars = load_env_file(env_path)
+    else:
+        env_vars = load_env_file(find_env_file())
+        env_vars.update(load_env_file(GLOBAL_ENV_PATH))
     for key, value in env_vars.items():
         if key not in os.environ:
             os.environ[key] = value
