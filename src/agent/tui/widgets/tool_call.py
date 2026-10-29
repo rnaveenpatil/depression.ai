@@ -490,6 +490,13 @@ class ToolCallWidget(Vertical):
         if not isinstance(result, dict):
             return f"[{TEXT}]{_esc(result)[:800]}[/]"
 
+        # A multi-file patch may partially fail: show successful diffs
+        # together with each failed file, rather than hiding every edit.
+        if self._tool in _DIFF_TOOLS and isinstance(result.get("results"), list):
+            rendered = self._render_diff(result)
+            if rendered:
+                return rendered
+
         if not result.get("success", True):
             return self._render_error(str(result.get("error") or ""))
 
