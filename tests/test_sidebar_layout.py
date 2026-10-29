@@ -66,3 +66,21 @@ async def test_mcp_connection_details_are_collapsed_by_default():
         assert panel.query_one("#mcp-details").display
         panel._toggle_details()
         assert not panel.query_one("#mcp-details").display
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("screen_width", [80, 100, 120])
+async def test_sidebar_buttons_have_height_for_visible_labels(screen_width):
+    """Catch Textual's one-row Button clipping (seen as green lines)."""
+    app = DepressionApp(coordinator=None, skip_onboarding=True)
+    async with app.run_test(size=(screen_width, 35)) as pilot:
+        app._show_panel("llm")
+        await pilot.pause()
+        sidebar = app.query_one("#sidebar", Sidebar)
+        assert sidebar.is_open
+        for tab in sidebar.query(".side-tab"):
+            assert isinstance(tab, Button)
+            assert tab.region.height >= 3, (tab.id, tab.region)
+            assert tab.region.width >= 8, (tab.id, tab.region)
+        assert app.query_one("#side-content").region.height >= 10
+        assert app.query_one("#base-url", Input).display
