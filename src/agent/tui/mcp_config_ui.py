@@ -1,8 +1,8 @@
 """Safe, paste-friendly MCP server configuration for the Textual UI.
 
 Only explicit Save actions write settings. Connections are stored in the user
-config; tokens and environment values are stored in the private ~/.agent/env
-file, never in the repository or config JSON.
+config; tokens and environment values are stored in the project's private .env
+file, never in config JSON. Keep .env ignored by Git.
 """
 from __future__ import annotations
 
@@ -15,7 +15,7 @@ from typing import Any, Dict
 from urllib.parse import urlsplit
 
 from agent.config.loader import USER_CONFIG_PATH
-from agent.utils.env_manager import GLOBAL_ENV_PATH, write_env_file, write_private_file
+from agent.utils.env_manager import find_env_file, write_env_file, write_private_file
 
 
 _NAME = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
@@ -117,7 +117,7 @@ def save_mcp_server(
     Never interprets a pasted string as a shell command.
     """
     config_path = config_path or USER_CONFIG_PATH
-    env_path = env_path or GLOBAL_ENV_PATH
+    env_path = env_path or find_env_file()
     pasted = _parse_pasted_server(str(values.get("json") or ""))
 
     name = str(pasted.get("name") or values.get("name") or "").strip()
