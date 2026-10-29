@@ -3,7 +3,7 @@ import pytest
 from textual.widgets import Button, Input, TextArea
 from agent.tui.app import DepressionApp
 from agent.tui.widgets.mcp_panel import MCPPanel
-from agent.tui.widgets.sidebar import Sidebar
+from agent.tui.widgets.sidebar import Sidebar, SidebarTab
 
 
 @pytest.mark.asyncio
@@ -79,8 +79,25 @@ async def test_sidebar_buttons_have_height_for_visible_labels(screen_width):
         sidebar = app.query_one("#sidebar", Sidebar)
         assert sidebar.is_open
         for tab in sidebar.query(".side-tab"):
-            assert isinstance(tab, Button)
-            assert tab.region.height >= 3, (tab.id, tab.region)
+            assert isinstance(tab, SidebarTab)
+            assert tab.region.height == 1, (tab.id, tab.region)
             assert tab.region.width >= 8, (tab.id, tab.region)
         assert app.query_one("#side-content").region.height >= 10
         assert app.query_one("#base-url", Input).display
+
+
+@pytest.mark.asyncio
+async def test_one_line_sidebar_tabs_switch_panels_with_click_and_keyboard():
+    app = DepressionApp(coordinator=None, skip_onboarding=True)
+    async with app.run_test(size=(120, 35)) as pilot:
+        app._show_panel("llm")
+        await pilot.pause()
+        tab = app.query_one("#tab-mcp", SidebarTab)
+        await pilot.click("#tab-mcp")
+        await pilot.pause()
+        assert app._active_panel == "mcp"
+        assert tab.has_class("active")
+        app.query_one("#tab-llm", SidebarTab).focus()
+        await pilot.press("enter")
+        await pilot.pause()
+        assert app._active_panel == "llm"

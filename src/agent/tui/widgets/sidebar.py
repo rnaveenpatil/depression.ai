@@ -8,10 +8,12 @@ fixed width. The transition is instant, but the caller can animate the
 
 from __future__ import annotations
 
+from textual import events
 from textual.app import ComposeResult
+from textual.message import Message
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.reactive import reactive
-from textual.widgets import Button, Static
+from textual.widgets import Static
 
 
 GREEN = "#00ff66"
@@ -23,6 +25,39 @@ MUTED = "#3d8c5c"
 DIM = "#1a5c33"
 BG = "#000000"
 BORDER = "#0a3d20"
+
+
+class SidebarTab(Static):
+    """One-line, click/keyboard accessible sidebar tab.
+
+    Textual Button needs three terminal rows to draw its border, so using it
+    at height=1 clips its label. Static renders readable text in one row.
+    """
+
+    can_focus = True
+
+    class Pressed(Message):
+        def __init__(self, tab: "SidebarTab") -> None:
+            super().__init__()
+            self.tab = tab
+
+        @property
+        def control(self) -> "SidebarTab":
+            """Source widget for Textual's @on selector matching."""
+            return self.tab
+
+    def _activate(self) -> None:
+        self.post_message(self.Pressed(self))
+
+    def on_click(self, event: events.Click) -> None:
+        event.stop()
+        self._activate()
+
+    def on_key(self, event: events.Key) -> None:
+        if event.key in ("enter", "space"):
+            event.stop()
+            event.prevent_default()
+            self._activate()
 
 
 class Sidebar(Vertical):
@@ -65,19 +100,18 @@ class Sidebar(Vertical):
         padding: 0 1;
     }}
     Sidebar .side-tab-row {{
-        height: 3;
+        height: 1;
         width: 100%;
         layout: horizontal;
     }}
     Sidebar .side-tab {{
         width: 1fr;
         min-width: 0;
-        height: 3;
+        height: 1;
         background: {BG};
-        border: none;
         color: {MUTED};
         text-style: bold;
-        padding: 0;
+        padding: 0 1;
         content-align: center middle;
     }}
     Sidebar .side-tab:hover {{
@@ -113,19 +147,19 @@ class Sidebar(Vertical):
 
     def compose(self) -> ComposeResult:
         yield Static("▌ SIDEBAR", id="side-title", markup=True)
-        # Textual Button requires three rows for reliable label rendering.
-        # One-row buttons clipped their text, leaving green lines instead.
+        # A one-line Static label preserves space without clipping text.
         with Vertical(id="side-tabs"):
             short_labels = {"llmcost": "COST", "context": "CONTEXT"}
             for i in range(0, len(self._panel_widgets), 2):
                 with Horizontal(classes="side-tab-row"):
                     for idx, (name, _widget) in enumerate(self._panel_widgets[i:i + 2]):
                         label = short_labels.get(name, name.upper())
-                        yield Button(
+                        yield SidebarTab(
                             label, id=f"tab-{name}",
                             classes="side-tab" + (
                                 " active" if i + idx == 0 else ""
                             ),
+                            markup=False,
                         )
         with VerticalScroll(id="side-content"):
             for _name, widget in self._panel_widgets:

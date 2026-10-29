@@ -1,38 +1,61 @@
-# depression
+# depression.ai
 
-### `Your A-Z AI depression.ai`
+<p align="center"><strong>YOUR TERMINAL. YOUR TOOLS. YOUR MODEL.</strong></p>
+
+<p align="center">
+  <img alt="Python 3.10+" src="https://img.shields.io/badge/Python-3.10%2B-3776AB?logo=python&logoColor=white">
+  <img alt="MIT License" src="https://img.shields.io/badge/License-MIT-2ea44f">
+  <img alt="Terminal-native" src="https://img.shields.io/badge/Experience-Terminal--native-101010">
+</p>
+
+<p align="center"><em>Your A–Z AI, from a single terminal.</em></p>
 
 <p align="center">
   <img src="https://raw.githubusercontent.com/rnaveenpatil/depression.ai/main/assets/tui.png" alt="depression.ai TUI" width="900">
 </p>
 
+<p align="center"><b>An open-source, local-first AI agent harness for coding, system work, and cloud operations.</b></p>
+
 <p align="center">
-  <b>An AI agent that works in your terminal — for coding, system tasks, analysis and cloud work.</b>
+  <a href="#-quick-start">Get started</a> ·
+  <a href="#-terminal-native-tui">Explore the UI</a> ·
+  <a href="#-llm-integration">Connect your model</a> ·
+  <a href="#-aws-integration">AWS</a> ·
+  <a href="#-security-privacy--data-boundary">Security</a>
 </p>
 
 <p align="center">
-  <b>▶ <a href="https://youtu.be/en5f4pOvfL0">Watch the full 7 minute walkthrough demo on YouTube</a></b>
+  <b>▶ <a href="https://youtu.be/en5f4pOvfL0">Watch the walkthrough demo on YouTube</a></b>
 </p>
 
 ---
 
 ## Start here — in simple words
 
-**depression.ai is an AI helper that works inside your terminal.**
+**Describe the job. Choose your model. Approve the tools.**
 
-You type what you want. The AI looks at your project, makes a plan, uses tools on your computer, checks the result and tells you what it did.
+`depression.ai` runs an AI agent in your terminal. It can inspect project files, plan edits, call tools, learn from tool errors and verify results instead of only returning text.
+
+| You ask | The agent can help with |
+| :-- | :-- |
+| “Why won't this app start?” | Investigate a failure, edit the relevant code, rerun checks |
+| “Build a feature” | Plan, implement, and test the changes |
+| “Inspect my AWS environment” | Use available tools within your AWS IAM permissions |
+| “Use a local model” | Connect a compatible local endpoint without a cloud LLM API |
+
+> **The model reasons; the harness runs tools under your configured permissions.** Results depend on the connected model and the actual tool responses.
 
 * **It can code and fix bugs** — read files, edit code, run tests.
 * **It can work on your system** — run commands, inspect processes, use Git.
 * **It can work with AWS** — inspect and manage cloud resources your keys allow.
 * **It asks before risky actions** — you stay in control.
 * **Credentials stay on your device** — API keys and AWS keys are stored locally and never sent to Team Depression.
-* **Works offline and is open source** — use a local model with no internet, and inspect the code yourself.
+* **Local-model option** — a compatible local LLM can work without remote inference; web and cloud tools still need connectivity.
 * **Google login is optional** — it only personalizes the agent (for example, your name); that profile data stays on your device.
 * **Your chats stay private** — Team Depression does not store your conversation history, and chats are not linked to your Gmail.
 * **You choose the AI model** — use a cloud API or a local model.
 * **No account is required** — install, run `depression --nosignin`, connect a model and start.
-* **It runs anywhere** — Linux, macOS or Windows; laptop, VM, container or server.
+* **Works across platforms** — Python 3.10+ on Linux, macOS and Windows, including VMs and servers.
 
 **Quick start:**
 
@@ -41,7 +64,7 @@ pip install depression.ai
 depression --nosignin
 ```
 
-Then add your LLM API key in the **LLM Connection** panel. That's it.
+Open the **LLM Connection** panel (`/connect`), paste your **Base URL**, **Model ID**, and **API key** if needed, then press **CONNECT**. No model suggestion menu is required.
 
 ---
 
@@ -319,7 +342,17 @@ Everything happens in one workspace:
 * Project context
 * Agent execution feedback
 
-The goal is a workflow like modern terminal coding agents, but also covering system and cloud work.
+The goal is one consistent workflow: **understand → act → observe → verify**.
+
+### Paste-first connection panels
+
+| Panel | What you enter |
+| :-- | :-- |
+| **LLM** (`/connect`) | Base URL, Model ID, API key (if required) |
+| **MCP** (`/mcp`) | HTTP/SSE URL and token, local command, or JSON |
+| **AWS** (`/aws`) | Authorized AWS credentials and region |
+
+The sidebar keeps connection controls editable while additional server details remain collapsed.
 
 ---
 
@@ -1120,6 +1153,14 @@ depression.ai
 
 You can add new capabilities without hard-coding every integration into the core.
 
+### Connect an MCP server
+
+1. Enter `/mcp` and select **HTTP**, **SSE**, **LOCAL**, or **JSON**.
+2. Paste the matching server details (URL and optional token, executable and arguments, or a compatible JSON snippet).
+3. Choose **SAVE & CONNECT**. Expand **CONNECTION DETAILS** to troubleshoot.
+
+Only connect servers you trust. MCP tools can perform sensitive actions; permission checks remain in effect.
+
 ---
 
 # 🔐 Permission System
@@ -1913,7 +1954,7 @@ https://github.com/rnaveenpatil/depression.ai
 </p>
 
 <p align="center">
-  <b><a href="https://youtu.be/en5f4pOvfL0">▶ Watch the full 11-minute walkthrough on YouTube</a></b>
+  <b><a href="https://youtu.be/en5f4pOvfL0">▶ Watch the complete walkthrough on YouTube</a></b>
 </p>
 
 See the complete setup and agent workflow in the official `depression.ai` demo — install with one command, connect your API credentials and start working with the agent on any machine.
@@ -1922,4 +1963,4 @@ See the complete setup and agent workflow in the official `depression.ai` demo �
 
 # 📜 License
 
-This project is released under the **MOODLAKATTE INSTITUTE**.
+This project is released under the **MIT License** (see [LICENSE](LICENSE)). Developed as an academic project at **Moodlakatte Institute of Technology, Kundapura**.
