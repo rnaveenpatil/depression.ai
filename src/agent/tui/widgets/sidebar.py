@@ -59,14 +59,14 @@ class Sidebar(Vertical):
         border-bottom: solid {BORDER};
     }}
     Sidebar #side-tabs {{
-        height: 1;
-        layout: horizontal;
+        height: auto;
+        layout: vertical;
         background: {BG};
         border-bottom: solid {BORDER};
     }}
     Sidebar .side-tab {{
-        width: 1fr;
-        min-width: 8;
+        width: 100%;
+        min-width: 0;
         height: 1;
         background: transparent;
         border: none;
@@ -95,9 +95,9 @@ class Sidebar(Vertical):
 
     def compose(self) -> ComposeResult:
         yield Static("▌ SIDEBAR", id="side-title", markup=True)
-        with Horizontal(id="side-tabs"):
+        with Vertical(id="side-tabs"):
             for i, (name, _widget) in enumerate(self._panel_widgets):
-                label = name.upper()[:8]
+                label = name.upper()[:12]
                 yield Button(label, id=f"tab-{name}",
                              classes="side-tab" + (" active" if i == 0 else ""))
         with VerticalScroll(id="side-content"):
