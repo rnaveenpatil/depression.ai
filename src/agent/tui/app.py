@@ -2374,7 +2374,8 @@ class DepressionApp(App):
         self, action: str, parameters: tuple[object, ...]
     ) -> bool | None:
         # Escape dismisses suggestions without interrupting a running agent.
-        if action == "interrupt" and self._command_menu_open:
+        if (action == "interrupt" and self._command_menu_open
+                and not isinstance(self.screen, ModalScreen)):
             self._hide_command_suggestions(suppress=True)
             return False
         # Modals own their keys; app shortcuts must not fire behind them.
