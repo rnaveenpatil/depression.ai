@@ -1003,7 +1003,7 @@ class MCPClient:
                 env=self._resolve_env(s.get("env", {})),
                 cwd=s.get("cwd"),
                 url=s.get("url"),
-                headers=s.get("headers", {}),
+                headers=self._resolve_env(s.get("headers", {})),
                 api_key=s.get("api_key") or self._resolve_api_key(s),
                 timeout=s.get("timeout", 30.0),
                 auto_reconnect=s.get("auto_reconnect", True),

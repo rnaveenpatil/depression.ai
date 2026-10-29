@@ -108,3 +108,70 @@ async def test_existing_file_reference_and_multiline_input_remain_available():
         await pilot.pause()
         assert "@src/agent/tui/app.py" in prompt.text
         assert not app._command_menu_open
+
+
+@pytest.mark.asyncio
+async def test_one_enter_runs_highlighted_slash_command_from_bare_slash():
+    app = DepressionApp(coordinator=None, skip_onboarding=True)
+    async with app.run_test() as pilot:
+        prompt = app.query_one("#prompt", PromptArea)
+        prompt.focus()
+        prompt.set_prompt_text("/")
+        await pilot.pause()
+        assert app._command_menu_open
+        # Select an explicit harmless panel command; one Enter must execute it.
+        matches = [name for name, _ in app._command_suggestion_matches]
+        app._move_command_suggestion(matches.index("/connect"))
+        await pilot.press("enter")
+        await pilot.pause()
+        assert app._active_panel == "llm"
+        assert not app._command_menu_open
+        assert prompt.text == ""
+
+
+@pytest.mark.asyncio
+async def test_one_enter_opens_filtered_mcp_command():
+    app = DepressionApp(coordinator=None, skip_onboarding=True)
+    async with app.run_test() as pilot:
+        prompt = app.query_one("#prompt", PromptArea)
+        prompt.focus()
+        prompt.set_prompt_text("/mcp")
+        await pilot.pause()
+        await pilot.press("enter")
+        await pilot.pause()
+        assert app._active_panel == "mcp"
+        assert prompt.text == ""
+        assert not app._command_menu_open
+
+
+@pytest.mark.asyncio
+async def test_sidebar_text_entry_is_not_redirected_to_prompt():
+    from textual.widgets import Input
+
+    app = DepressionApp(coordinator=None, skip_onboarding=True)
+    async with app.run_test() as pilot:
+        prompt = app.query_one("#prompt", PromptArea)
+        app._slash("/connect")
+        field = app.query_one("#base-url", Input)
+        field.focus()
+        field.value = ""
+        await pilot.press("h", "t", "t", "p", "s")
+        await pilot.pause()
+        assert field.value == "https"
+        assert prompt.text == ""
+
+
+@pytest.mark.asyncio
+async def test_mcp_connection_fields_accept_keyboard_typing():
+    from textual.widgets import Input
+
+    app = DepressionApp(coordinator=None, skip_onboarding=True)
+    async with app.run_test() as pilot:
+        prompt = app.query_one("#prompt", PromptArea)
+        app._slash("/mcp")
+        field = app.query_one("#mcp-url", Input)
+        field.focus()
+        await pilot.press("h", "t", "t", "p", "s")
+        await pilot.pause()
+        assert field.value == "https"
+        assert prompt.text == ""

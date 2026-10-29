@@ -9,7 +9,7 @@ from typing import Any
 
 from textual.app import ComposeResult
 from textual.containers import Horizontal, Vertical
-from textual.widgets import Button, Static
+from textual.widgets import Button, Static, Input, Select, TextArea
 
 from agent.tui.theme import GREEN, MUTED, TEXT, PANEL, BORDER
 
@@ -37,6 +37,12 @@ class MCPPanel(Vertical):
         color: {MUTED};
         margin-bottom: 1;
     }}
+    MCPPanel .mcp-label {{ color: {MUTED}; height: 1; margin-top: 1; }}
+    MCPPanel Input, MCPPanel Select, MCPPanel TextArea {{
+        border: round {BORDER}; background: {PANEL}; color: {TEXT}; width: 100%;
+    }}
+    MCPPanel Input, MCPPanel Select {{ height: 3; }}
+    MCPPanel #mcp-paste {{ height: 6; }}
     MCPPanel #mcp-actions {{
         height: 3;
         layout: horizontal;
@@ -58,6 +64,26 @@ class MCPPanel(Vertical):
 
     def compose(self) -> ComposeResult:
         yield Static("▌ MCP SERVERS", classes="mcp-heading", markup=False)
+        yield Static("Paste URL, API token, command or JSON, then save.", classes="mcp-muted", markup=False)
+        yield Static("Server name", classes="mcp-label")
+        yield Input(id="mcp-name", placeholder="my-server")
+        yield Static("Transport", classes="mcp-label")
+        yield Select([
+            ("HTTP", "streamable-http"), ("SSE", "sse"),
+            ("Cloud", "cloud"), ("Local command", "stdio"),
+        ], id="mcp-transport", value="streamable-http", allow_blank=False)
+        yield Static("MCP URL", classes="mcp-label")
+        yield Input(id="mcp-url", placeholder="https://example.com/mcp")
+        yield Static("API token (optional)", classes="mcp-label")
+        yield Input(id="mcp-token", password=True, placeholder="Paste API token")
+        yield Static("Local executable (stdio)", classes="mcp-label")
+        yield Input(id="mcp-command", placeholder="npx / uvx / python")
+        yield Static("Arguments (stdio)", classes="mcp-label")
+        yield Input(id="mcp-args", placeholder="-y @package/server")
+        yield Static("Or paste MCP server JSON", classes="mcp-label")
+        yield TextArea("", id="mcp-paste", soft_wrap=True, show_line_numbers=False)
+        yield Button("SAVE & CONNECT", id="mcp-save")
+        yield Static("", id="mcp-save-status", classes="mcp-muted", markup=False)
         yield Static("Checking MCP…", id="mcp-status", classes="mcp-detail", markup=False)
         yield Static("", id="mcp-servers", classes="mcp-detail", markup=False)
         yield Static("", id="mcp-tools", classes="mcp-muted", markup=False)
@@ -65,14 +91,28 @@ class MCPPanel(Vertical):
             yield Button("REFRESH", id="mcp-refresh")
             yield Button("RECONNECT", id="mcp-reconnect")
         yield Static(
-            "Configure servers in ~/.agent/config.json under 'mcp', "
-            "then restart depression.ai. Reconnect retries currently configured servers.",
+            "Paste one Claude-style mcpServers JSON object, or enter a URL. "
+            "Existing servers remain. Reload reconnects configured servers.",
             classes="mcp-muted",
             markup=False,
         )
 
     def on_mount(self) -> None:
         self.refresh_status()
+
+    def connection_values(self) -> dict[str, str]:
+        return {
+            "name": self.query_one("#mcp-name", Input).value,
+            "transport": str(self.query_one("#mcp-transport", Select).value),
+            "url": self.query_one("#mcp-url", Input).value,
+            "api_key": self.query_one("#mcp-token", Input).value,
+            "command": self.query_one("#mcp-command", Input).value,
+            "args": self.query_one("#mcp-args", Input).value,
+            "json": self.query_one("#mcp-paste", TextArea).text,
+        }
+
+    def set_save_status(self, message: str) -> None:
+        self.query_one("#mcp-save-status", Static).update(message)
 
     def get_client(self) -> Any:
         """Find the shared MCP client without creating one or changing settings."""
@@ -94,6 +134,9 @@ class MCPPanel(Vertical):
         reconnect.disabled = (
             client is None or not bool(getattr(client, "enabled", False))
             or bool(getattr(self._host_app, "busy", False))
+        )
+        self.query_one("#mcp-save", Button).disabled = bool(
+            getattr(self._host_app, "busy", False)
         )
         status = self.query_one("#mcp-status", Static)
         servers = self.query_one("#mcp-servers", Static)

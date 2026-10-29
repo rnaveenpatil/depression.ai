@@ -490,6 +490,13 @@ class ToolCallWidget(Vertical):
         if not isinstance(result, dict):
             return f"[{TEXT}]{_esc(result)[:800]}[/]"
 
+        # A multi-file patch may partially fail: show successful diffs
+        # together with each failed file, rather than hiding every edit.
+        if self._tool in _DIFF_TOOLS and isinstance(result.get("results"), list):
+            rendered = self._render_diff(result)
+            if rendered:
+                return rendered
+
         if not result.get("success", True):
             return self._render_error(str(result.get("error") or ""))
 
@@ -584,20 +591,44 @@ class ToolCallWidget(Vertical):
         return "\n".join(lines)
 
     def _render_diff(self, result: Dict[str, Any]) -> str:
-        before = result.get("before") or result.get("content_before") or ""
-        after = (
-            result.get("after")
-            or result.get("content_after")
-            or result.get("new_content")
-            or ""
-        )
-        if not before or not after:
+        """Render only verified file mutations, including empty snapshots."""
+        if result.get("diff_omitted"):
+            return f"[{AMBER}]Diff preview omitted: {_esc(result.get('diff_omitted_reason') or 'file is too large')}[/]"
+
+        # Patch tools return a list of per-file results, not one top-level diff.
+        entries = result.get("results")
+        if isinstance(entries, list):
+            rendered = []
+            for entry in entries:
+                if not isinstance(entry, dict):
+                    continue
+                if not entry.get("success", True):
+                    rendered.append(self._render_error(str(entry.get("error") or "Patch failed")))
+                else:
+                    portion = self._render_single_diff(entry)
+                    if portion:
+                        rendered.append(portion)
+            if rendered:
+                return "\n\n".join(rendered)
+            return ""
+
+        # Filesystem also handles reads, stats and listings: those are not edits.
+        if self._tool == "filesystem" and self._params.get("action") not in (
+            "write", "append", "edit", "delete",
+        ):
+            return ""
+        return self._render_single_diff(result)
+
+    @staticmethod
+    def _render_single_diff(result: Dict[str, Any]) -> str:
+        if result.get("diff_omitted"):
+            return f"[{AMBER}]Diff preview omitted: {_esc(result.get('diff_omitted_reason') or 'file is too large')}[/]"
+        before = result.get("before", result.get("content_before"))
+        after = result.get("after", result.get("content_after"))
+        if not isinstance(before, str) or not isinstance(after, str):
             return ""
         path = str(result.get("path") or "")
-        markup = render_diff(before, after, path=path)
-        if not markup:
-            return ""
-        return markup
+        return render_diff(before, after, path=path)
 
     def _render_bash(self, result: Dict[str, Any]) -> str:
         command = _esc(result.get("command") or self._target())
