@@ -28,8 +28,9 @@ async def test_slash_menu_filters_as_user_types():
     async with app.run_test() as pilot:
         prompt = app.query_one("#prompt", PromptArea)
         prompt.set_prompt_text("/")
+        immediate = (app._command_menu_open, prompt.text, app._command_suggestion_matches)
         await pilot.pause()
-        assert app._command_menu_open
+        assert app._command_menu_open, repr((immediate, prompt.text, app._command_suggestion_matches, app._command_suppressed_text))
         assert app.query_one("#command-menu").display is True
         prompt.set_prompt_text("/mcp")
         await pilot.pause()
