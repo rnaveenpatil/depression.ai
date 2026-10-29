@@ -713,7 +713,9 @@ class AgentLoop:
         return name in self._registry_list_tools()
 
     def _registry_get_schemas(self) -> List[Dict[str, Any]]:
-        for attr, with_intent in (("select_for_task", True), ("get_schemas", False)):
+        # Do not hide capabilities based on an uncertain intent label.
+        # Permissions are still enforced when tools are executed.
+        for attr, with_intent in (("get_schemas", False), ("select_for_task", True)):
             probe = getattr(self.tool_registry, attr, None)
             if not callable(probe):
                 continue
@@ -985,31 +987,16 @@ class AgentLoop:
     # ==================================================================
 
     async def _classify_intent(self, query: str) -> str:
+        """Use the connected model to understand the complete user request.
+
+        Intent is a planning hint, never a permission boundary or tool gate.
+        If classification fails, let the main model decide using all tools.
+        """
         q = (query or "").strip()
         if not q:
             return "ambiguous"
-
         if not self.enable_intent_classification:
             return "unknown"
-
-        lowered = q.lower()
-        if (
-            any(re.match(rf"^{re.escape(p)}\b", lowered) for p in _QUESTION_PREFIXES)
-            and len(q.split()) < 40
-        ):
-            return "question"
-        for kw in ("refactor", "clean up", "rename"):
-            if re.search(rf"\b{re.escape(kw)}\b", lowered):
-                return "refactor"
-        for kw in ("fix", "bug", "error", "crash", "broken", "failing"):
-            if re.search(rf"\b{re.escape(kw)}\b", lowered):
-                return "bugfix"
-        for kw in ("add", "implement", "create", "build", "support for"):
-            if re.search(rf"\b{re.escape(kw)}\b", lowered):
-                return "feature"
-        for kw in ("analyze", "inspect", "review", "audit"):
-            if re.search(rf"\b{re.escape(kw)}\b", lowered):
-                return "analysis"
 
         try:
             self.context.llm_calls += 1
@@ -1018,13 +1005,19 @@ class AgentLoop:
                     Message(
                         role="system",
                         content=(
-                            "Classify the user's request into exactly one "
-                            "category: feature, bugfix, refactor, analysis, "
-                            "question, or ambiguous. Reply with only the "
-                            "category word, lowercase."
+                            "Read the ENTIRE request and infer the outcome the user "
+                            "expects, not just the first word. Classify into exactly "
+                            "one of: feature, bugfix, refactor, analysis, question, "
+                            "ambiguous. Requests to change, repair, build, or "
+                            "implement something are action requests even when "
+                            "phrased as questions. Mixed requests that include an "
+                            "explicit action should be classified by that action. "
+                            "Use analysis only when the user asks to inspect or "
+                            "review without requesting modifications. Return one "
+                            "lowercase category word and nothing else."
                         ),
                     ),
-                    Message(role="user", content=query),
+                    Message(role="user", content=q),
                 ],
                 temperature=0.0,
                 max_tokens=32,
@@ -1063,6 +1056,11 @@ class AgentLoop:
                 self.state = LoopState.ACTING
                 await self._trigger_event("on_phase", {"phase": "acting"})
                 results = await self._act(thought["tool_calls"])
+                if any(
+                    not self._is_read_only(getattr(call, "name", ""))
+                    for call in thought["tool_calls"]
+                ):
+                    self.context.metadata["action_attempted"] = True
 
                 self.state = LoopState.OBSERVING
                 await self._trigger_event("on_phase", {"phase": "observing"})
@@ -1115,15 +1113,32 @@ class AgentLoop:
                     await self._inject_verification_guidance()
                     continue
 
-                fast = await self._maybe_fast_path(thought, results)
-                if fast is not None:
-                    self.state = LoopState.STOPPED
-                    self._update_metrics()
-                    return self._result(True, fast)
-
+                # Always let the model interpret read results and decide
+                # whether further work is needed. A read is not completion.
                 continue
 
             response_text = (thought.get("response") or "").strip()
+
+            # For an action request, do not accept a no-tool final answer
+            # before the agent has attempted an action. Nudge at most once;
+            # the model may then explain a genuine blocker.
+            if (
+                self.context.intent in ("feature", "bugfix", "refactor")
+                and not self.context.metadata.get("action_completion_nudged")
+                and not self.context.metadata.get("action_attempted")
+                and self.context.iteration < self.max_iterations
+            ):
+                self.context.metadata["action_completion_nudged"] = True
+                await self.model_context.add_message(
+                    role="user",
+                    content=(
+                        "The user requested an outcome, not only an explanation. "
+                        "You have not attempted any action yet. Use the appropriate "
+                        "tools to carry it out when authorized, or clearly explain "
+                        "the concrete blocker. Do not claim completion without evidence."
+                    ),
+                )
+                continue
 
             # A single file write/edit is cheap to verify directly. Read it
             # back now instead of spending an extra LLM turn on the simple
@@ -2018,6 +2033,9 @@ Goal: Understand the user → Solve the actual problem → Verify the outcome �
 
  UNDERSTANDING & DECISIONS
 - Understand what the user actually wants, including context, expectations, and implied requirements—not just their exact words.
+- Prioritize the user's intended outcome over superficial keyword labels; questions can contain explicit requests to act.
+- Be creative and resourceful when the user leaves implementation details open, but follow explicit requirements exactly.
+- Do not mistake reading, researching, or planning for completing a requested change.
 - Handle informal language, typos, incomplete requests, and follow-ups naturally.
 - Decide independently how best to accomplish the goal. Choose your own approach, tools, and workflow based on the situation.
 - Make any changes genuinely necessary to achieve the expected outcome, whether small or extensive. Preserve unrelated functionality and user data.
