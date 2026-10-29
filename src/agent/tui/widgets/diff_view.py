@@ -12,6 +12,8 @@ Computes line-level changes from (before, after) text and renders:
 from __future__ import annotations
 
 from dataclasses import dataclass
+import difflib
+from rich.markup import escape
 from typing import Any, List, Optional, Sequence, Tuple
 
 from textual.app import ComposeResult
@@ -38,45 +40,27 @@ class DiffLine:
     new_no: Optional[int] = None
 
 
-def _lcs_matrix(a: Sequence[str], b: Sequence[str]) -> List[List[int]]:
-    n, m = len(a), len(b)
-    dp = [[0] * (m + 1) for _ in range(n + 1)]
-    for i in range(n - 1, -1, -1):
-        for j in range(m - 1, -1, -1):
-            if a[i] == b[j]:
-                dp[i][j] = dp[i + 1][j + 1] + 1
-            else:
-                dp[i][j] = max(dp[i + 1][j], dp[i][j + 1])
-    return dp
+# Even valid 50 KB tool snapshots can contain thousands of tiny lines.
+# Bound worst-case diff processing, and show a clear omission notice instead.
+_MAX_PREVIEW_BYTES = 80 * 1024
+_MAX_PREVIEW_LINES = 3500
 
 
 def compute_line_diff(before: str, after: str, context: int = 3) -> List[DiffLine]:
-    """Return a list of DiffLine for the two texts."""
+    """Return a line diff using SequenceMatcher instead of quadratic DP memory."""
     a = before.splitlines()
     b = after.splitlines()
-
-    dp = _lcs_matrix(a, b)
-
-    # Walk the matrix building the raw edit list.
-    i = j = 0
     raw: List[Tuple[str, str]] = []
-    while i < len(a) and j < len(b):
-        if a[i] == b[j]:
-            raw.append(("ctx", a[i]))
-            i += 1
-            j += 1
-        elif dp[i + 1][j] >= dp[i][j + 1]:
-            raw.append(("del", a[i]))
-            i += 1
+    for tag, i1, i2, j1, j2 in difflib.SequenceMatcher(
+        a=a, b=b, autojunk=True,
+    ).get_opcodes():
+        if tag == "equal":
+            raw.extend(("ctx", value) for value in a[i1:i2])
         else:
-            raw.append(("add", b[j]))
-            j += 1
-    while i < len(a):
-        raw.append(("del", a[i]))
-        i += 1
-    while j < len(b):
-        raw.append(("add", b[j]))
-        j += 1
+            if tag in ("replace", "delete"):
+                raw.extend(("del", value) for value in a[i1:i2])
+            if tag in ("replace", "insert"):
+                raw.extend(("add", value) for value in b[j1:j2])
 
     # Assign line numbers and trim unchanged runs to `context` lines.
     out: List[DiffLine] = []
@@ -136,25 +120,34 @@ def render_diff(
     if before == after:
         return ""
 
+    # Do not freeze the Textual event loop for pathological inputs.
+    if (len(before.encode("utf-8")) > _MAX_PREVIEW_BYTES
+            or len(after.encode("utf-8")) > _MAX_PREVIEW_BYTES
+            or len(before.splitlines()) > _MAX_PREVIEW_LINES
+            or len(after.splitlines()) > _MAX_PREVIEW_LINES):
+        label = f" {escape(path)}:" if path else ""
+        return f"[{AMBER}]Diff preview omitted{label} file is too large; inspect with git diff.[/]"
+
     lines = compute_line_diff(before, after)
     if not lines:
         return ""
 
     header_parts = []
     if path:
-        header_parts.append(f"[bold {AMBER}]{path}[/]")
+        header_parts.append(f"[bold {AMBER}]{escape(path)}[/]")
     added = sum(1 for dl in lines if dl.kind == "add")
     removed = sum(1 for dl in lines if dl.kind == "del")
     header_parts.append(f"[{GREEN}]+{added}[/] [{RED}]-{removed}[/]")
     out = ["  " + "  ".join(header_parts)]
 
+    max_lines = max(1, int(max_lines))
     for line in lines[:max_lines]:
         if line.kind == "hunk":
             out.append(f"[{AMBER}]  {line.text}[/]")
             continue
         old = f"{line.old_no:>4}" if line.old_no is not None else "    "
         new = f"{line.new_no:>4}" if line.new_no is not None else "    "
-        body = line.text.replace("[", r"\[")
+        body = escape(line.text)
         if line.kind == "del":
             out.append(f"[{RED_DIM}]{old}[/] [{RED_DIM}]{new}[/] [{RED}]- {body}[/]")
         elif line.kind == "add":
