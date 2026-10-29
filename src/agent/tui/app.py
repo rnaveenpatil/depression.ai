@@ -3421,8 +3421,19 @@ class DepressionApp(App):
 
     @on(Button.Pressed, ".side-tab")
     def _on_tab(self, event: Button.Pressed) -> None:
-        self._set_active_panel(event.button.id.replace("tab-", ""))
-        self._refocus_prompt()
+        panel = event.button.id.replace("tab-", "")
+        self._set_active_panel(panel)
+        # Connection panels should focus their first editable field.
+        # Do not unexpectedly force the user back to the chat input.
+        try:
+            if panel == "mcp":
+                self.query_one("#panel-mcp", MCPPanel).focus_entry_field()
+            elif panel == "llm":
+                self.query_one("#base-url", Input).focus()
+            else:
+                self._refocus_prompt()
+        except Exception:
+            self._refocus_prompt()
 
     # ------------------------------------------------------------------
     # TRANSCRIPT WRITES
@@ -3555,6 +3566,10 @@ class DepressionApp(App):
                 pass
         elif command == "/mcp":
             self._show_panel("mcp")
+            try:
+                self.query_one("#panel-mcp", MCPPanel).focus_entry_field()
+            except Exception:
+                pass
         elif command == "/connect":
             self._show_panel("llm")
             try:
