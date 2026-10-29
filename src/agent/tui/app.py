@@ -2369,6 +2369,13 @@ class DepressionApp(App):
             "clear",
         }:
             return False
+        # Tab must navigate editable sidebar controls, not switch the
+        # agent's mode or accept a slash suggestion behind their back.
+        if action == "tab_or_mode":
+            focused = self.focused
+            if focused is not None and focused is not self.query_one("#prompt", PromptArea):
+                if isinstance(focused, (Input, TextArea, Select)):
+                    return False
         return True
 
     def on_key(self, event) -> None:
@@ -2381,6 +2388,14 @@ class DepressionApp(App):
                 return
             prompt = self.query_one("#prompt", PromptArea)
             if prompt.disabled or prompt.has_focus:
+                return
+            # A sidebar connection field owns its keystrokes and paste.
+            # Previously the app moved printable keys back to the main
+            # prompt whenever that prompt was not focused.
+            focused = self.focused
+            if focused is not None and isinstance(
+                focused, (Input, TextArea, Select, Button, OptionList)
+            ):
                 return
 
             key = event.key
@@ -2945,11 +2960,10 @@ class DepressionApp(App):
         try:
             prompt = self.query_one("#prompt", PromptArea)
             draft = prompt.text
-            should_run = (
-                execute
-                and selected not in _SLASH_ARGUMENT_COMMANDS
-                and len(draft.strip()) > 1
-            )
+            # Enter executes the highlighted command immediately, even
+            # when the user has only typed "/". Commands needing an
+            # argument still fill the prompt without running.
+            should_run = execute and selected not in _SLASH_ARGUMENT_COMMANDS
             replacement = selected + (
                 " " if selected in _SLASH_ARGUMENT_COMMANDS else ""
             )
