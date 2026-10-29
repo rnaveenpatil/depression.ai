@@ -2126,13 +2126,8 @@ class DepressionApp(App):
 
         self._set_active_panel("llm")
 
-        # Only panel tabs should be skipped during keyboard navigation.
-        # Panel controls (AWS save, MCP reconnect, etc.) must remain focusable.
-        for w in self.query("#sidebar .side-tab"):
-            try:
-                w.can_focus = False
-            except Exception:
-                pass
+        # Compact sidebar labels are keyboard-accessible; do not disable focus.
+        # Editable LLM/MCP/AWS controls remain focusable as before.
 
         try:
             self.query_one("#transcript", VerticalScroll).display = False
