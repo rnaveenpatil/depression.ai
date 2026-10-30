@@ -66,7 +66,7 @@ async def test_mcp_panel_displays_shared_client_and_lists_servers():
 
 
 @pytest.mark.asyncio
-async def test_reconnect_does_not_change_config_or_register_stale_tools():
+async def test_reconnect_does_not_change_config_or_register_stale_tools(monkeypatch):
     client = DummyClient()
     registry = ToolRegistry()
     registry.register_external(
