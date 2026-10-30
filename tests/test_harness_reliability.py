@@ -160,3 +160,24 @@ async def test_simple_question_does_not_call_intent_classifier(monkeypatch):
     assert (await loop.run("What is Python?"))["success"]
     assert loop.context.intent == "question"
     assert loop.context.metadata["intent_needs_plan"] is False
+
+
+@pytest.mark.asyncio
+async def test_coordinator_avoids_nested_build_planning():
+    from agent.agent.dual_agent import AgentCoordinator
+
+    loop = SimpleNamespace(enable_planning=True)
+    observed = []
+    async def execute(**kwargs):
+        observed.append(loop.enable_planning)
+        return {"success": True, "response": "completed", "tool_calls": 1}
+
+    coordinator = AgentCoordinator(
+        plan_agent=SimpleNamespace(),
+        build_agent=SimpleNamespace(loop=loop, process_query=execute),
+        config={},
+    )
+    result = await coordinator._execute_plan_with_build("Already planned", {})
+    assert result["success"] is True
+    assert observed == [False]
+    assert loop.enable_planning is True
