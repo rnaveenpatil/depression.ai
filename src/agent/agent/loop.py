@@ -1107,6 +1107,30 @@ class AgentLoop:
                     self.context.metadata["stopped_on_failures"] = True
                     break
 
+                # Detect repeated batches independently of model claims. This
+                # catches models alternating tools and endlessly retrying the
+                # same arguments. A real mutation resets the batch history.
+                signatures = []
+                for call in thought["tool_calls"]:
+                    name = str(getattr(call, "name", ""))
+                    args = getattr(call, "arguments", {}) or {}
+                    try:
+                        signature = json.dumps([name, args], sort_keys=True, default=str)
+                    except (TypeError, ValueError):
+                        signature = name
+                    signatures.append(signature)
+                batch_signature = tuple(sorted(signatures))
+                seen = self.context.metadata.setdefault("repeated_batches", {})
+                if self._made_progress(results):
+                    seen.clear()
+                elif batch_signature:
+                    count = seen.get(batch_signature, 0) + 1
+                    seen[batch_signature] = count
+                    if count >= 3:
+                        logger.warning("Stopping repeated identical tool batch: %s", batch_signature)
+                        self.context.metadata["stopped_on_no_progress"] = True
+                        break
+
                 # [STOP-2] No-progress breaker: if 3 consecutive acting
                 # iterations produce nothing new, stop churning.
                 if self._made_progress(results):
@@ -1182,6 +1206,22 @@ class AgentLoop:
                     ),
                 )
                 continue
+
+            # A final answer with no further tool requests is the natural
+            # completion signal. Do not manufacture more work for read-only
+            # tasks; only actual outstanding modifications require validation.
+            if (response_text and not self.context.unverified_mutations
+                    and not self._pending_verification_entries()
+                    and not self.context.metadata.get("stopped_on_failures")
+                    and not (
+                        (self.context.metadata.get("requires_action") is True
+                         or self.context.intent in ("feature", "bugfix", "refactor"))
+                        and not self.context.metadata.get("action_attempted")
+                    )):
+                self.state = LoopState.STOPPED
+                self._update_metrics()
+                response_text = await self._ensure_demo_offer(response_text)
+                return self._result(True, response_text)
 
             # A single file write/edit is cheap to verify directly. Read it
             # back now instead of spending an extra LLM turn on the simple
