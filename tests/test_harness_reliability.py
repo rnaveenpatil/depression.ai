@@ -115,7 +115,7 @@ async def test_mcp_disconnect_fails_pending_requests_immediately():
 
 @pytest.mark.asyncio
 async def test_failed_mcp_initialization_exposes_connection_errors(monkeypatch):
-    async def fail(self, cfg):
+    async def fail(cfg):
         raise RuntimeError("wrong credentials")
     client = MCPClient({
         "enabled": True, "servers": [{
