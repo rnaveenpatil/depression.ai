@@ -64,7 +64,7 @@ pip install depression.ai
 depression --nosignin
 ```
 
-Open the **LLM Connection** panel (`/connect`), paste your **Base URL**, **Model ID**, and **API key** if needed, then press **CONNECT**. No model suggestion menu is required.
+Open the **LLM Connection** panel (`/connect`), paste your **Base URL**, **Model ID**, and **API key** if needed, then press **CONNECT**. On Ubuntu/Debian, see [installation without manual venv setup](#install-without-creating-a-virtual-environment) if `pip install` is blocked.
 
 ---
 
@@ -291,29 +291,9 @@ The exact behaviour depends on the model, available tools, permissions and envir
 
 # 🧠 About depression.ai
 
-**depression.ai** is an AI agent framework made and released by **Team Depression**.
+Built by **Team Depression**, `depression.ai` brings development, code analysis, debugging, Git, system operations and AWS tools into one terminal workspace. You describe the task; the model decides an approach; the harness provides tools, permissions, project context and execution.
 
-It is a terminal workspace that helps with the whole workflow:
-
-```text
-Development
-     ↓
-Analysis
-     ↓
-System Operations
-     ↓
-Testing & Debugging
-     ↓
-Git & Project Management
-     ↓
-AWS Operations
-     ↓
-Deployment
-```
-
-The model does the reasoning. `depression.ai` provides the execution environment, tools, permissions, project context and session management.
-
-It is not just a set of fixed commands. The agent can inspect the environment, understand your request, decide what to do, run the available tools and check the result.
+It isn't a fixed set of commands. Its results depend on the connected model, available tools and permissions.
 
 ---
 
@@ -967,7 +947,7 @@ A model used with `depression.ai` should ideally have:
 * Tool / function calling where supported
 * Consistent responses
 
-Model quality matters because the model must understand the task and decide which tools to use.
+Model quality matters because the model must understand the task and decide which tools to use. The agent's **1M-token generic fallback** is an estimate, not a promise that the connected model accepts that much context.
 
 ---
 
@@ -1157,7 +1137,7 @@ You can add new capabilities without hard-coding every integration into the core
 
 1. Enter `/mcp` and select **HTTP**, **SSE**, **LOCAL**, or **JSON**.
 2. Paste the matching server details (URL and optional token, executable and arguments, or a compatible JSON snippet).
-3. Choose **SAVE & CONNECT**. Expand **CONNECTION DETAILS** to troubleshoot.
+3. Choose **SAVE & CONNECT**. Use **MANAGE SERVERS** to connect, disconnect or delete saved servers; expand **CONNECTION DETAILS** to troubleshoot.
 
 Only connect servers you trust. MCP tools can perform sensitive actions; permission checks remain in effect.
 
@@ -1250,7 +1230,7 @@ TODO
 ────────────────────────
 ```
 
-This breaks the overall job into smaller steps.
+For complex work, the agent can create a plan or use the `todo` tool to add and update tasks. The panel shows their progress automatically; for a simple request, it may stay empty. Open it with `/todo`.
 
 ---
 
@@ -1258,6 +1238,11 @@ This breaks the overall job into smaller steps.
 
 ```text
 /help
+/connect
+/aws
+/mcp
+/todo
+/copy
 /plan
 /build
 /auto
@@ -1299,6 +1284,8 @@ PLAN ↔ BUILD ↔ AUTO
 * **AUTO** — runs Plan and Build in a loop until the task succeeds or the iteration limit is reached (`--max-iterations`).
 
 You can also switch directly with `/plan`, `/build` and `/auto`.
+
+**Copy and paste:** The `COPY` button and `/copy` use your system clipboard when available. On Linux, install `wl-clipboard` (Wayland) or `xclip`/`xsel` (X11) if needed; copying over SSH depends on terminal support.
 
 ---
 
@@ -1364,96 +1351,99 @@ depression --max-turns N
 
 # 🚪 Start Without Sign-In (`--nosignin`)
 
-Google sign-in is **optional**. Use `--nosignin` to bypass the welcome/onboarding screen and go straight into the TUI:
+Google sign-in is optional. To enter the TUI immediately with a local guest profile (no Google account or email required), run:
 
 ```bash
 depression --nosignin
 ```
 
-On first run this creates a local guest profile (`local-guest`) on your machine. No Google account, email address or OAuth flow is required.
-
-Combine it with other options:
+You can combine it with other options:
 
 ```bash
 depression --nosignin -p /path/to/project
 depression --nosignin --provider groq --model <model>
 ```
 
-What you should know:
-
-* The guest profile is stored locally in the agent data directory.
-* The agent, tools, sessions and permissions work the same as when signed in.
-* Gmail-specific features (mail/calendar) stay disabled until you sign in.
-* You can sign in with Google later from the `/profile` panel.
-* Signing in is **not** required to use `depression.ai`.
+Your tools, sessions and permissions still work in guest mode. The local profile is saved on your device; you can sign in later from `/profile`.
 
 ---
 
 # 📦 Installation
 
-Install with a single command — no clone or build step required:
+**Requirements:** Python 3.10+ and a terminal. No GPU is needed when using a hosted model. Once installed, you can run `depression` from any folder.
 
-```bash
-pip install depression.ai
+### Install directly with pip
+
+**Windows (PowerShell or Command Prompt):**
+
+```powershell
+py -m pip install depression.ai
+depression
 ```
 
-The package is lightweight and runs on any Linux, macOS or Windows machine, whether virtual or physical.
+**Linux/macOS (if your Python installation allows pip):**
 
-To inspect or modify the architecture, clone the repository:
+```bash
+python3 -m pip install depression.ai
+depression
+```
+
+On Windows, Python's Scripts directory must be on `PATH`. On Ubuntu/Debian, `pip` may reject direct installation with `externally-managed-environment`—use the method below.
+
+### Install without creating a virtual environment
+
+You don't have to create or activate a `venv`. On **Ubuntu/Debian**, install the CLI with `pipx`:
+
+```bash
+sudo apt update
+sudo apt install pipx
+pipx ensurepath
+pipx install depression.ai
+```
+
+On **macOS with Homebrew**:
+
+```bash
+brew install pipx
+pipx ensurepath
+pipx install depression.ai
+```
+
+Then launch the agent:
+
+```bash
+depression --nosignin
+```
+
+If `depression` isn't found, open a new terminal after `pipx ensurepath`. `pipx` manages an isolated Python environment **automatically**; you never create or activate it. Avoid `--break-system-packages`, which bypasses your OS's Python safeguards.
+
+To update a `pipx` install, run `pipx upgrade depression.ai`. **PyPI releases may be behind the latest GitHub commits.**
+
+**Want to develop or inspect the source?** Clone it:
 
 ```bash
 git clone https://github.com/rnaveenpatil/depression.ai.git
 cd depression.ai
-```
-
-For development:
-
-```bash
 pip install -e ".[dev]"
 ```
 
-Start:
-
-```bash
-depression
-```
+Development installs are best done in an isolated environment. Regular users don't need to clone or build the project.
 
 ---
 
 # 🧩 Compatibility
 
-`depression.ai` is lightweight and runs on **any machine with a terminal** that can run **Python 3.10+** and **pip**:
-
-* Linux, macOS or Windows (Windows Terminal / WSL)
-* Physical machines, virtual machines, containers or remote servers
-* Local laptops or cloud instances — no GPU or dedicated infrastructure required
+`depression.ai` supports **Python 3.10+** on Windows, Linux and macOS, including virtual machines and remote servers. The CLI doesn't require a GPU; **local models** need hardware appropriate to their size. Browser tools and cloud features may need additional software or credentials.
 
 ### Plug-and-play setup
 
-1. Install with a single command:
-
-   ```bash
-   pip install depression.ai
-   ```
-
-2. Start the agent:
-
-   ```bash
-   depression
-   # or skip sign-in:
-   depression --nosignin
-   ```
-
-3. Add your LLM API credentials in the LLM Connection panel.
-4. Start working with the agent.
-
-You do not need to share data to get started. Your credentials and sessions stay on your machine, and sign-in is optional. Install, run the command, connect your API credentials, and start working on any machine.
+After installation, run `depression --nosignin`, open `/connect`, and enter a compatible model's **Base URL**, **Model ID**, and API key (if required). A cloud provider account or local model server is needed for inference, but a Team Depression account is not.
 
 ---
 
 # ⚡ Quick Start
 
-**Requirements:** a terminal, **Python 3.10+** and **pip** — any physical or virtual machine works, with no GPU required.
+If you installed from PyPI, simply run `depression`. For a development checkout, use:
 
 ```bash
 git clone https://github.com/rnaveenpatil/depression.ai.git
@@ -1462,7 +1452,7 @@ pip install -e .
 depression
 ```
 
-To skip the Google sign-in / onboarding screen and go straight to the TUI:
+To bypass Google sign-in and go straight to the TUI:
 
 ```bash
 depression --nosignin
@@ -1473,22 +1463,21 @@ After starting the TUI, configure the LLM:
 ```text
 LLM CONNECTION
 ────────────────────────────
-Provider    : custom
-Base URL    : ...
-API Key     : ...
-Model       : ...
+Base URL : https://api.example.com/v1
+API Key  : ... (optional for local endpoints)
+Model ID : your-model-id
 ────────────────────────────
 ```
 
-For AWS work, set your AWS credentials and region in the same config.
+Select **CONNECT**. For AWS work, use the separate `/aws` panel with credentials and region.
 
 ---
 
 # 🔧 Environment Configuration
 
-**Unified credential storage:** Credentials saved through the LLM, AWS, and MCP panels now live in the same private user file: `~/.agent/env` (owner-only permissions on supported systems). MCP server metadata such as URLs and command arguments remains in `~/.agent/config.json`, without plain-text tokens.
+**Where credentials are saved:** LLM, AWS and MCP secrets saved in the TUI go into the nearest project `.env` file (or a `.env` in the current directory if none exists). Existing `~/.agent/env` entries remain readable as a legacy fallback. MCP server settings are stored separately in `~/.agent/config.json`.
 
-Existing credentials in a project `.env` remain readable for compatibility. The agent does **not silently delete** legacy project secrets; after reconnecting/saving them to the unified file, review old project `.env` files and remove any duplicate secrets yourself. Keep both locations out of version control. These files are local, **not encrypted**, and remote providers still receive data necessary for their API calls.
+These files stay on your device but are **not encrypted**. Never commit a `.env` file or copy secrets into a public repository. When using remote LLMs or cloud services, the required request data still goes to those providers.
 
 You can also use environment variables where supported:
 
