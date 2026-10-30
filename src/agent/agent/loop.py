@@ -902,8 +902,8 @@ class AgentLoop:
 
             # Do not route an unambiguous greeting into repository inspection.
             greeting = bool(re.fullmatch(
-                r"\\s*(?:hi|hello|hey|hiya|good morning|good evening|"
-                r"good afternoon|thanks|thank you|ok|okay)[!.\\s]*",
+                r"\s*(?:hi|hello|hey|hiya|good morning|good evening|"
+                r"good afternoon|thanks|thank you|ok|okay)[!.\s]*",
                 query or "", re.I,
             ))
             self.context.metadata["direct_greeting"] = greeting
