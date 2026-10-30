@@ -713,7 +713,7 @@ class PlanAgent(BaseAgent):
         }
 
     def get_available_tools(self) -> List[str]:
-        return list(self.tool_registry.tools.keys())
+        return self.tool_registry.list_tools()
 
 
 class BuildAgent(BaseAgent):
@@ -723,7 +723,7 @@ class BuildAgent(BaseAgent):
         super().__init__(AgentRole.BUILD, *args, **kwargs)
 
     def get_available_tools(self) -> List[str]:
-        return list(self.tool_registry.tools.keys())
+        return self.tool_registry.list_tools()
 
 
 @dataclass
