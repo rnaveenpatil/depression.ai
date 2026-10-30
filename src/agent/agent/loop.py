@@ -523,7 +523,7 @@ class AgentLoop:
         self.enable_streaming = bool(config.get("enable_streaming", True))
         # [STOP-2] No-progress streak limit (configurable).
         self.no_progress_streak_cap = int(
-            config.get("no_progress_streak_cap", NO_PROGRESS_STREAK_CAP)
+            config.get("no_progress_streak_cap", 6)
         )
 
         self.state = LoopState.IDLE
@@ -1113,6 +1113,13 @@ class AgentLoop:
                         "No-progress streak: %d/%d",
                         streak, self.no_progress_streak_cap,
                     )
+                    if streak == 3:
+                        await self.model_context.add_system_message(
+                            "Three consecutive tool rounds made no verified state change. "
+                            "Stop broad file browsing. Use one targeted grep/glob/read "
+                            "only if required by the user's specific task; otherwise "
+                            "answer with the evidence already found or state the blocker."
+                        )
                     if streak >= self.no_progress_streak_cap:
                         logger.warning(
                             "Stopping loop: %d consecutive iterations "
@@ -1370,13 +1377,24 @@ class AgentLoop:
 
     # [STOP-2] Did any tool call in this iteration produce real progress?
     def _made_progress(self, results: List[Dict[str, Any]]) -> bool:
+        """Count actual state-changing work, not arbitrary successful reads.
+
+        A successful read/search is useful evidence but cannot keep an
+        unproductive agent alive forever. Allow several exploration turns
+        through the separate no-progress budget.
+        """
         for x in results:
             r = x.get("result") or {}
-            if not r.get("success", False):
+            if not isinstance(r, dict) or not r.get("success", False):
                 continue
-            if r.get("duplicate"):
+            if (r.get("duplicate") or r.get("cached")
+                    or x.get("duplicate") or x.get("cached")):
                 continue
-            if r.get("cached"):
+            name = str(x.get("tool") or "")
+            if self._is_read_only(name):
+                continue
+            # Do not mistake no-op tool responses for progress.
+            if r.get("changed") is False or r.get("no_change") is True:
                 continue
             return True
         return False
