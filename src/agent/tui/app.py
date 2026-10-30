@@ -3276,7 +3276,7 @@ class DepressionApp(App):
         except ValueError as exc:
             panel.set_save_status(f"Invalid connection: {exc}")
         except Exception as exc:
-            panel.set_save_status(f"Could not save/connect: {type(exc).__name__}")
+            panel.set_save_status(f"Could not save/connect: {exc}")
         finally:
             button.disabled = False
             panel.refresh_status()
@@ -3292,19 +3292,57 @@ class DepressionApp(App):
             self._system("MCP reconnect unavailable while the agent is running.")
             return
         panel = self.query_one("#panel-mcp", MCPPanel)
-        client = panel.get_client()
-        if client is None or not getattr(client, "enabled", False):
-            self._system("MCP is disabled; enable it in the config and restart.")
-            return
         button = self.query_one("#mcp-reconnect", Button)
         button.disabled = True
         try:
+            # Re-read the actual saved configuration on every reconnect.
+            # This also permits recovery when MCP was disabled at startup.
+            from agent.config.loader import ConfigLoader
+            from agent.mcp.client import MCPClient
+            cfg = ConfigLoader().load(validate=False).to_dict(
+                include_secrets=True
+            ).get("mcp", {}) or {}
+            if not cfg.get("enabled"):
+                message = "MCP is disabled in saved config; save an MCP server first."
+                panel.set_management_status(message)
+                self._system(message)
+                return
+
+            client = panel.get_client()
+            if client is None:
+                client = MCPClient(cfg)
+                if self.coordinator is None:
+                    self._system("No active agent to attach MCP tools to.")
+                    return
+                for role in ("plan_agent", "build_agent"):
+                    agent = getattr(self.coordinator, role, None)
+                    if agent is not None:
+                        agent.mcp_client = client
+            else:
+                client.update_config(cfg)
             self._system("Reconnecting configured MCP servers…")
             await self._reload_mcp_client(client)
-
-            self._system("MCP reconnect finished; check server status for failures.")
+            servers = list(client.servers_cfg)
+            connected = len(client.transports)
+            errors = getattr(client, "connection_errors", {}) or {}
+            if not servers:
+                message = "MCP enabled but no servers configured."
+            elif connected == len(servers):
+                message = f"MCP connected: {connected}/{len(servers)} servers."
+            else:
+                failures = "; ".join(
+                    f"{name}: {detail}" for name, detail in list(errors.items())[:3]
+                )
+                message = (
+                    f"MCP connected: {connected}/{len(servers)} servers. "
+                    f"Failures: {failures or 'check server configuration'}"
+                )
+            panel.set_management_status(message)
+            self._system(message)
         except Exception as exc:
-            self._error("MCP reconnect failed: " + type(exc).__name__)
+            message = f"MCP reconnect failed: {exc}"
+            panel.set_management_status(message)
+            self._error(message)
         finally:
             self._refresh_mcp_status()
             if not self.busy and not self._is_shutting_down:
@@ -3345,9 +3383,9 @@ class DepressionApp(App):
             panel.set_management_status(f"Connect failed: {exc}")
         except Exception as exc:
             panel.set_management_status(
-                f"Connect failed: {type(exc).__name__}"
+                f"Connect failed: {exc}"
             )
-            self._error(f"MCP connect failed for {name}: {type(exc).__name__}")
+            self._error(f"MCP connect failed for {name}: {exc}")
         finally:
             panel.refresh_status()
 
@@ -3382,10 +3420,10 @@ class DepressionApp(App):
             self._system(message)
         except Exception as exc:
             panel.set_management_status(
-                f"Disconnect failed: {type(exc).__name__}"
+                f"Disconnect failed: {exc}"
             )
             self._error(
-                f"MCP disconnect failed for {name}: {type(exc).__name__}"
+                f"MCP disconnect failed for {name}: {exc}"
             )
         finally:
             panel.refresh_status()
@@ -3441,9 +3479,9 @@ class DepressionApp(App):
             panel.set_management_status(f"Delete failed: {exc}")
         except Exception as exc:
             panel.set_management_status(
-                f"Delete failed: {type(exc).__name__}"
+                f"Delete failed: {exc}"
             )
-            self._error(f"MCP delete failed for {name}: {type(exc).__name__}")
+            self._error(f"MCP delete failed for {name}: {exc}")
         finally:
             panel.refresh_status()
 
