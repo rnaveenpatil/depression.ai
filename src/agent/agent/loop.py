@@ -868,6 +868,15 @@ class AgentLoop:
     ) -> Dict[str, Any]:
         self.context = LoopContext()
         self._checkpoint_goal = query
+        self._recovered_checkpoint = None
+        try:
+            from agent.context.checkpoint import TaskCheckpointStore
+            session = getattr(self.agent, "session", None)
+            session_id = str(getattr(session, "id", "") or "")
+            if session_id:
+                self._recovered_checkpoint = TaskCheckpointStore().load(session_id, query[:500])
+        except Exception as exc:
+            logger.debug("Task checkpoint recovery failed: %s", exc)
         self.current_plan = None
         self.pending_tool_calls = []
         self.completed_tool_calls = []
@@ -2514,6 +2523,16 @@ Stop when the goal is achieved.
         if self.current_plan and self.current_plan.get_pending_tasks():
             state_parts["plan"] = self._get_plan_context()
         checkpoint = self._task_checkpoint()
+        previous = getattr(self, "_recovered_checkpoint", None)
+        if previous:
+            for key in ("completed_tools", "modified_files", "failures"):
+                checkpoint[key] = list(dict.fromkeys(
+                    list(previous.get(key, [])) + checkpoint[key]
+                ))[-16:]
+            if not checkpoint["pending_tasks"] and previous.get("pending_tasks"):
+                checkpoint["pending_tasks"] = previous["pending_tasks"][:8]
+                checkpoint["next_step"] = checkpoint["pending_tasks"][0]
+            self._recovered_checkpoint = None
         state_parts["checkpoint"] = checkpoint
         self._save_task_checkpoint(checkpoint)
         state_block = json.dumps(state_parts, default=str)
