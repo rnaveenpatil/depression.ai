@@ -1081,6 +1081,7 @@ class MCPClient:
         # The agent's ToolRegistry (set by initialize/register_tools_into).
         self._tool_registry: Any = None
         self.connection_errors: Dict[str, str] = {}
+        self._server_capabilities: Dict[str, Dict[str, Any]] = {}
 
     # ------------------------------------------------------------------
     # SERVER CONFIG LOADING
@@ -1347,6 +1348,11 @@ class MCPClient:
                 transport._protocol_version = str(
                     init_result.get("protocolVersion") or "2025-03-26"
                 )
+            capabilities = init_result.get("capabilities")
+            if isinstance(capabilities, dict):
+                self._server_capabilities[cfg.name] = capabilities
+            else:
+                self._server_capabilities.pop(cfg.name, None)
             await transport.notify("notifications/initialized")
 
             await self._discover_server(cfg.name, transport)
@@ -1370,6 +1376,9 @@ class MCPClient:
 
         # Rediscovery replaces stale tool schemas from this server.
         self._drop_server_state(name)
+        capabilities = self._server_capabilities.get(name)
+        if capabilities is not None and "tools" not in capabilities:
+            return
         # Tools
         try:
             result = await transport.request("tools/list")
@@ -1389,34 +1398,35 @@ class MCPClient:
                 f"Tool discovery failed for '{name}': {e}"
             ) from e
 
-        # Resources
-        try:
-            result = await transport.request("resources/list")
-            for r in result.get("resources", []):
-                resource = MCPResource(
-                    server=name,
-                    uri=r["uri"],
-                    name=r.get("name", ""),
-                    description=r.get("description", ""),
-                    mime_type=r.get("mimeType", ""),
-                )
-                self.resources[f"{name}:{resource.uri}"] = resource
-        except Exception as e:
-            logger.debug(f"'{name}' has no resources: {e}")
+        # Optional MCP capabilities: do not probe unsupported methods.
+        if capabilities is None or "resources" in capabilities:
+            try:
+                result = await transport.request("resources/list")
+                for resource in result.get("resources", []):
+                    entry = MCPResource(
+                        server=name,
+                        uri=resource["uri"],
+                        name=resource.get("name", ""),
+                        description=resource.get("description", ""),
+                        mime_type=resource.get("mimeType", ""),
+                    )
+                    self.resources[f"{name}:{entry.uri}"] = entry
+            except Exception as exc:
+                logger.debug("MCP '%s' has no resources: %s", name, exc)
 
-        # Prompts
-        try:
-            result = await transport.request("prompts/list")
-            for p in result.get("prompts", []):
-                prompt = MCPPrompt(
-                    server=name,
-                    name=p["name"],
-                    description=p.get("description", ""),
-                    arguments=p.get("arguments", []),
-                )
-                self.prompts[f"{name}:{prompt.name}"] = prompt
-        except Exception as e:
-            logger.debug(f"'{name}' has no prompts: {e}")
+        if capabilities is None or "prompts" in capabilities:
+            try:
+                result = await transport.request("prompts/list")
+                for prompt in result.get("prompts", []):
+                    entry = MCPPrompt(
+                        server=name,
+                        name=prompt["name"],
+                        description=prompt.get("description", ""),
+                        arguments=prompt.get("arguments", []),
+                    )
+                    self.prompts[f"{name}:{entry.name}"] = entry
+            except Exception as exc:
+                logger.debug("MCP '%s' has no prompts: %s", name, exc)
 
     async def shutdown(self) -> None:
         if self._health_task:
@@ -1435,6 +1445,7 @@ class MCPClient:
         self.tools.clear()
         self.resources.clear()
         self.prompts.clear()
+        self._server_capabilities.clear()
         self._initialized = False
         logger.info("MCP client shutdown complete")
 
