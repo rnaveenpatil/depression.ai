@@ -890,7 +890,22 @@ class AgentLoop:
         try:
             self.state = LoopState.INITIALIZING
 
-            intent = await self._classify_intent(query)
+            # Avoid extra intent/planning model requests for unambiguous questions.
+            simple_question = bool(re.match(
+                r"^\s*(what is|what are|who is|why does|how does|"
+                r"define|explain|tell me about)\b", query, re.I,
+            )) and not bool(re.search(
+                r"\b(implement|modify|change|create|build|fix|run|execute|"
+                r"delete|install|update|test|deploy|launch|edit|write)\b",
+                query, re.I,
+            ))
+            if simple_question:
+                intent = "question"
+                self.context.metadata.update({
+                    "intent_needs_plan": False, "requires_action": False,
+                })
+            else:
+                intent = await self._classify_intent(query)
             self.context.intent = intent
             logger.info("Classified intent: %s", intent)
 
@@ -1638,6 +1653,11 @@ class AgentLoop:
         max_local_turns = self.max_tool_calls_per_iteration * 2
         local_unverified: Dict[str, Dict[str, Any]] = {}
         local_verify_rounds = 0
+        task_actions = 0
+        action_required = bool(re.search(
+            r"\b(write|edit|modify|create|build|implement|fix|delete|"
+            r"install|deploy|update|execute|run)\b", task.description, re.I,
+        ))
 
         while local_turns < max_local_turns:
             local_turns += 1
@@ -1674,6 +1694,23 @@ class AgentLoop:
 
             if not tool_calls:
                 upper = content.upper()
+                if action_required and not task_actions:
+                    if local_turns < max_local_turns:
+                        messages.append(Message(role="assistant", content=content))
+                        messages.append(Message(
+                            role="user",
+                            content=(
+                                "This task requires an actual action, but no tool "
+                                "has succeeded yet. Execute the required operation "
+                                "with the appropriate tool, or respond "
+                                "'TASK FAILED: <concrete blocker>'."
+                            ),
+                        ))
+                        continue
+                    return {
+                        "success": False, "retry": False,
+                        "error": "No successful tool action executed",
+                    }
                 if upper.startswith("TASK FAILED"):
                     return {"success": False, "retry": True, "error": content}
 
@@ -1775,6 +1812,8 @@ class AgentLoop:
                 tool = x.get("tool", "")
                 if not r.get("success"):
                     continue
+                if not self._is_read_only(tool):
+                    task_actions += 1
                 tool_args = x.get("params") or {}
                 if self._is_read_only(tool):
                     target = _read_target(tool, tool_args)
