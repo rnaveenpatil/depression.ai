@@ -51,7 +51,7 @@ def save_credentials(
             current[key] = value
         applied[key] = value
 
-    write_env_file(current, target, strict=True)
+    write_env_file(current, target, strict=True, replace=True)
 
     for key, value in applied.items():
         if value == "" and remove_empty:
@@ -108,9 +108,16 @@ def save_mcp_secrets(
     secrets: Mapping[str, str],
     *,
     env_path: Optional[Path] = None,
+    remove_empty: bool = False,
 ) -> Dict[str, str]:
-    """Persist MCP secret values in one write."""
-    return save_credentials(secrets, env_path=env_path)
+    """Persist MCP secret values in one write.
+
+    ``remove_empty`` lets callers remove keys that belonged to a deleted MCP
+    server without introducing a second write path for the credential file.
+    """
+    return save_credentials(
+        secrets, env_path=env_path, remove_empty=remove_empty,
+    )
 
 
 __all__ = [

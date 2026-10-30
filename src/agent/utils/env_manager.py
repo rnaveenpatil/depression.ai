@@ -159,6 +159,7 @@ def write_env_file(
     env_vars: Dict[str, str],
     env_path: Optional[Path] = None,
     strict: bool = False,
+    replace: bool = False,
 ) -> None:
     """Write environment variables to a .env file.
 
@@ -169,10 +170,13 @@ def write_env_file(
             being swallowed. Credential writes pass ``strict=True`` so the
             UI can report a failed save rather than reporting success while
             the old value silently remains on disk.
+        replace: when True, write ``env_vars`` as the complete file instead of
+            merging with the on-disk copy. Credential writes use this so a key
+            removed in memory is not silently re-added from disk.
     """
     path = env_path or find_env_file()
 
-    existing = load_env_file(path)
+    existing = {} if replace else load_env_file(path)
     existing.update(env_vars)
 
     lines = []

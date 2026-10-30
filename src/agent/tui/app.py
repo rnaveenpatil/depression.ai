@@ -3310,43 +3310,182 @@ class DepressionApp(App):
             if not self.busy and not self._is_shutting_down:
                 button.disabled = False
 
+    @on(Button.Pressed, "#mcp-server-connect")
+    def _mcp_server_connect_pressed(self) -> None:
+        self._connect_mcp_server()
+
+    @work(exclusive=True, group="mcp-manage")
+    async def _connect_mcp_server(self) -> None:
+        panel = self.query_one("#panel-mcp", MCPPanel)
+        name = panel.selected_server_name()
+        if self.busy or self._is_shutting_down:
+            panel.set_management_status("Stop the running agent first.")
+            return
+        if not name:
+            panel.set_management_status("Select a server first.")
+            return
+        client = panel.get_client()
+        if client is None or not getattr(client, "enabled", False):
+            panel.set_management_status(
+                "MCP is disabled. Enable it and restart, or use Save & Connect."
+            )
+            return
+
+        panel.set_management_status(f"Connecting {name}…")
+        try:
+            changed = await client.connect_server(name)
+            self._sync_mcp_tools(client)
+            message = (
+                f"Connected MCP server: {name}" if changed
+                else f"MCP server already connected: {name}"
+            )
+            panel.set_management_status(message)
+            self._system(message)
+        except ValueError as exc:
+            panel.set_management_status(f"Connect failed: {exc}")
+        except Exception as exc:
+            panel.set_management_status(
+                f"Connect failed: {type(exc).__name__}"
+            )
+            self._error(f"MCP connect failed for {name}: {type(exc).__name__}")
+        finally:
+            panel.refresh_status()
+
+    @on(Button.Pressed, "#mcp-server-disconnect")
+    def _mcp_server_disconnect_pressed(self) -> None:
+        self._disconnect_mcp_server()
+
+    @work(exclusive=True, group="mcp-manage")
+    async def _disconnect_mcp_server(self) -> None:
+        panel = self.query_one("#panel-mcp", MCPPanel)
+        name = panel.selected_server_name()
+        if self.busy or self._is_shutting_down:
+            panel.set_management_status("Stop the running agent first.")
+            return
+        if not name:
+            panel.set_management_status("Select a server first.")
+            return
+        client = panel.get_client()
+        if client is None or not getattr(client, "enabled", False):
+            panel.set_management_status("MCP is disabled or not initialized.")
+            return
+
+        panel.set_management_status(f"Disconnecting {name}…")
+        try:
+            changed = await client.disconnect_server(name)
+            self._sync_mcp_tools(client)
+            message = (
+                f"Disconnected MCP server: {name}" if changed
+                else f"MCP server was not connected: {name}"
+            )
+            panel.set_management_status(message)
+            self._system(message)
+        except Exception as exc:
+            panel.set_management_status(
+                f"Disconnect failed: {type(exc).__name__}"
+            )
+            self._error(
+                f"MCP disconnect failed for {name}: {type(exc).__name__}"
+            )
+        finally:
+            panel.refresh_status()
+
+    @on(Button.Pressed, "#mcp-server-delete")
+    def _mcp_server_delete_pressed(self) -> None:
+        panel = self.query_one("#panel-mcp", MCPPanel)
+        name = panel.selected_server_name()
+        if self.busy or self._is_shutting_down:
+            panel.set_management_status("Stop the running agent first.")
+            return
+        if not name:
+            panel.set_management_status("Select a server first.")
+            return
+
+        def confirmed(yes: bool) -> None:
+            if yes:
+                self.run_worker(
+                    self._delete_mcp_server(name),
+                    group="mcp-manage", exclusive=True,
+                )
+
+        self.push_screen(
+            ConfirmModal(
+                "DELETE MCP SERVER",
+                f"Remove '{name}' from the MCP config? "
+                "Its auto-generated secrets will also be removed.",
+            ),
+            confirmed,
+        )
+
+    async def _delete_mcp_server(self, name: str) -> None:
+        panel = self.query_one("#panel-mcp", MCPPanel)
+        if self.busy or self._is_shutting_down:
+            panel.set_management_status("Stop the running agent first.")
+            return
+        try:
+            from agent.tui.mcp_config_ui import delete_mcp_server
+
+            result = delete_mcp_server(name)
+            client = panel.get_client()
+            if client is not None:
+                await client.disconnect_server(name)
+                client.update_config(result["config"])
+                self._sync_mcp_tools(client)
+
+            message = f"Deleted MCP {result['kind']}: {name}"
+            if result.get("cleanup_error"):
+                message += f" (secret cleanup failed: {result['cleanup_error']})"
+            panel.set_management_status(message)
+            self._system(message)
+        except ValueError as exc:
+            panel.set_management_status(f"Delete failed: {exc}")
+        except Exception as exc:
+            panel.set_management_status(
+                f"Delete failed: {type(exc).__name__}"
+            )
+            self._error(f"MCP delete failed for {name}: {type(exc).__name__}")
+        finally:
+            panel.refresh_status()
+
     async def _reload_mcp_client(self, client: Any) -> None:
         """Reload MCP and sync Build tools without changing agent permissions."""
         await client.reload()
+        self._sync_mcp_tools(client)
 
-        # MCPClient.reload() discovers tools, but the Build agent's
-        # registry originally receives them only during initialization.
+    def _sync_mcp_tools(self, client: Any) -> None:
+        """Mirror the client's live MCP tools into the Build tool registry."""
         coordinator = self.coordinator
         build = getattr(coordinator, "build_agent", None)
         registry = getattr(build, "tool_registry", None)
-        if registry is not None:
-            discovered = {
-                tool["function"]["name"]: tool["function"]
-                for tool in client.list_tools()
-            }
-            for name in list(registry.list_tools(include_disabled=True)):
-                if name.startswith("mcp__") and name not in discovered:
-                    registry.unregister_tool(name)
-            for name, schema in discovered.items():
-                async def _call(_name: str = name, **kwargs: Any) -> Any:
-                    return await client.call_tool(_name, kwargs)
-                registry.register_external(
-                    name=name,
-                    handler=_call,
-                    description=str(schema.get("description") or ""),
-                    parameters=schema.get("parameters") or {
-                        "type": "object", "properties": {},
-                    },
-                    read_only=False,
-                    mutating=True,
-                    category="cloud" if name.startswith("mcp__aws__") else "misc",
-                )
+        if registry is None:
+            return
 
-            # Rebuild pinned system prompts after schema changes.
-            loop = getattr(build, "loop", None)
-            if loop is not None:
-                loop._system_prompt_cache = None
-                loop._system_prompt_fp = None
+        discovered = {
+            tool["function"]["name"]: tool["function"]
+            for tool in client.list_tools()
+        }
+        for name in list(registry.list_tools(include_disabled=True)):
+            if name.startswith("mcp__") and name not in discovered:
+                registry.unregister_tool(name)
+        for name, schema in discovered.items():
+            async def _call(_name: str = name, **kwargs: Any) -> Any:
+                return await client.call_tool(_name, kwargs)
+            registry.register_external(
+                name=name,
+                handler=_call,
+                description=str(schema.get("description") or ""),
+                parameters=schema.get("parameters") or {
+                    "type": "object", "properties": {},
+                },
+                read_only=False,
+                mutating=True,
+                category="cloud" if name.startswith("mcp__aws__") else "misc",
+            )
+
+        loop = getattr(build, "loop", None)
+        if loop is not None:
+            loop._system_prompt_cache = None
+            loop._system_prompt_fp = None
 
 
     def _refresh_aws_status(self) -> None:

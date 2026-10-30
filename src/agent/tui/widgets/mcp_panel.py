@@ -6,8 +6,10 @@ from typing import Any
 from textual import on
 from textual.app import ComposeResult
 from textual.containers import Horizontal, Vertical
-from textual.widgets import Button, Static, Input, TextArea
+from textual.widgets import Button, Static, Input, TextArea, OptionList
+from textual.widgets.option_list import Option
 
+from agent.tui.mcp_config_ui import list_mcp_servers
 from agent.tui.theme import GREEN, MUTED, TEXT, PANEL, BORDER
 
 
@@ -109,6 +111,34 @@ class MCPPanel(Vertical):
         background: {PANEL};
         color: {GREEN};
     }}
+    MCPPanel #mcp-server-list {{
+        height: auto;
+        max-height: 8;
+        border: round {BORDER};
+        background: {PANEL};
+        color: {TEXT};
+        margin-bottom: 1;
+    }}
+    MCPPanel #mcp-server-list:focus {{
+        border: round {GREEN};
+    }}
+    MCPPanel #mcp-server-actions {{
+        height: 3;
+        layout: horizontal;
+        margin-bottom: 1;
+    }}
+    MCPPanel #mcp-server-actions Button {{
+        width: 1fr;
+        min-width: 0;
+        height: 3;
+        border: round {BORDER};
+        background: {PANEL};
+        color: {GREEN};
+    }}
+    MCPPanel #mcp-server-actions Button:disabled {{
+        color: {MUTED};
+        border: round {BORDER};
+    }}
     """
 
     def __init__(self, host_app: Any, **kwargs: Any) -> None:
@@ -116,6 +146,7 @@ class MCPPanel(Vertical):
         self._host_app = host_app
         self._entry_mode = "http"
         self._details_expanded = False
+        self._server_list_signature: tuple[tuple[str, str], ...] = ()
 
     def compose(self) -> ComposeResult:
         yield Static("▌ CONNECT MCP", classes="mcp-heading", markup=False)
@@ -160,6 +191,16 @@ class MCPPanel(Vertical):
         )
         yield Static(
             "Connection status: not checked", id="mcp-status",
+            classes="mcp-muted", markup=False,
+        )
+        yield Static("▌ MANAGE SERVERS", classes="mcp-heading", markup=False)
+        yield OptionList(id="mcp-server-list")
+        with Horizontal(id="mcp-server-actions"):
+            yield Button("CONNECT", id="mcp-server-connect")
+            yield Button("DISCONNECT", id="mcp-server-disconnect")
+            yield Button("DELETE", id="mcp-server-delete")
+        yield Static(
+            "Select a server to manage it.", id="mcp-server-status",
             classes="mcp-muted", markup=False,
         )
         yield Button("CONNECTION DETAILS  ▾", id="mcp-details-toggle")
@@ -267,6 +308,113 @@ class MCPPanel(Vertical):
                 return client
         return None
 
+    def _management_entries(self, client: Any) -> list[dict[str, Any]]:
+        entries: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for item in list_mcp_servers():
+            name = str(item.get("name") or "").strip()
+            if not name or name in seen:
+                continue
+            seen.add(name)
+            entries.append({
+                "name": name,
+                "enabled": bool(item.get("enabled", True)),
+            })
+        configurations = list(getattr(client, "servers_cfg", ()) or ())
+        for cfg in configurations:
+            name = str(getattr(cfg, "name", "") or "").strip()
+            if not name or name in seen:
+                continue
+            seen.add(name)
+            entries.append({"name": name, "enabled": True})
+        return entries
+
+    def _server_state(self, client: Any, name: str, enabled: bool) -> str:
+        if not enabled:
+            return "disabled"
+        if client is None:
+            return "not initialized"
+        if not bool(getattr(client, "enabled", False)):
+            return "MCP disabled"
+        transport = (getattr(client, "transports", {}) or {}).get(name)
+        state = getattr(getattr(transport, "state", None), "value", None)
+        return str(state or "disconnected")
+
+    def selected_server_name(self) -> str | None:
+        try:
+            option = self.query_one(
+                "#mcp-server-list", OptionList
+            ).highlighted_option
+            return str(option.id) if option is not None and option.id else None
+        except Exception:
+            return None
+
+    def set_management_status(self, message: str) -> None:
+        self.query_one("#mcp-server-status", Static).update(message)
+
+    def _refresh_management_buttons(self, client: Any) -> None:
+        name = self.selected_server_name()
+        busy = bool(getattr(self._host_app, "busy", False))
+        client_ready = (
+            client is not None and bool(getattr(client, "enabled", False))
+        )
+        transports = getattr(client, "transports", {}) or {}
+        enabled = True
+        if name:
+            for entry in self._management_entries(client):
+                if entry["name"] == name:
+                    enabled = bool(entry["enabled"])
+                    break
+        state = self._server_state(client, name, enabled) if name else ""
+
+        connect = self.query_one("#mcp-server-connect", Button)
+        disconnect = self.query_one("#mcp-server-disconnect", Button)
+        delete = self.query_one("#mcp-server-delete", Button)
+        connect.disabled = (
+            busy or not client_ready or not name or not enabled
+            or state in ("connected", "ready", "connecting", "reconnecting")
+        )
+        disconnect.disabled = (
+            busy or not client_ready or not name or not enabled
+            or name not in transports
+        )
+        delete.disabled = busy or not name
+
+    def _refresh_server_management(self, client: Any) -> None:
+        option_list = self.query_one("#mcp-server-list", OptionList)
+        entries = self._management_entries(client)
+        signature = tuple(
+            (entry["name"], self._server_state(
+                client, entry["name"], bool(entry["enabled"])
+            ))
+            for entry in entries
+        )
+        if signature != self._server_list_signature:
+            selected = self.selected_server_name()
+            option_list.clear_options()
+            if entries:
+                options = []
+                for entry in entries:
+                    state = self._server_state(
+                        client, entry["name"], bool(entry["enabled"])
+                    )
+                    options.append(Option(
+                        f"• {entry['name']}  [{state}]",
+                        id=entry["name"],
+                    ))
+                option_list.add_options(options)
+                names = [entry["name"] for entry in entries]
+                if selected in names:
+                    option_list.highlighted = names.index(selected)
+                elif option_list.highlighted is None:
+                    option_list.highlighted = 0
+            self._server_list_signature = signature
+        self._refresh_management_buttons(client)
+
+    @on(OptionList.OptionHighlighted, "#mcp-server-list")
+    def _server_highlighted(self) -> None:
+        self._refresh_management_buttons(self.get_client())
+
     def refresh_status(self) -> None:
         """Display configured and live server state without leaking credentials."""
         client = self.get_client()
@@ -284,6 +432,7 @@ class MCPPanel(Vertical):
         status = self.query_one("#mcp-status", Static)
         servers = self.query_one("#mcp-servers", Static)
         tools = self.query_one("#mcp-tools", Static)
+        self._refresh_server_management(client)
 
         if client is None or not getattr(client, "enabled", False):
             status.update("MCP disabled or not initialized")

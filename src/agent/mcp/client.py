@@ -1304,6 +1304,65 @@ class MCPClient:
         self._initialized = False
         logger.info("MCP client shutdown complete")
 
+    def _drop_server_state(self, name: str) -> None:
+        self.tools = {
+            key: tool for key, tool in self.tools.items()
+            if tool.server != name
+        }
+        prefix = f"{name}:"
+        self.resources = {
+            key: value for key, value in self.resources.items()
+            if not key.startswith(prefix)
+        }
+        self.prompts = {
+            key: value for key, value in self.prompts.items()
+            if not key.startswith(prefix)
+        }
+
+    async def connect_server(self, name: str) -> bool:
+        """Connect one configured server without touching the others."""
+        if not self.enabled:
+            raise MCPConnectionError("MCP is disabled")
+        cfg = next((c for c in self.servers_cfg if c.name == name), None)
+        if cfg is None:
+            raise MCPConnectionError(f"MCP server '{name}' is not configured")
+
+        current = self.transports.get(name)
+        if current is not None:
+            if current.state in (MCPState.CONNECTED, MCPState.READY):
+                return False
+            self.transports.pop(name, None)
+            try:
+                await current.disconnect()
+            except Exception:
+                pass
+            self._drop_server_state(name)
+
+        await self._connect_server(cfg)
+        if not self._initialized:
+            self._initialized = True
+        if self._health_task is None or self._health_task.done():
+            self._health_task = asyncio.create_task(self._health_loop())
+        return True
+
+    async def disconnect_server(self, name: str) -> bool:
+        """Disconnect one live server while keeping it in the config."""
+        transport = self.transports.pop(name, None)
+        self._drop_server_state(name)
+        if transport is None:
+            return False
+        try:
+            await transport.disconnect()
+        except Exception as exc:
+            logger.debug(f"MCP disconnect for '{name}' failed: {exc}")
+        return True
+
+    def update_config(self, config: Dict[str, Any]) -> None:
+        """Apply an already-persisted MCP config without reconnecting."""
+        self.config = config
+        self.enabled = config.get("enabled", False)
+        self.servers_cfg = self._load_servers()
+
     async def reload(self) -> None:
         """
         Tear down and re-initialize every server.

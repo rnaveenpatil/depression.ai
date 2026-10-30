@@ -105,6 +105,177 @@ def _parse_args(value: Any) -> list[str]:
         raise ValueError("Invalid arguments: unmatched quote") from exc
 
 
+def list_mcp_servers(
+    *,
+    config_path: Path | None = None,
+) -> list[dict]:
+    """Return configured explicit servers and enabled presets, without secrets."""
+    config_path = config_path or USER_CONFIG_PATH
+    if not config_path.exists():
+        return []
+    try:
+        document = json.loads(config_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    if not isinstance(document, dict):
+        return []
+    current = document.get("mcp") or {}
+    if not isinstance(current, dict):
+        return []
+
+    out: list[dict] = []
+    seen: set[str] = set()
+    servers = current.get("servers") or []
+    if isinstance(servers, list):
+        for server in servers:
+            if not isinstance(server, dict):
+                continue
+            name = str(server.get("name") or "").strip()
+            if not name or name in seen:
+                continue
+            seen.add(name)
+            out.append({
+                "name": name,
+                "kind": "server",
+                "enabled": bool(server.get("enabled", True)),
+                "transport": str(server.get("transport") or ""),
+            })
+
+    presets = current.get("presets") or {}
+    if isinstance(presets, dict):
+        for key, preset in presets.items():
+            if not isinstance(preset, dict) or not preset.get("enabled", False):
+                continue
+            name = str(preset.get("name") or key).strip()
+            if not name or name in seen:
+                continue
+            seen.add(name)
+            out.append({"name": name, "kind": "preset", "enabled": True})
+    return out
+
+
+def _server_secret_keys(entry: dict, namespace: str) -> set[str]:
+    keys: set[str] = set()
+    api_key_env = entry.get("api_key_env")
+    if isinstance(api_key_env, str) and api_key_env.startswith(namespace + "_"):
+        keys.add(api_key_env)
+    for field in ("env", "headers"):
+        values = entry.get(field)
+        if not isinstance(values, dict):
+            continue
+        for value in values.values():
+            if not isinstance(value, str):
+                continue
+            if value.startswith("${") and value.endswith("}"):
+                key = value[2:-1]
+                if key.startswith(namespace + "_"):
+                    keys.add(key)
+    return keys
+
+
+def delete_mcp_server(
+    name: str,
+    *,
+    config_path: Path | None = None,
+    env_path: Path | None = None,
+) -> dict:
+    """Delete a configured server or disable its matching preset.
+
+    Only auto-generated ``DEPRESSION_MCP_<SERVER>_*`` secrets are removed,
+    and only when no remaining config entry references them.
+    """
+    config_path = config_path or USER_CONFIG_PATH
+    env_path = env_path or credential_env_path()
+    name = str(name or "").strip()
+    if not _NAME.fullmatch(name):
+        raise ValueError("Invalid MCP server name")
+    if not config_path.exists():
+        raise ValueError("MCP server not found")
+
+    try:
+        document = json.loads(config_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise ValueError("Cannot safely edit existing MCP config JSON") from exc
+    if not isinstance(document, dict):
+        raise ValueError("Existing config must be a JSON object")
+
+    current = document.get("mcp") or {}
+    if not isinstance(current, dict):
+        raise ValueError("Existing 'mcp' section must be a JSON object")
+    servers = current.get("servers") or []
+    if not isinstance(servers, list):
+        raise ValueError("Existing 'mcp.servers' must be a list")
+
+    removed = next(
+        (s for s in servers if isinstance(s, dict) and s.get("name") == name),
+        None,
+    )
+    kind = "server"
+    secret_keys: set[str] = set()
+
+    if removed is not None:
+        updated_servers = [
+            server for server in servers
+            if not (isinstance(server, dict) and server.get("name") == name)
+        ]
+        updated_mcp = {**current, "servers": updated_servers}
+        document["mcp"] = updated_mcp
+        namespace = "DEPRESSION_MCP_" + re.sub(
+            r"[^A-Z0-9_]", "_", name.upper()
+        )
+        secret_keys = _server_secret_keys(removed, namespace)
+    else:
+        presets = current.get("presets") or {}
+        if not isinstance(presets, dict):
+            raise ValueError("MCP server not found")
+        preset_key = next(
+            (
+                key for key, preset in presets.items()
+                if isinstance(preset, dict)
+                and preset.get("enabled", False)
+                and str(preset.get("name") or key) == name
+            ),
+            None,
+        )
+        if preset_key is None:
+            raise ValueError("MCP server not found")
+        kind = "preset"
+        updated_presets = dict(presets)
+        updated_presets[preset_key] = {
+            **presets[preset_key], "enabled": False,
+        }
+        updated_mcp = {**current, "presets": updated_presets}
+        document["mcp"] = updated_mcp
+
+    remaining = json.dumps(document, ensure_ascii=False)
+    removable = sorted(
+        key for key in secret_keys if ("${" + key + "}") not in remaining
+    )
+    write_private_file(
+        config_path, json.dumps(document, indent=2, ensure_ascii=False) + "\n",
+        mode=0o600,
+    )
+
+    cleanup_error = None
+    if removable:
+        try:
+            save_mcp_secrets(
+                {key: "" for key in removable},
+                env_path=env_path,
+                remove_empty=True,
+            )
+        except Exception as exc:
+            cleanup_error = type(exc).__name__
+
+    return {
+        "name": name,
+        "kind": kind,
+        "config": updated_mcp,
+        "secrets_removed": [] if cleanup_error else removable,
+        "cleanup_error": cleanup_error,
+    }
+
+
 def save_mcp_server(
     values: Dict[str, str],
     *,
