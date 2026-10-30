@@ -144,7 +144,7 @@ _DEFAULT_MAX_RETRIES = 2
 # reads it. Until then those callers simply see empty/zero values.
 
 #: Context window assumed when the connected model's is unknown or tiny.
-DEFAULT_CONTEXT_WINDOW = 500_000
+DEFAULT_CONTEXT_WINDOW = 1_000_000
 
 #: model id -> metadata (context_window, cost_input, capabilities, ...)
 MODEL_METADATA: Dict[str, Dict[str, Any]] = {}
