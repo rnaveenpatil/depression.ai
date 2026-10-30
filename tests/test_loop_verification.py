@@ -470,3 +470,21 @@ async def test_repeated_reads_stop_without_indefinite_loop():
     assert loop.context.metadata.get("stopped_on_no_progress") is True
     assert len(agent.executed) <= 6
     assert result["success"] is False
+
+
+@pytest.mark.asyncio
+async def test_greeting_does_not_expose_tools_or_invoke_file_reads():
+    loop, agent, _llm = make_loop([text_response("Hello!")])
+    result = await loop.run("hello")
+    assert result["success"] is True
+    assert agent.executed == []
+    assert loop.context.metadata["direct_greeting"] is True
+    assert loop._get_available_tools() == []
+
+
+@pytest.mark.asyncio
+async def test_coding_request_keeps_all_tools_available():
+    loop, _agent, _llm = make_loop([text_response("ready")])
+    await loop.run("fix the parser bug")
+    assert loop.context.metadata["direct_greeting"] is False
+    assert loop._get_available_tools()
