@@ -525,12 +525,15 @@ class CodeBlock(Vertical):
         if "code-copy" not in event.button.classes:
             return
         event.stop()
-        try:
-            self.app.copy_to_clipboard(self._code)
-            event.button.label = "COPIED"
-            self.set_timer(1.2, lambda: setattr(event.button, "label", "COPY"))
-        except Exception:
-            event.button.label = "FAILED"
+        from agent.utils.clipboard import copy_text
+
+        outcome = copy_text(self._code, terminal_copy=self.app.copy_to_clipboard)
+        event.button.label = {
+            "copied": "COPIED",
+            "terminal": "SENT",
+            "unavailable": "FAILED",
+        }[outcome]
+        self.set_timer(1.5, lambda: setattr(event.button, "label", "COPY"))
 
 
 class OutputView(Vertical):
