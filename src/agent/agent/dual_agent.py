@@ -319,6 +319,9 @@ class BaseAgent:
                     ),
                     category="cloud" if is_aws else "misc",
                 )
+            # Notifications and automatic reconnection must update the same
+            # Build registry that the LLM actually uses, not an orphan copy.
+            self.mcp_client._tool_registry = self.tool_registry
 
     def _get_config_object(self):
         try:
