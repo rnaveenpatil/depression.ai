@@ -213,9 +213,10 @@ class MCPPanel(Vertical):
                 "", id="mcp-tools",
                 classes="mcp-muted", markup=False,
             )
-            with Horizontal(id="mcp-actions"):
-                yield Button("REFRESH", id="mcp-refresh")
-                yield Button("RECONNECT", id="mcp-reconnect")
+        # Keep recovery controls visible even when details are collapsed.
+        with Horizontal(id="mcp-actions"):
+            yield Button("REFRESH", id="mcp-refresh")
+            yield Button("RECONNECT", id="mcp-reconnect")
 
     def on_mount(self) -> None:
         self.set_entry_mode(self._entry_mode)
