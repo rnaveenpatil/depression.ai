@@ -867,6 +867,7 @@ class AgentLoop:
         max_turns: Optional[int] = None,
     ) -> Dict[str, Any]:
         self.context = LoopContext()
+        self._checkpoint_goal = query
         self.current_plan = None
         self.pending_tool_calls = []
         self.completed_tool_calls = []
@@ -2439,6 +2440,70 @@ Stop when the goal is achieved.
     # THINK
     # ==================================================================
 
+    def _task_checkpoint(self) -> Dict[str, Any]:
+        """Build a bounded execution checkpoint without raw tool payloads."""
+        from pathlib import Path
+        import re
+
+        goal = str(getattr(self, "_checkpoint_goal", "") or "")[:500]
+        actions = list(getattr(self.context, "actions", []) or [])[-60:]
+        files, failures, completed = [], [], []
+        for action in actions:
+            if not isinstance(action, dict):
+                continue
+            name = str(action.get("tool") or "")[:60]
+            result = action.get("result")
+            success = action.get("success")
+            if success is None and isinstance(result, dict):
+                success = result.get("success", True)
+            if success is None:
+                success = not action.get("refused", False)
+            params = action.get("params") or {}
+            if not isinstance(params, dict):
+                params = {}
+            if name in ("write", "write_file", "edit", "apply_patch", "patch", "create",
+                        "delete", "remove", "move", "rename") and success:
+                candidate = params.get("path") or params.get("file_path") or params.get("filename")
+                if isinstance(candidate, str) and len(candidate) <= 240 and not re.search(
+                    r"(secret|password|token|credential|\.env)", candidate, re.I
+                ):
+                    files.append(candidate)
+            if success:
+                completed.append(name)
+            else:
+                failures.append(name + ": failed")
+        plan = getattr(self, "current_plan", None)
+        pending = []
+        if plan:
+            try:
+                pending = [str(t.description)[:160] for t in plan.get_pending_tasks()][:8]
+            except Exception:
+                pass
+        next_step = pending[0] if pending else (
+            "Verify outstanding changes" if self.context.unverified_mutations
+            else "Continue the current task using the latest tool results"
+        )
+        return {
+            "version": 1,
+            "goal": goal,
+            "completed_tools": list(dict.fromkeys(completed))[-12:],
+            "modified_files": list(dict.fromkeys(files))[-16:],
+            "failures": failures[-8:],
+            "pending_tasks": pending,
+            "next_step": next_step,
+            "unverified_changes": len(self.context.unverified_mutations),
+        }
+
+    def _save_task_checkpoint(self, checkpoint: Dict[str, Any]) -> None:
+        try:
+            from agent.context.checkpoint import TaskCheckpointStore
+            session = getattr(self.agent, "session", None)
+            session_id = str(getattr(session, "id", "") or "")
+            if session_id:
+                TaskCheckpointStore().save(session_id, checkpoint)
+        except Exception as exc:
+            logger.debug("Task checkpoint save failed: %s", exc)
+
     async def _think(self) -> Dict[str, Any]:
         await self._ensure_system_prompt()
 
@@ -2448,6 +2513,9 @@ Stop when the goal is achieved.
         state_parts: Dict[str, Any] = {"state": await self._get_state_context()}
         if self.current_plan and self.current_plan.get_pending_tasks():
             state_parts["plan"] = self._get_plan_context()
+        checkpoint = self._task_checkpoint()
+        state_parts["checkpoint"] = checkpoint
+        self._save_task_checkpoint(checkpoint)
         state_block = json.dumps(state_parts, default=str)
 
         await self._maybe_compact_before_call(system_prompt, tool_schemas, state_block)
