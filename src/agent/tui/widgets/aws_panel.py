@@ -20,8 +20,8 @@ Secret field contract:
       from the stored one, "secret unchanged" otherwise.
 
 Storage contract:
-    * Credentials are written via EnvManager to the private USER env file
-      (~/.agent/env, mode 0600) shared with LLM and MCP credentials.
+    * Credentials are written via EnvManager to the project .env file
+      (mode 0600) shared with LLM and MCP credentials.
     * EnvManager mirrors them into os.environ and notifies subscribers,
       so the MCP client, aws_helper, and terminal subprocesses see the
       change without a restart.
@@ -43,6 +43,7 @@ from textual.app import ComposeResult
 from textual.containers import Vertical
 from textual.widgets import Button, Input, Select, Static
 
+from agent.utils.credential_store import save_aws_credentials as persist_aws_credentials
 from agent.utils.env_manager import EnvManager
 
 
@@ -133,8 +134,12 @@ def _global_env_path() -> Optional[str]:
 
 
 def _written_env_path() -> Optional[str]:
-    """Return the canonical private credential store used by all panels."""
-    return _global_env_path()
+    """Return the canonical project credential store used by all panels."""
+    try:
+        from agent.utils.env_manager import credential_env_path
+        return str(credential_env_path())
+    except Exception:
+        return _global_env_path()
 
 def _parse_env_text(text: str) -> Dict[str, str]:
     """Parse raw ``KEY=VALUE`` env-file text into a dict."""
@@ -645,7 +650,7 @@ class AWSPanel(Vertical):
 
     def save_credentials(self) -> Dict[str, Any]:
         """
-        Persist AWS creds to ~/.agent/env, verify the write, notify the
+        Persist AWS creds to the project .env, verify the write, notify the
         agent, and refresh the panel.
 
         Returns:
@@ -690,57 +695,22 @@ class AWSPanel(Vertical):
                 "path": None,
             }
 
-        # --- persist via EnvManager ---
+        # --- persist through the single credential bridge ---
         try:
-            em = EnvManager.get()
+            persist_aws_credentials(
+                access_key=access_key,
+                secret_key=secret_key,
+                region=region,
+            )
         except Exception as e:
             return {
                 "ok": False,
-                "error": f"EnvManager unavailable: {e}",
-                "path": None,
-            }
-
-        saved = False
-        last_error = ""
-
-        # Preferred path: EnvManager.save_aws_credentials (updates
-        # os.environ + notifies subscribers).
-        saver = getattr(em, "save_aws_credentials", None)
-        if callable(saver):
-            try:
-                saver(
-                    access_key=access_key,
-                    secret_key=secret_key,
-                    region=region,
-                )
-                saved = True
-            except Exception as e:
-                last_error = str(e)
-
-        # Fallback: module-level set_aws_credentials helper.
-        if not saved:
-            try:
-                from agent.utils.env_manager import set_aws_credentials
-                set_aws_credentials(access_key, secret_key, region)
-                reload_fn = getattr(em, "reload", None)
-                if callable(reload_fn):
-                    try:
-                        reload_fn()
-                    except Exception:
-                        pass
-                saved = True
-            except Exception as e:
-                last_error = last_error or str(e)
-
-        if not saved:
-            return {
-                "ok": False,
-                "error": last_error or "unknown error saving credentials",
+                "error": str(e) or "unknown error saving credentials",
                 "path": None,
             }
 
         # --- verify the write actually landed on disk ---
-        # Verify the unified user-scoped credential file, not project .env.
+        # Verify the project credential file shared with LLM and MCP.
         env_path = _written_env_path() or _global_env_path()
         if env_path:
             try:

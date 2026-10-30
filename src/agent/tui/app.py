@@ -4299,7 +4299,7 @@ class DepressionApp(App):
         self.aws = get_aws_credentials()
         panel.refresh_values()
         panel.set_status(
-            f"saved to ~/.agent/env · {self.aws.get('region') or DEFAULT_AWS_REGION}"
+            f"saved to project .env · {self.aws.get('region') or DEFAULT_AWS_REGION}"
         )
         panel.start_scan(passes=2)
         panel.start_trace(ok=True)
@@ -4328,7 +4328,7 @@ class DepressionApp(App):
         panel.refresh_mcp_status()
         self._refresh_setup_status()
         self._system(
-            f"AWS credentials saved to ~/.agent/env "
+            f"AWS credentials saved to project .env "
             f"({self.aws.get('region') or DEFAULT_AWS_REGION}){note}"
         )
 

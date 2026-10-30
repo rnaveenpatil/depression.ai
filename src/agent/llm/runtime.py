@@ -46,7 +46,8 @@ from agent.llm.provider import (
     ProviderError,
     ProviderErrorCode,
 )
-from agent.utils.env_manager import get_env_var, set_env_var, load_into_os_environ
+from agent.utils.credential_store import save_llm_credentials
+from agent.utils.env_manager import get_env_var, load_into_os_environ
 from agent.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -807,9 +808,12 @@ def save_runtime_config(
         ENV_MODEL: model,
         ENV_PROVIDER: family or RUNTIME_PROVIDER,
     }
-    for key, value in values.items():
-        set_env_var(key, value)
-    os.environ.update(values)
+    save_llm_credentials(
+        base_url=base_url,
+        api_key=api_key,
+        model=model,
+        provider=family or RUNTIME_PROVIDER,
+    )
     return values
 
 

@@ -2,7 +2,7 @@
 AWS MCP server configuration builder.
 
 Credential sources (in order):
-    1. EnvManager.get_aws_env() — writes to ~/.agent/env, 0600
+    1. EnvManager.get_aws_env() — writes to the project .env, 0600
     2. ~/.aws/credentials + ~/.aws/config — for users with existing AWS setup
 
 The AWS MCP server runs `awslabs.core-mcp-server` via uvx and uses the

@@ -18,6 +18,7 @@ def test_private_token_and_existing_settings(tmp_path):
     assert len(obj["mcp"]["servers"]) == 2
     assert "SECRET_TOKEN" not in config.read_text()
     assert "SECRET_TOKEN" in env.read_text()
+    assert obj["mcp"]["servers"][1]["api_key_env"] == "DEPRESSION_MCP_DEMO_API_KEY"
     assert env.stat().st_mode & 0o077 == 0
 
 def test_pasted_json_stdio(tmp_path):
@@ -27,9 +28,25 @@ def test_pasted_json_stdio(tmp_path):
         "env": {"EXAMPLE_TOKEN": "private"}
     }}}
     saved = save_mcp_server({"json": json.dumps(payload)}, config_path=config, env_path=env)
-    assert saved["config"]["servers"][0]["transport"] == "stdio"
+    server = saved["config"]["servers"][0]
+    assert server["transport"] == "stdio"
+    assert server["env"]["EXAMPLE_TOKEN"] == "${DEPRESSION_MCP_FILESYSTEM_ENV_EXAMPLE_TOKEN}"
     assert "private" not in config.read_text()
-    assert "private" in env.read_text()
+    assert "DEPRESSION_MCP_FILESYSTEM_ENV_EXAMPLE_TOKEN=private" in env.read_text()
+
+def test_pasted_header_stored_as_env_reference(tmp_path):
+    config, env = tmp_path / "config.json", tmp_path / "env"
+    payload = {"mcpServers": {"demo": {
+        "url": "https://example.com/mcp",
+        "headers": {"X-Api-Token": "header-secret"},
+    }}}
+    saved = save_mcp_server(
+        {"json": json.dumps(payload)}, config_path=config, env_path=env,
+    )
+    server = saved["config"]["servers"][0]
+    assert server["headers"]["X-Api-Token"] == "${DEPRESSION_MCP_DEMO_HEADER_X_API_TOKEN}"
+    assert "DEPRESSION_MCP_DEMO_HEADER_X_API_TOKEN=header-secret" in env.read_text()
+
 
 @pytest.mark.parametrize("url", ["http://example.com/mcp", "https://user:pass@example.com/mcp", "file:///tmp/mcp"])
 def test_invalid_remote_url_rejected(tmp_path, url):

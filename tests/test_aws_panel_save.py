@@ -177,8 +177,8 @@ def test_save_reports_secret_replaced(monkeypatch, tmp_path):
     store = {}
     panel = _Panel(None, store)
 
-    # The global user-store path is patched by the isolation fixture.
-    # Keep this override as verification against the exact save destination.
+    # Keep save and verification on the same project .env path.
+    monkeypatch.setattr(em, "find_env_file", lambda: env)
     monkeypatch.setattr(
         "agent.tui.widgets.aws_panel._written_env_path", lambda: str(env)
     )
@@ -301,8 +301,8 @@ def test_save_fails_when_disk_holds_a_different_secret(monkeypatch, tmp_path):
     )
     # force the "write" to be a no-op so disk keeps the stale secret
     monkeypatch.setattr(
-        "agent.tui.widgets.aws_panel.EnvManager.get",
-        lambda: _NoWriteEnvManager(),
+        "agent.tui.widgets.aws_panel.persist_aws_credentials",
+        lambda **kwargs: None,
     )
 
     _Field.values = {"#aws-key": "AKIAREAL", "#aws-secret": "brandnewsecret"}
@@ -311,22 +311,6 @@ def test_save_fails_when_disk_holds_a_different_secret(monkeypatch, tmp_path):
 
     assert result["ok"] is False
     assert "different secret" in result["error"]
-
-
-class _NoWriteEnvManager:
-    """EnvManager stub whose save silently does nothing."""
-
-    def save_aws_credentials(self, **kwargs):
-        return None
-
-    def get_aws_credentials(self):
-        return {}
-
-    def subscribe(self, cb):
-        return None
-
-    def unsubscribe(self, cb):
-        return None
 
 
 class _Field:

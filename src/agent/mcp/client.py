@@ -1010,6 +1010,7 @@ class MCPClient:
                 max_reconnect_attempts=s.get("max_reconnect_attempts", 5),
                 enabled=True,
                 capabilities=s.get("capabilities", {}),
+                aws_credentials=s.get("aws_credentials", False),
             ))
 
         # Format B: presets

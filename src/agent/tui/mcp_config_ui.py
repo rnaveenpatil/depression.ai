@@ -1,13 +1,12 @@
 """Safe, paste-friendly MCP server configuration for the Textual UI.
 
 Only explicit Save actions write settings. Connections are stored in the user
-config; tokens and environment values are stored in the private ~/.agent/env
-file, never in the repository or config JSON.
+config; tokens and environment values are stored in the project .env file,
+never in the repository or config JSON.
 """
 from __future__ import annotations
 
 import json
-import os
 import re
 import shlex
 from pathlib import Path
@@ -15,7 +14,8 @@ from typing import Any, Dict
 from urllib.parse import urlsplit
 
 from agent.config.loader import USER_CONFIG_PATH
-from agent.utils.env_manager import GLOBAL_ENV_PATH, write_env_file, write_private_file
+from agent.utils.credential_store import credential_env_path, save_mcp_secrets
+from agent.utils.env_manager import write_private_file
 
 
 _NAME = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
@@ -117,7 +117,7 @@ def save_mcp_server(
     Never interprets a pasted string as a shell command.
     """
     config_path = config_path or USER_CONFIG_PATH
-    env_path = env_path or GLOBAL_ENV_PATH
+    env_path = env_path or credential_env_path()
     pasted = _parse_pasted_server(str(values.get("json") or ""))
 
     name = str(pasted.get("name") or values.get("name") or "").strip()
@@ -185,11 +185,11 @@ def save_mcp_server(
 
     def private(value: Any, label: str, suffix: str) -> str:
         text = _safe_value(value, label)
-        if text.startswith(") and text.endswith(") and _ENV_NAME.fullmatch(text[2:-1]):
+        if text.startswith("${") and text.endswith("}") and _ENV_NAME.fullmatch(text[2:-1]):
             return text
         env_key = f"{namespace}_{suffix}"
         secrets[env_key] = text
-        return " + env_key + "
+        return "${" + env_key + "}"
 
     # Preset or pasted stdio env vars are private, even if they contain tokens.
     env_data = pasted.get("env", {})
@@ -210,7 +210,7 @@ def save_mcp_server(
         if transport == "stdio":
             raise ValueError("Use the pasted JSON 'env' object for stdio secrets")
         entry["api_key_env"] = namespace + "_API_KEY"
-        if token.startswith(") and token.endswith(") and _ENV_NAME.fullmatch(token[2:-1]):
+        if token.startswith("${") and token.endswith("}") and _ENV_NAME.fullmatch(token[2:-1]):
             entry["api_key_env"] = token[2:-1]
         else:
             secrets[entry["api_key_env"]] = _safe_value(token, "API token")
@@ -240,13 +240,11 @@ def save_mcp_server(
     document["mcp"] = updated_mcp
 
     if secrets:
-        write_env_file(secrets, env_path, strict=True)
+        save_mcp_secrets(secrets, env_path=env_path)
     write_private_file(
         config_path, json.dumps(document, indent=2, ensure_ascii=False) + "\n",
         mode=0o600,
     )
-    for key, value in secrets.items():
-        os.environ[key] = value
 
     # Return sanitized server details, never credentials.
     return {"name": name, "transport": transport, "config": updated_mcp}

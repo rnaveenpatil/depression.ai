@@ -9,6 +9,15 @@ from agent.agent.dual_agent import AgentRole, BaseAgent
 from agent.agent.loop import AgentLoop
 from agent.llm.provider import ToolCall
 from agent.llm.runtime import configure_runtime_provider, get_llm_registry, reset_llm_registry
+from agent.utils import env_manager as em
+
+
+@pytest.fixture(autouse=True)
+def _isolate_env(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(em, "GLOBAL_ENV_PATH", tmp_path / "agent-env")
+    for key in ("DEPRESSION_PROVIDER", "DEPRESSION_BASE_URL", "DEPRESSION_API_KEY", "DEPRESSION_MODEL"):
+        monkeypatch.delenv(key, raising=False)
 
 
 def test_runtime_provider_is_selected_by_the_registry():

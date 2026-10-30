@@ -306,7 +306,7 @@ class AWSHelperTool(BaseTool):
         """
         env = {**os.environ}
 
-        # 1. Canonical: EnvManager (writes here go to ~/.agent/env).
+        # 1. Canonical: EnvManager (writes here go to the project .env).
         try:
             canonical = EnvManager.get().get_aws_env()
         except Exception:
@@ -379,7 +379,7 @@ class AWSHelperTool(BaseTool):
                 "_source": "cli",
                 "error": (
                     "No AWS credentials found. Save them via the AWS panel "
-                    "(they go to ~/.agent/env), or set AWS_ACCESS_KEY_ID + "
+                    "(they go to the project .env), or set AWS_ACCESS_KEY_ID + "
                     "AWS_SECRET_ACCESS_KEY in the environment, or create "
                     "~/.aws/credentials."
                 ),
