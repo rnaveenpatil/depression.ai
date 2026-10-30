@@ -92,7 +92,8 @@ async def test_reconnect_does_not_change_config_or_register_stale_tools(monkeypa
     app = DepressionApp(coordinator=coordinator, skip_onboarding=True)
     async with app.run_test() as pilot:
         app._slash("/mcp")
-        await pilot.pause()
+        # Sidebar animates its width for 200 ms before hit testing is stable.
+        await pilot.pause(0.35)
         button = app.query_one("#mcp-reconnect", Button)
         assert button.display and not button.disabled
         assert await pilot.click("#mcp-reconnect") is True
