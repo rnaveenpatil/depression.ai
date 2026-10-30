@@ -92,7 +92,8 @@ async def test_reconnect_does_not_change_config_or_register_stale_tools(monkeypa
     app = DepressionApp(coordinator=coordinator, skip_onboarding=True)
     async with app.run_test() as pilot:
         app._slash("/mcp")
-        app._reconnect_mcp()
+        await pilot.pause()
+        await pilot.click("#mcp-reconnect")
         await pilot.pause()
         for _ in range(20):
             await pilot.pause()
