@@ -2717,40 +2717,42 @@ Stop when the goal is achieved.
         """
         results: List[Dict[str, Any]] = []
 
-        parallel_batch: List[ToolCall] = []
-        sequential_batch: List[ToolCall] = []
+        # Preserve the model's ordering. Only consecutive, independent
+        # read-only calls may run together; never move reads ahead of writes.
+        parallel_reads: List[ToolCall] = []
+
+        async def flush_reads() -> None:
+            if not parallel_reads:
+                return
+            batch = list(parallel_reads)
+            parallel_reads.clear()
+            if len(batch) == 1:
+                results.append(await self._act_one(
+                    batch[0], persist=persist, track_verification=track_verification,
+                ))
+            else:
+                results.extend(await asyncio.gather(*[
+                    self._act_one(call, persist=persist,
+                                  track_verification=track_verification)
+                    for call in batch
+                ]))
 
         for call in calls:
             name = getattr(call, "name", "")
+            args = getattr(call, "arguments", {}) or {}
             if (
                 self.enable_parallel_reads
                 and self._is_read_only(name)
-                and not _looks_destructive_call(name, getattr(call, "arguments", {}) or {})
+                and not _looks_destructive_call(name, args)
             ):
-                parallel_batch.append(call)
+                parallel_reads.append(call)
             else:
-                sequential_batch.append(call)
+                await flush_reads()
+                results.append(await self._act_one(
+                    call, persist=persist, track_verification=track_verification,
+                ))
 
-        if parallel_batch:
-            parallel_results = await asyncio.gather(
-                *[
-                    self._act_one(
-                        call, persist=persist,
-                        track_verification=track_verification,
-                    )
-                    for call in parallel_batch
-                ],
-                return_exceptions=False,
-            )
-            results.extend(parallel_results)
-
-        for call in sequential_batch:
-            r = await self._act_one(
-                call, persist=persist,
-                track_verification=track_verification,
-            )
-            results.append(r)
-
+        await flush_reads()
         return results
 
     async def _act_one(
