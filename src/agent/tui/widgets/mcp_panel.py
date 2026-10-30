@@ -154,6 +154,11 @@ class MCPPanel(Vertical):
             "Paste connection details directly. No suggestions or presets.",
             classes="mcp-muted", markup=False,
         )
+        # Recovery belongs at the top, visible without expanding details or
+        # scrolling through a long form on small terminal windows.
+        with Horizontal(id="mcp-actions"):
+            yield Button("REFRESH", id="mcp-refresh")
+            yield Button("RECONNECT", id="mcp-reconnect")
         with Horizontal(id="mcp-mode-row"):
             yield Button("HTTP", id="mcp-mode-http", classes="mcp-mode active")
             yield Button("SSE", id="mcp-mode-sse", classes="mcp-mode")
@@ -213,10 +218,7 @@ class MCPPanel(Vertical):
                 "", id="mcp-tools",
                 classes="mcp-muted", markup=False,
             )
-        # Keep recovery controls visible even when details are collapsed.
-        with Horizontal(id="mcp-actions"):
-            yield Button("REFRESH", id="mcp-refresh")
-            yield Button("RECONNECT", id="mcp-reconnect")
+
 
     def on_mount(self) -> None:
         self.set_entry_mode(self._entry_mode)
