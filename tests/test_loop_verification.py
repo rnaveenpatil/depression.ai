@@ -432,3 +432,41 @@ def test_stop_disables_batch_verification():
     loop.should_stop = True
 
     assert loop._should_batch_verify("done") is False
+
+
+def test_successful_reads_are_not_counted_as_task_progress():
+    loop, _agent, _llm = make_loop([])
+    assert loop._made_progress([
+        {"tool": "read", "result": {"success": True, "content": "file data"}}
+    ]) is False
+    assert loop._made_progress([
+        {"tool": "grep", "result": {"success": True, "content": "match"}}
+    ]) is False
+
+
+def test_mutations_still_count_as_progress_but_noops_do_not():
+    loop, _agent, _llm = make_loop([])
+    assert loop._made_progress([
+        {"tool": "write", "result": {"success": True, "changed": True}}
+    ]) is True
+    assert loop._made_progress([
+        {"tool": "write", "result": {"success": True, "changed": False}}
+    ]) is False
+    assert loop._made_progress([
+        {"tool": "read", "cached": True, "result": {"success": True}}
+    ]) is False
+
+
+@pytest.mark.asyncio
+async def test_repeated_reads_stop_without_indefinite_loop():
+    calls = [
+        tool_response(ToolCall(id=f"r{i}", name="read", arguments={"filePath": f"file{i}.py"}))
+        for i in range(12)
+    ]
+    loop, agent, _llm = make_loop(
+        calls, no_progress_streak_cap=6, max_iterations=30
+    )
+    result = await loop.run("inspect these files")
+    assert loop.context.metadata.get("stopped_on_no_progress") is True
+    assert len(agent.executed) <= 6
+    assert result["success"] is False
