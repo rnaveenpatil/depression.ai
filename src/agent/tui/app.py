@@ -3914,12 +3914,24 @@ class DepressionApp(App):
         if not self._last_output:
             self._system("nothing to copy yet")
             return
-        try:
-            self.copy_to_clipboard(self._last_output)
-            chars = len(self._last_output)
+        from agent.utils.clipboard import copy_text
+
+        outcome = copy_text(
+            self._last_output, terminal_copy=self.copy_to_clipboard
+        )
+        chars = len(self._last_output)
+        if outcome == "copied":
             self._system(f"copied last reply ({chars:,} chars) to the clipboard")
-        except Exception as exc:
-            self._error(f"clipboard copy failed: {exc}")
+        elif outcome == "terminal":
+            self._system(
+                "sent clipboard request to terminal (OSC 52); "
+                "paste availability depends on terminal support"
+            )
+        else:
+            self._error(
+                "clipboard unavailable; install wl-clipboard (Wayland) "
+                "or xclip/xsel (X11), or use a terminal supporting OSC 52"
+            )
 
     def _export_transcript(self, path: str = "") -> None:
         if not self._transcript_log:
