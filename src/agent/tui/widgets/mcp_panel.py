@@ -422,9 +422,12 @@ class MCPPanel(Vertical):
             return
 
         reconnect = self.query_one("#mcp-reconnect", Button)
+        # Reconnect can bootstrap a missing client from previously saved servers.
         reconnect.disabled = (
-            client is None or not bool(getattr(client, "enabled", False))
-            or bool(getattr(self._host_app, "busy", False))
+            bool(getattr(self._host_app, "busy", False))
+            or not (bool(list_mcp_servers()) or (
+                client is not None and bool(getattr(client, "enabled", False))
+            ))
         )
         self.query_one("#mcp-save", Button).disabled = bool(
             getattr(self._host_app, "busy", False)
@@ -453,7 +456,11 @@ class MCPPanel(Vertical):
             if state in ("connected", "ready"):
                 connected += 1
             transport_kind = getattr(getattr(cfg, "transport", None), "value", "unknown")
-            lines.append(f"• {name} ({transport_kind}): {state}")
+            error = str((getattr(client, "connection_errors", {}) or {}).get(name) or "")
+            lines.append(
+                f"• {name} ({transport_kind}): {state}"
+                + (f" — {error[:180]}" if error and state not in ("connected", "ready") else "")
+            )
 
         status.update(
             f"{connected}/{len(configurations)} configured server(s) connected"
