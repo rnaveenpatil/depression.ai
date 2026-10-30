@@ -93,7 +93,9 @@ async def test_reconnect_does_not_change_config_or_register_stale_tools(monkeypa
     async with app.run_test() as pilot:
         app._slash("/mcp")
         await pilot.pause()
-        await pilot.click("#mcp-reconnect")
+        button = app.query_one("#mcp-reconnect", Button)
+        assert button.display and not button.disabled
+        assert await pilot.click("#mcp-reconnect") is True
         await pilot.pause()
         for _ in range(20):
             await pilot.pause()
