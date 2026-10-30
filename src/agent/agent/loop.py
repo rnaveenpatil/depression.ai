@@ -900,8 +900,15 @@ class AgentLoop:
         try:
             self.state = LoopState.INITIALIZING
 
+            # Do not route an unambiguous greeting into repository inspection.
+            greeting = bool(re.fullmatch(
+                r"\s*(?:hi|hello|hey|hiya|good morning|good evening|"
+                r"good afternoon|thanks|thank you|ok|okay)[!.\s]*",
+                query or "", re.I,
+            ))
+            self.context.metadata["direct_greeting"] = greeting
             # Avoid extra intent/planning model requests for unambiguous questions.
-            simple_question = bool(re.match(
+            simple_question = greeting or bool(re.match(
                 r"^\s*(what is|what are|who is|why does|how does|"
                 r"define|explain|tell me about)\b", query, re.I,
             )) and not bool(re.search(
@@ -1100,6 +1107,30 @@ class AgentLoop:
                     self.context.metadata["stopped_on_failures"] = True
                     break
 
+                # Detect repeated batches independently of model claims. This
+                # catches models alternating tools and endlessly retrying the
+                # same arguments. A real mutation resets the batch history.
+                signatures = []
+                for call in thought["tool_calls"]:
+                    name = str(getattr(call, "name", ""))
+                    args = getattr(call, "arguments", {}) or {}
+                    try:
+                        signature = json.dumps([name, args], sort_keys=True, default=str)
+                    except (TypeError, ValueError):
+                        signature = name
+                    signatures.append(signature)
+                batch_signature = tuple(sorted(signatures))
+                seen = self.context.metadata.setdefault("repeated_batches", {})
+                if self._made_progress(results):
+                    seen.clear()
+                elif batch_signature:
+                    count = seen.get(batch_signature, 0) + 1
+                    seen[batch_signature] = count
+                    if count >= 3:
+                        logger.warning("Stopping repeated identical tool batch: %s", batch_signature)
+                        self.context.metadata["stopped_on_no_progress"] = True
+                        break
+
                 # [STOP-2] No-progress breaker: if 3 consecutive acting
                 # iterations produce nothing new, stop churning.
                 if self._made_progress(results):
@@ -1175,6 +1206,22 @@ class AgentLoop:
                     ),
                 )
                 continue
+
+            # A final answer with no further tool requests is the natural
+            # completion signal. Do not manufacture more work for read-only
+            # tasks; only actual outstanding modifications require validation.
+            if (response_text and not self.context.unverified_mutations
+                    and not self._pending_verification_entries()
+                    and not self.context.metadata.get("stopped_on_failures")
+                    and not (
+                        (self.context.metadata.get("requires_action") is True
+                         or self.context.intent in ("feature", "bugfix", "refactor"))
+                        and not self.context.metadata.get("action_attempted")
+                    )):
+                self.state = LoopState.STOPPED
+                self._update_metrics()
+                response_text = await self._ensure_demo_offer(response_text)
+                return self._result(True, response_text)
 
             # A single file write/edit is cheap to verify directly. Read it
             # back now instead of spending an extra LLM turn on the simple
@@ -2116,6 +2163,11 @@ AUTONOMY & INTELLIGENT EXECUTION
 - Make all changes needed to achieve the goal while preserving unrelated functionality and user data.
 - Plan complex tasks; use the TODO tool when useful; execute simple tasks directly.
 - Use available tools effectively. Inspect relevant context selectively and reuse existing information.
+- For repository tasks, follow an evidence-first loop: understand the requested outcome; locate relevant symbols with filename hints, glob, and bounded grep; inspect only the matching function and its direct callers; formulate a concrete root-cause hypothesis; make the smallest sufficient change; run the narrowest useful test; stop when evidence meets the goal.
+- Search by exact error, function, class, API, or filename before opening unrelated files. Expand to adjacent modules only if the first hypothesis fails or cross-module behavior is required.
+- A successful file read or grep is information, not task progress. Do not keep browsing unless the next lookup answers a specific unresolved question.
+- Separate observed tool results from hypotheses. Never invent file content, paths, signatures, test outcomes, or claim an unexecuted change worked.
+- For non-coding tasks, choose the appropriate workflow freely; these discovery heuristics are not restrictions on available capabilities.
 - Avoid redundant operations, unnecessary tool calls, repeated file reads, and wasted tokens.
 - Work independently within granted permissions without interrupting the user unnecessarily.
 
@@ -2764,6 +2816,10 @@ Stop when the goal is achieved.
     # ==================================================================
 
     def _get_available_tools(self) -> List[Dict[str, Any]]:
+        # Obvious greetings need no tool schemas or tool-selection opportunities.
+        # Keep all tools available for real tasks, including investigative ones.
+        if self.context.metadata.get("direct_greeting"):
+            return []
         return self._registry_get_schemas()
 
     async def _get_state_context(self) -> Dict[str, Any]:
