@@ -1992,7 +1992,7 @@ class DepressionApp(App):
     tokens_used: reactive[int] = reactive(0)
     cost: reactive[float] = reactive(0.0)
     message_count: reactive[int] = reactive(0)
-    context_window: reactive[int] = reactive(200_000)
+    context_window: reactive[int] = reactive(1_000_000)
     queue_depth: reactive[int] = reactive(0)
 
     live_input_tokens: reactive[int] = reactive(0)
