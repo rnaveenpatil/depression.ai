@@ -1635,6 +1635,10 @@ class MCPClient:
         if tool_registry is None:
             return 0
 
+        # Drop stale MCP tools after failed reconnect or a server tool-list change.
+        for old_name in tool_registry.list_tools():
+            if old_name.startswith("mcp__") and old_name not in self.tools:
+                tool_registry.unregister_tool(old_name)
         count = 0
         for full_name, tool in self.tools.items():
             # Bind by default-arg to avoid late-binding closure bugs.
@@ -1649,6 +1653,9 @@ class MCPClient:
                     parameters=tool.input_schema or {
                         "type": "object", "properties": {},
                     },
+                    read_only=False,
+                    mutating=True,
+                    category="cloud" if full_name.startswith("mcp__aws__") else "misc",
                 )
                 count += 1
             except Exception as e:
