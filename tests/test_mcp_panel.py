@@ -66,8 +66,16 @@ async def test_mcp_panel_displays_shared_client_and_lists_servers():
 
 
 @pytest.mark.asyncio
-async def test_reconnect_does_not_change_config_or_register_stale_tools():
+async def test_reconnect_does_not_change_config_or_register_stale_tools(monkeypatch):
     client = DummyClient()
+    # Reconnect now reloads the saved MCP settings before reconnecting.
+    monkeypatch.setattr(
+        "agent.config.loader.ConfigLoader.load",
+        lambda self, **kwargs: SimpleNamespace(
+            to_dict=lambda **options: {"mcp": {"enabled": True, "servers": []}}
+        ),
+    )
+    client.update_config = lambda cfg: None
     registry = ToolRegistry()
     registry.register_external(
         name="mcp__stale__old",
@@ -84,7 +92,14 @@ async def test_reconnect_does_not_change_config_or_register_stale_tools():
     app = DepressionApp(coordinator=coordinator, skip_onboarding=True)
     async with app.run_test() as pilot:
         app._slash("/mcp")
-        app._reconnect_mcp()
+        # Sidebar animates its width for 200 ms before hit testing is stable.
+        await pilot.pause(0.35)
+        button = app.query_one("#mcp-reconnect", Button)
+        assert button.display and not button.disabled
+        # The /mcp command focuses an input farther down the scrollable panel.
+        button.scroll_visible(animate=False)
+        await pilot.pause()
+        assert await pilot.click("#mcp-reconnect") is True
         await pilot.pause()
         for _ in range(20):
             await pilot.pause()

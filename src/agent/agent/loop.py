@@ -890,7 +890,22 @@ class AgentLoop:
         try:
             self.state = LoopState.INITIALIZING
 
-            intent = await self._classify_intent(query)
+            # Avoid extra intent/planning model requests for unambiguous questions.
+            simple_question = bool(re.match(
+                r"^\s*(what is|what are|who is|why does|how does|"
+                r"define|explain|tell me about)\b", query, re.I,
+            )) and not bool(re.search(
+                r"\b(implement|modify|change|create|build|fix|run|execute|"
+                r"delete|install|update|test|deploy|launch|edit|write)\b",
+                query, re.I,
+            ))
+            if simple_question:
+                intent = "question"
+                self.context.metadata.update({
+                    "intent_needs_plan": False, "requires_action": False,
+                })
+            else:
+                intent = await self._classify_intent(query)
             self.context.intent = intent
             logger.info("Classified intent: %s", intent)
 
@@ -1638,6 +1653,11 @@ class AgentLoop:
         max_local_turns = self.max_tool_calls_per_iteration * 2
         local_unverified: Dict[str, Dict[str, Any]] = {}
         local_verify_rounds = 0
+        task_actions = 0
+        action_required = bool(re.match(
+            r"^\s*(write|edit|modify|create|build|implement|fix|delete|"
+            r"install|deploy|update|execute|run)\b", task.description, re.I,
+        ))
 
         while local_turns < max_local_turns:
             local_turns += 1
@@ -1676,7 +1696,23 @@ class AgentLoop:
                 upper = content.upper()
                 if upper.startswith("TASK FAILED"):
                     return {"success": False, "retry": True, "error": content}
-
+                if action_required and not task_actions:
+                    if local_turns < max_local_turns:
+                        messages.append(Message(role="assistant", content=content))
+                        messages.append(Message(
+                            role="user",
+                            content=(
+                                "This task requires an actual action, but no tool "
+                                "has succeeded yet. Execute the required operation "
+                                "with the appropriate tool, or respond "
+                                "'TASK FAILED: <concrete blocker>'."
+                            ),
+                        ))
+                        continue
+                    return {
+                        "success": False, "retry": False,
+                        "error": "No successful tool action executed",
+                    }
                 # Task-local verification. Reads clear only the target they
                 # actually checked; the budget is per task, not global.
                 verify_budget = (
@@ -1775,6 +1811,8 @@ class AgentLoop:
                 tool = x.get("tool", "")
                 if not r.get("success"):
                     continue
+                if not self._is_read_only(tool):
+                    task_actions += 1
                 tool_args = x.get("params") or {}
                 if self._is_read_only(tool):
                     target = _read_target(tool, tool_args)
@@ -2717,40 +2755,42 @@ Stop when the goal is achieved.
         """
         results: List[Dict[str, Any]] = []
 
-        parallel_batch: List[ToolCall] = []
-        sequential_batch: List[ToolCall] = []
+        # Preserve the model's ordering. Only consecutive, independent
+        # read-only calls may run together; never move reads ahead of writes.
+        parallel_reads: List[ToolCall] = []
+
+        async def flush_reads() -> None:
+            if not parallel_reads:
+                return
+            batch = list(parallel_reads)
+            parallel_reads.clear()
+            if len(batch) == 1:
+                results.append(await self._act_one(
+                    batch[0], persist=persist, track_verification=track_verification,
+                ))
+            else:
+                results.extend(await asyncio.gather(*[
+                    self._act_one(call, persist=persist,
+                                  track_verification=track_verification)
+                    for call in batch
+                ]))
 
         for call in calls:
             name = getattr(call, "name", "")
+            args = getattr(call, "arguments", {}) or {}
             if (
                 self.enable_parallel_reads
                 and self._is_read_only(name)
-                and not _looks_destructive_call(name, getattr(call, "arguments", {}) or {})
+                and not _looks_destructive_call(name, args)
             ):
-                parallel_batch.append(call)
+                parallel_reads.append(call)
             else:
-                sequential_batch.append(call)
+                await flush_reads()
+                results.append(await self._act_one(
+                    call, persist=persist, track_verification=track_verification,
+                ))
 
-        if parallel_batch:
-            parallel_results = await asyncio.gather(
-                *[
-                    self._act_one(
-                        call, persist=persist,
-                        track_verification=track_verification,
-                    )
-                    for call in parallel_batch
-                ],
-                return_exceptions=False,
-            )
-            results.extend(parallel_results)
-
-        for call in sequential_batch:
-            r = await self._act_one(
-                call, persist=persist,
-                track_verification=track_verification,
-            )
-            results.append(r)
-
+        await flush_reads()
         return results
 
     async def _act_one(

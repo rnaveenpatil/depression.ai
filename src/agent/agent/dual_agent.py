@@ -319,6 +319,9 @@ class BaseAgent:
                     ),
                     category="cloud" if is_aws else "misc",
                 )
+            # Notifications and automatic reconnection must update the same
+            # Build registry that the LLM actually uses, not an orphan copy.
+            self.mcp_client._tool_registry = self.tool_registry
 
     def _get_config_object(self):
         try:
@@ -713,7 +716,7 @@ class PlanAgent(BaseAgent):
         }
 
     def get_available_tools(self) -> List[str]:
-        return list(self.tool_registry.tools.keys())
+        return self.tool_registry.list_tools()
 
 
 class BuildAgent(BaseAgent):
@@ -723,7 +726,7 @@ class BuildAgent(BaseAgent):
         super().__init__(AgentRole.BUILD, *args, **kwargs)
 
     def get_available_tools(self) -> List[str]:
-        return list(self.tool_registry.tools.keys())
+        return self.tool_registry.list_tools()
 
 
 @dataclass
@@ -944,10 +947,19 @@ class AgentCoordinator:
             "Continue until all tasks are complete or you encounter blockers.\n"
             "Be specific about what you did and any errors encountered."
         )
-        # [Bug 1] Orchestration prompt: do NOT persist as a user turn.
-        build_result = await self.build_agent.process_query(
-            query=build_prompt, context=context, record_user=False,
-        )
+        # A plan already exists. Don't spend another model call planning
+        # the coordinator's execution prompt inside the Build agent.
+        build_loop = getattr(self.build_agent, "loop", None)
+        original_planning = getattr(build_loop, "enable_planning", False)
+        try:
+            if build_loop is not None:
+                build_loop.enable_planning = False
+            build_result = await self.build_agent.process_query(
+                query=build_prompt, context=context, record_user=False,
+            )
+        finally:
+            if build_loop is not None:
+                build_loop.enable_planning = original_planning
         result = {
             "success": build_result.get("success", True),
             "plan": plan,
@@ -1061,10 +1073,19 @@ class AgentCoordinator:
                 "Continue until all tasks are complete or you encounter blockers.\n"
                 "Be specific about what you did and any errors encountered."
             )
-            # [Bug 1] Orchestration prompt: NOT a user turn.
-            build_result = await self.build_agent.process_query(
-                query=build_prompt, context=current_context, record_user=False,
-            )
+            # The coordinator already planned this iteration. Avoid a
+            # second plan-generation pass in the Build agent.
+            build_loop = getattr(self.build_agent, "loop", None)
+            original_planning = getattr(build_loop, "enable_planning", False)
+            try:
+                if build_loop is not None:
+                    build_loop.enable_planning = False
+                build_result = await self.build_agent.process_query(
+                    query=build_prompt, context=current_context, record_user=False,
+                )
+            finally:
+                if build_loop is not None:
+                    build_loop.enable_planning = original_planning
 
             execution_result = build_result.get("response", "")
             execution_history.append({

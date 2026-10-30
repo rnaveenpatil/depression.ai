@@ -154,6 +154,11 @@ class MCPPanel(Vertical):
             "Paste connection details directly. No suggestions or presets.",
             classes="mcp-muted", markup=False,
         )
+        # Recovery belongs at the top, visible without expanding details or
+        # scrolling through a long form on small terminal windows.
+        with Horizontal(id="mcp-actions"):
+            yield Button("REFRESH", id="mcp-refresh")
+            yield Button("RECONNECT", id="mcp-reconnect")
         with Horizontal(id="mcp-mode-row"):
             yield Button("HTTP", id="mcp-mode-http", classes="mcp-mode active")
             yield Button("SSE", id="mcp-mode-sse", classes="mcp-mode")
@@ -213,9 +218,7 @@ class MCPPanel(Vertical):
                 "", id="mcp-tools",
                 classes="mcp-muted", markup=False,
             )
-            with Horizontal(id="mcp-actions"):
-                yield Button("REFRESH", id="mcp-refresh")
-                yield Button("RECONNECT", id="mcp-reconnect")
+
 
     def on_mount(self) -> None:
         self.set_entry_mode(self._entry_mode)
@@ -422,9 +425,12 @@ class MCPPanel(Vertical):
             return
 
         reconnect = self.query_one("#mcp-reconnect", Button)
+        # Reconnect can bootstrap a missing client from previously saved servers.
         reconnect.disabled = (
-            client is None or not bool(getattr(client, "enabled", False))
-            or bool(getattr(self._host_app, "busy", False))
+            bool(getattr(self._host_app, "busy", False))
+            or not (bool(list_mcp_servers()) or (
+                client is not None and bool(getattr(client, "enabled", False))
+            ))
         )
         self.query_one("#mcp-save", Button).disabled = bool(
             getattr(self._host_app, "busy", False)
@@ -453,7 +459,11 @@ class MCPPanel(Vertical):
             if state in ("connected", "ready"):
                 connected += 1
             transport_kind = getattr(getattr(cfg, "transport", None), "value", "unknown")
-            lines.append(f"• {name} ({transport_kind}): {state}")
+            error = str((getattr(client, "connection_errors", {}) or {}).get(name) or "")
+            lines.append(
+                f"• {name} ({transport_kind}): {state}"
+                + (f" — {error[:180]}" if error and state not in ("connected", "ready") else "")
+            )
 
         status.update(
             f"{connected}/{len(configurations)} configured server(s) connected"
