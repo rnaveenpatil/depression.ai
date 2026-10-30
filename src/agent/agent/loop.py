@@ -1654,8 +1654,8 @@ class AgentLoop:
         local_unverified: Dict[str, Dict[str, Any]] = {}
         local_verify_rounds = 0
         task_actions = 0
-        action_required = bool(re.search(
-            r"\b(write|edit|modify|create|build|implement|fix|delete|"
+        action_required = bool(re.match(
+            r"^\s*(write|edit|modify|create|build|implement|fix|delete|"
             r"install|deploy|update|execute|run)\b", task.description, re.I,
         ))
 
@@ -1694,6 +1694,8 @@ class AgentLoop:
 
             if not tool_calls:
                 upper = content.upper()
+                if upper.startswith("TASK FAILED"):
+                    return {"success": False, "retry": True, "error": content}
                 if action_required and not task_actions:
                     if local_turns < max_local_turns:
                         messages.append(Message(role="assistant", content=content))
@@ -1711,9 +1713,6 @@ class AgentLoop:
                         "success": False, "retry": False,
                         "error": "No successful tool action executed",
                     }
-                if upper.startswith("TASK FAILED"):
-                    return {"success": False, "retry": True, "error": content}
-
                 # Task-local verification. Reads clear only the target they
                 # actually checked; the budget is per task, not global.
                 verify_budget = (
