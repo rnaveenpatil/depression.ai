@@ -292,9 +292,8 @@ class FileSystemTool(BaseTool):
                         if used + len(raw_line) > byte_limit:
                             # Respect byte cap even for a single very long line.
                             room = byte_limit - used
-                            if room > 0:
-                                chunks.append(raw_line[:room])
-                                used += room
+                            # Never return half a line: the caller can resume
+                            # with next_line without losing bytes.
                             break
                         chunks.append(raw_line)
                         used += len(raw_line)
