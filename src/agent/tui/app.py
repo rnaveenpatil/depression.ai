@@ -3329,7 +3329,23 @@ class DepressionApp(App):
             else:
                 client.update_config(cfg)
             self._system("Reconnecting configured MCP servers…")
-            await self._reload_mcp_client(client)
+            # Repair missing/down connections without interrupting healthy ones.
+            if hasattr(client, "connect_server") and hasattr(client, "disconnect_server"):
+                wanted = {server.name for server in client.servers_cfg}
+                for name in list(client.transports):
+                    if name not in wanted:
+                        await client.disconnect_server(name)
+                for server in client.servers_cfg:
+                    transport = client.transports.get(server.name)
+                    state = getattr(getattr(transport, "state", None), "value", "")
+                    if state not in ("ready", "connected"):
+                        try:
+                            await client.connect_server(server.name)
+                        except Exception as exc:
+                            client.connection_errors[server.name] = str(exc)
+                self._sync_mcp_tools(client)
+            else:
+                await self._reload_mcp_client(client)
             servers = list(client.servers_cfg)
             connected = len(client.transports)
             errors = getattr(client, "connection_errors", {}) or {}
