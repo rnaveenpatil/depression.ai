@@ -34,3 +34,13 @@ async def test_invalid_line_range_rejected(tmp_path):
     tool = FileSystemTool()
     result = await tool._read(path, {"start_line": 4, "end_line": 2})
     assert not result["success"]
+
+
+@pytest.mark.asyncio
+async def test_line_range_binary_file_rejected(tmp_path):
+    path = tmp_path / "binary.dat"
+    path.write_bytes(b"ok\x00bad\n")
+    tool = FileSystemTool()
+    result = await tool._read(path, {"start_line": 1, "end_line": 1})
+    assert result["success"] is False
+    assert result.get("binary") is True
