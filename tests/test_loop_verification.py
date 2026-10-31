@@ -432,3 +432,86 @@ def test_stop_disables_batch_verification():
     loop.should_stop = True
 
     assert loop._should_batch_verify("done") is False
+
+
+def test_successful_reads_are_not_counted_as_task_progress():
+    loop, _agent, _llm = make_loop([])
+    assert loop._made_progress([
+        {"tool": "read", "result": {"success": True, "content": "file data"}}
+    ]) is False
+    assert loop._made_progress([
+        {"tool": "grep", "result": {"success": True, "content": "match"}}
+    ]) is False
+
+
+def test_mutations_still_count_as_progress_but_noops_do_not():
+    loop, _agent, _llm = make_loop([])
+    assert loop._made_progress([
+        {"tool": "write", "result": {"success": True, "changed": True}}
+    ]) is True
+    assert loop._made_progress([
+        {"tool": "write", "result": {"success": True, "changed": False}}
+    ]) is False
+    assert loop._made_progress([
+        {"tool": "read", "cached": True, "result": {"success": True}}
+    ]) is False
+
+
+@pytest.mark.asyncio
+async def test_repeated_reads_stop_without_indefinite_loop():
+    calls = [
+        tool_response(ToolCall(id=f"r{i}", name="read", arguments={"filePath": f"file{i}.py"}))
+        for i in range(12)
+    ]
+    loop, agent, _llm = make_loop(
+        calls, no_progress_streak_cap=6, max_iterations=30
+    )
+    result = await loop.run("inspect these files")
+    assert loop.context.metadata.get("stopped_on_no_progress") is True
+    assert len(agent.executed) <= 6
+    assert result["success"] is False
+
+
+@pytest.mark.asyncio
+async def test_greeting_does_not_expose_tools_or_invoke_file_reads():
+    loop, agent, _llm = make_loop([text_response("Hello!")])
+    result = await loop.run("hello")
+    assert result["success"] is True
+    assert agent.executed == []
+    assert loop.context.metadata["direct_greeting"] is True
+    assert loop._get_available_tools() == []
+
+
+@pytest.mark.asyncio
+async def test_coding_request_keeps_all_tools_available():
+    loop, _agent, _llm = make_loop([text_response("ready")])
+    await loop.run("fix the parser bug")
+    assert loop.context.metadata["direct_greeting"] is False
+    assert loop._get_available_tools()
+
+
+@pytest.mark.asyncio
+async def test_identical_read_batches_stop_early():
+    calls = [
+        tool_response(ToolCall(id=f"repeat{i}", name="read",
+                               arguments={"filePath": "same.py"}))
+        for i in range(12)
+    ]
+    loop, agent, _llm = make_loop(calls, no_progress_streak_cap=12)
+    result = await loop.run("inspect the same file")
+    assert loop.context.metadata.get("stopped_on_no_progress") is True
+    assert len(agent.executed) <= 3
+    assert result["success"] is False
+
+
+@pytest.mark.asyncio
+async def test_read_only_answer_stops_after_one_observation():
+    loop, agent, llm = make_loop([
+        tool_response(ToolCall(id="read-one", name="read",
+                               arguments={"filePath": "target.py"})),
+        text_response("The function returns the requested value."),
+    ])
+    result = await loop.run("explain target.py")
+    assert result["success"] is True
+    assert llm.calls == 2
+    assert len(agent.executed) == 1
