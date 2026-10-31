@@ -1121,7 +1121,8 @@ class AgentLoop:
                     signatures.append(signature)
                 batch_signature = tuple(sorted(signatures))
                 seen = self.context.metadata.setdefault("repeated_batches", {})
-                if self._made_progress(results):
+                round_progress = self._made_progress(results)
+                if round_progress:
                     seen.clear()
                 elif batch_signature:
                     count = seen.get(batch_signature, 0) + 1
@@ -1133,7 +1134,7 @@ class AgentLoop:
 
                 # [STOP-2] No-progress breaker: if 3 consecutive acting
                 # iterations produce nothing new, stop churning.
-                if self._made_progress(results):
+                if round_progress:
                     self.context.metadata["no_progress_streak"] = 0
                 else:
                     streak = int(
