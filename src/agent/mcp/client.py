@@ -390,62 +390,62 @@ class StdioTransport(MCPTransportBase):
         logger.info(f"stdio MCP '{self.config.name}' started (pid={self._process.pid})")
 
     async def disconnect(self) -> None:
+        """Reap the stdio child and close its pipes before the event loop exits."""
         self.state = MCPState.CLOSED
         self._fail_pending("MCP stdio server disconnected")
-        # Close the child first so its stdout/stderr reach EOF and the reader
-        # tasks finish naturally. Cancelling the readers before the process
-        # exits can leave the subprocess transport half-open; its __del__ then
-        # fires after the event loop is closed ("Event loop is closed").
-        if self._process:
+        proc = self._process
+        if proc is not None:
             try:
-                if self._process.stdin and not self._process.stdin.is_closing():
-                    self._process.stdin.close()
+                if proc.stdin:
+                    proc.stdin.close()
+                if proc.returncode is None:
                     try:
-                        await self._process.stdin.wait_closed()
-                    except Exception:
-                        pass
-                if self._process.returncode is None:
-                    try:
-                        self._process.terminate()
+                        proc.terminate()
                     except ProcessLookupError:
                         pass
                     try:
-                        await asyncio.wait_for(self._process.wait(), timeout=5.0)
+                        await asyncio.wait_for(proc.wait(), timeout=5)
                     except asyncio.TimeoutError:
                         try:
-                            self._process.kill()
+                            proc.kill()
                         except ProcessLookupError:
                             pass
-                    except Exception:
-                        pass
-                if self._process.returncode is None:
-                    try:
-                        self._process.kill()
-                    except ProcessLookupError:
-                        pass
-                await self._process.wait()
+                # Always reap the child, including after forced termination.
+                await proc.wait()
             except Exception as exc:
-                logger.debug(
-                    "MCP stdio '%s' process cleanup failed: %s",
-                    self.config.name, exc,
-                )
+                logger.debug("MCP stdio '%s' process cleanup failed: %s", self.config.name, exc)
+
+        # The readers own stdout/stderr. Let them consume EOF after process
+        # exit; cancel only if a reader is still blocked.
         for task in (self._read_task, self._stderr_task):
-            if task and not task.done():
-                task.cancel()
             if task:
                 try:
-                    await task
+                    await asyncio.wait_for(asyncio.shield(task), timeout=1)
+                except asyncio.TimeoutError:
+                    task.cancel()
+                    try:
+                        await task
+                    except asyncio.CancelledError:
+                        pass
                 except asyncio.CancelledError:
-                    pass
+                    if task.cancelled():
+                        pass
+                    else:
+                        raise
                 except Exception as exc:
-                    logger.debug(
-                        "MCP stdio '%s' reader cleanup failed: %s",
-                        self.config.name, exc,
-                    )
+                    logger.debug("MCP stdio '%s' reader cleanup failed: %s", self.config.name, exc)
+        if proc is not None:
+            # asyncio's subprocess transport may retain pipe registrations
+            # even after wait() if a reader was cancelled. Explicitly close it
+            # while the event loop is alive rather than in __del__ afterward.
+            transport = getattr(proc, "_transport", None)
+            if transport is not None:
+                transport.close()
+            await asyncio.sleep(0)
         self._read_task = None
         self._stderr_task = None
         self._process = None
-        logger.info(f"stdio MCP '{self.config.name}' stopped")
+        logger.info("stdio MCP '%s' stopped", self.config.name)
 
     async def _send(self, message: Dict[str, Any]) -> None:
         if not self._process or not self._process.stdin:
