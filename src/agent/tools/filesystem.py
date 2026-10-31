@@ -31,7 +31,7 @@ logger = get_logger(__name__)
 
 
 DIFF_SIZE_CAP = 50 * 1024           # bytes per side, for diff rendering
-DEFAULT_MAX_BYTES = 1_048_576       # 1 MiB cap on read() content
+DEFAULT_MAX_BYTES = 32 * 1024       # bounded default; request larger slices explicitly
 READ_CONTENT_HARD_CAP = 512 * 1024  # never exceed 512 KiB of content returned
 ALLOWED_ABS_ROOTS = ("/tmp", "/var/tmp", os.path.expanduser("~/.cache"))
 
@@ -78,6 +78,7 @@ class FileSystemTool(BaseTool):
             "pattern": {"type": "string"},
             "recursive": {"type": "boolean", "default": False},
             "max_bytes": {"type": "integer", "default": DEFAULT_MAX_BYTES},
+            "offset_bytes": {"type": "integer", "default": 0, "description": "Start byte offset for a bounded file slice."},
             "max_files": {"type": "integer", "default": 500},
             "include_diff": {
                 "type": "boolean",
@@ -265,9 +266,11 @@ class FileSystemTool(BaseTool):
 
         max_bytes = int(params.get("max_bytes", DEFAULT_MAX_BYTES))
         max_bytes = max(1, min(max_bytes, READ_CONTENT_HARD_CAP))
+        offset = max(0, int(params.get("offset_bytes", 0)))
 
         def _read_bytes():
             with open(target, "rb") as f:
+                f.seek(offset)
                 raw = f.read(max_bytes + 1)
             truncated = len(raw) > max_bytes
             if truncated:
@@ -292,6 +295,8 @@ class FileSystemTool(BaseTool):
                 "size": size,
                 "sha256": digest,
                 "truncated": truncated,
+                "offset_bytes": offset,
+                "next_offset_bytes": offset + len(raw),
                 "content_omitted": True,
             }
 
@@ -318,6 +323,8 @@ class FileSystemTool(BaseTool):
             "content": content,
             "encoding": encoding,
             "truncated": truncated,
+            "offset_bytes": offset,
+            "next_offset_bytes": offset + len(raw),
             "size": size,
             "lines": content.count("\n") + (
                 1 if content and not content.endswith("\n") else 0
