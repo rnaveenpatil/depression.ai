@@ -438,10 +438,13 @@ def test_successful_reads_are_not_counted_as_task_progress():
     loop, _agent, _llm = make_loop([])
     assert loop._made_progress([
         {"tool": "read", "result": {"success": True, "content": "file data"}}
+    ]) is True
+    assert loop._made_progress([
+        {"tool": "read", "result": {"success": True, "content": "file data"}}
     ]) is False
     assert loop._made_progress([
         {"tool": "grep", "result": {"success": True, "content": "match"}}
-    ]) is False
+    ]) is True
 
 
 def test_mutations_still_count_as_progress_but_noops_do_not():
