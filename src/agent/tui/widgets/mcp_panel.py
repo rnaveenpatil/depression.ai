@@ -476,6 +476,18 @@ class MCPPanel(Vertical):
         prompts = len(getattr(client, "prompts", {}) or {})
         visible_names = tool_list[:8]
         summary = f"{len(tool_list)} tools · {resources} resources · {prompts} prompts"
+        # Connection/discovery is not equivalent to availability in Build.
+        coordinator = getattr(self._host_app, "coordinator", None)
+        build = getattr(coordinator, "build_agent", None)
+        registry = getattr(build, "tool_registry", None)
+        if registry is not None:
+            try:
+                available = sum(1 for name in tool_list if registry.has_tool(name))
+                summary += f" · {available}/{len(tool_list)} registered in Build"
+                if available < len(tool_list):
+                    summary += "\\nTool registry out of sync; reconnect while idle."
+            except Exception:
+                pass
         if visible_names:
             summary += "\n" + "\n".join(f"  {name}" for name in visible_names)
         if len(tool_list) > len(visible_names):
