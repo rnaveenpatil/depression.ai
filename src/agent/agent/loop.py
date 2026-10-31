@@ -2594,15 +2594,19 @@ Stop when the goal is achieved.
             state_parts["plan"] = self._get_plan_context()
         checkpoint = self._task_checkpoint()
         previous = getattr(self, "_recovered_checkpoint", None)
-        if previous:
-            for key in ("completed_tools", "modified_files", "failures"):
-                checkpoint[key] = list(dict.fromkeys(
-                    list(previous.get(key, [])) + checkpoint[key]
-                ))[-16:]
+        # Carry the bounded checkpoint forward on every turn, not just recovery.
+        if previous and previous.get("goal") == checkpoint["goal"]:
+            for key, limit in (("completed_tools", 12), ("modified_files", 16),
+                               ("failures", 8)):
+                before = previous.get(key, [])
+                if isinstance(before, list):
+                    checkpoint[key] = list(dict.fromkeys(
+                        [str(x) for x in before] + checkpoint[key]
+                    ))[-limit:]
             if not checkpoint["pending_tasks"] and previous.get("pending_tasks"):
                 checkpoint["pending_tasks"] = previous["pending_tasks"][:8]
                 checkpoint["next_step"] = checkpoint["pending_tasks"][0]
-            self._recovered_checkpoint = None
+        self._recovered_checkpoint = checkpoint
         state_parts["checkpoint"] = checkpoint
         self._save_task_checkpoint(checkpoint)
         state_block = json.dumps(state_parts, default=str)
