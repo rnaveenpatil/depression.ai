@@ -291,7 +291,6 @@ class FileSystemTool(BaseTool):
                     ):
                         if used + len(raw_line) > byte_limit:
                             # Respect byte cap even for a single very long line.
-                            room = byte_limit - used
                             # Never return half a line: the caller can resume
                             # with next_line without losing bytes.
                             break
@@ -307,7 +306,7 @@ class FileSystemTool(BaseTool):
                 size = target.stat().st_size
             except Exception as exc:
                 return _err(f"Failed to read {target}: {exc}")
-            if b"\\x00" in raw[:2048]:
+            if b"\x00" in raw[:2048]:
                 return _err(f"Binary file not supported: {target}", binary=True)
             content, encoding = self._decode(raw)
             if content is None:
