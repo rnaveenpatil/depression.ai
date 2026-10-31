@@ -3262,9 +3262,17 @@ class DepressionApp(App):
                     if agent is not None:
                         agent.mcp_client = client
             else:
-                client.config = saved["config"]
-                client.enabled = True
-            await self._reload_mcp_client(client)
+                client.update_config(saved["config"])
+            # Preserve unrelated live servers. Reconnect only the saved server.
+            if hasattr(client, "disconnect_server") and hasattr(client, "connect_server"):
+                await client.disconnect_server(saved["name"])
+                try:
+                    await client.connect_server(saved["name"])
+                except Exception as exc:
+                    panel.set_save_status(f"Saved, but connection failed: {exc}")
+                self._sync_mcp_tools(client)
+            else:
+                await self._reload_mcp_client(client)
             connected = saved["name"] in getattr(client, "transports", {})
             if connected:
                 panel.set_save_status(f"Connected: {saved['name']}")
@@ -3491,40 +3499,40 @@ class DepressionApp(App):
         self._sync_mcp_tools(client)
 
     def _sync_mcp_tools(self, client: Any) -> None:
-        """Mirror the client's live MCP tools into the Build tool registry."""
+        """Mirror live MCP tools into every agent registry, removing stale entries."""
         coordinator = self.coordinator
-        build = getattr(coordinator, "build_agent", None)
-        registry = getattr(build, "tool_registry", None)
-        if registry is None:
-            return
-
         discovered = {
-            tool["function"]["name"]: tool["function"]
-            for tool in client.list_tools()
+            item["function"]["name"]: item["function"]
+            for item in client.list_tools()
         }
-        for name in list(registry.list_tools(include_disabled=True)):
-            if name.startswith("mcp__") and name not in discovered:
-                registry.unregister_tool(name)
-        for name, schema in discovered.items():
-            async def _call(_name: str = name, **kwargs: Any) -> Any:
-                return await client.call_tool(_name, kwargs)
-            registry.register_external(
-                name=name,
-                handler=_call,
-                description=str(schema.get("description") or ""),
-                parameters=schema.get("parameters") or {
-                    "type": "object", "properties": {},
-                },
-                read_only=False,
-                mutating=True,
-                category="cloud" if name.startswith("mcp__aws__") else "misc",
-            )
-
-        loop = getattr(build, "loop", None)
-        if loop is not None:
-            loop._system_prompt_cache = None
-            loop._system_prompt_fp = None
-
+        # Permission defaults must remain conservative for unknown servers.
+        # Never infer read-only safety from a user-controlled tool name.
+        for role in ("build_agent", "plan_agent"):
+            agent = getattr(coordinator, role, None)
+            registry = getattr(agent, "tool_registry", None)
+            if registry is None:
+                continue
+            for name in list(registry.list_tools(include_disabled=True)):
+                if name.startswith("mcp__") and name not in discovered:
+                    registry.unregister_tool(name)
+            for name, schema in discovered.items():
+                async def _call(_name: str = name, **kwargs: Any) -> Any:
+                    return await client.call_tool(_name, kwargs)
+                registry.register_external(
+                    name=name,
+                    handler=_call,
+                    description=str(schema.get("description") or ""),
+                    parameters=schema.get("parameters") or {
+                        "type": "object", "properties": {},
+                    },
+                    read_only=False,
+                    mutating=True,
+                    category="cloud" if name.startswith("mcp__aws__") else "misc",
+                )
+            loop = getattr(agent, "loop", None)
+            if loop is not None:
+                loop._system_prompt_cache = None
+                loop._system_prompt_fp = None
 
     def _refresh_aws_status(self) -> None:
         try:
