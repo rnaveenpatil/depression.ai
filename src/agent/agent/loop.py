@@ -1439,7 +1439,24 @@ class AgentLoop:
                 continue
             name = str(x.get("tool") or "")
             if self._is_read_only(name):
-                continue
+                # A genuinely new observation is progress during investigation,
+                # but repeated identical content must not reset the stop budget.
+                import hashlib
+                payload = r.get("content", r.get("output", r.get("result", "")))
+                if not payload:
+                    continue
+                signature = hashlib.sha256(
+                    (name + ":" + str(x.get("params") or "") + ":" + str(payload)).encode(
+                        "utf-8", errors="replace"
+                    )
+                ).hexdigest()
+                seen = self.context.metadata.setdefault("observed_read_fingerprints", [])
+                if signature in seen:
+                    continue
+                seen.append(signature)
+                if len(seen) > 128:
+                    del seen[:-128]
+                return True
             # Do not mistake no-op tool responses for progress.
             if r.get("changed") is False or r.get("no_change") is True:
                 continue
