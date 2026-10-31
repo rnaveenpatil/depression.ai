@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>depression.ai — Simple Agent Flow</title>
+<style>
+  :root { color-scheme: dark; }
+  body { margin:0; padding:32px; background:#0d1117; color:#e6edf3;
+         font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif; }
+  h1 { font-size:20px; margin:0 0 4px; font-weight:600; }
+  p.sub { margin:0 0 24px; color:#8b949e; font-size:13px; }
+  .card { background:#161b22; border:1px solid #30363d; border-radius:12px; padding:24px; }
+  .mermaid { display:flex; justify-content:center; }
+</style>
+</head>
+<body>
+  <h1>depression.ai — Simple Agent Flow</h1>
+  <p class="sub">User prompt → planning → tool loop → final answer</p>
+  <div class="card">
+<pre class="mermaid">
+flowchart TD
+    A([User types prompt]) --> B[TUI / CLI input]
+    B --> C{Plan mode?}
+    C -- yes --> D[Planner breaks task into steps]
+    C -- no --> E[Skip planning]
+    D --> F[[Agent loop]]
+    E --> F
+    F --> G[LLM picks a tool]
+    G --> H{Permission OK?}
+    H -- no --> I[Ask user / deny]
+    I --> F
+    H -- yes --> J[Run tool<br/>filesystem · bash · web · aws]
+    J --> K[Result fed back to LLM]
+    K --> L{Done?}
+    L -- no --> G
+    L -- yes --> M([Final answer shown in TUI])
+</pre>
+  </div>
+<script type="module">
+  import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs';
+  mermaid.initialize({ startOnLoad:true, theme:'dark', flowchart:{ curve:'basis', useMaxWidth:true },
+                       themeVariables:{ fontSize:'15px' } });
+  window.__ready = false;
+  mermaid.parseError = (e)=>console.error('MERMAID_ERROR', e);
+</script>
+</body>
+</html>
