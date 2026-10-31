@@ -117,7 +117,11 @@ class GitProject:
                     timeout=timeout or self.timeout,
                 )
             except asyncio.TimeoutError:
-                proc.kill()
+                try:
+                    proc.kill()
+                    await asyncio.wait_for(proc.wait(), timeout=2)
+                except Exception:
+                    pass
                 raise GitError(f"git {args[0]} timed out")
 
             out = stdout.decode(errors="replace")

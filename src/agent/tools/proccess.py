@@ -16,12 +16,18 @@ Env policy:
     Child env = os.environ + EnvManager.get_aws_env() + optional per-call
     env. This keeps long-running servers in sync with credentials saved
     mid-session (AWS, etc.).
+
+Shutdown:
+    `shutdown()` is idempotent and bounded by a hard wall-clock timeout.
+    Every ManagedProcess transport is reaped before the loop closes, so
+    the interpreter never sees a live BaseSubprocessTransport at exit.
 """
 
 from __future__ import annotations
 
 import asyncio
 import os
+import signal
 import time
 import uuid
 from collections import deque
@@ -45,6 +51,9 @@ _MAX_LOG_BYTES = 32 * 1024
 # How long we wait after terminate() before escalating to kill().
 _TERMINATE_GRACE_SECONDS = 5.0
 
+# Hard upper bound on the whole shutdown() call.
+_SHUTDOWN_TIMEOUT_SECONDS = 10.0
+
 
 @dataclass
 class ManagedProcess:
@@ -60,6 +69,7 @@ class ManagedProcess:
     stderr: Deque[str] = field(default_factory=lambda: deque(maxlen=_MAX_BUFFER_LINES))
     _pumps: List[asyncio.Task] = field(default_factory=list)
     _watcher: Optional[asyncio.Task] = None
+    pgid: Optional[int] = None
 
     @property
     def running(self) -> bool:
@@ -77,6 +87,38 @@ class ManagedProcess:
         if self.running:
             return "running"
         return f"exited({self.exit_code})"
+
+    def cancel_tasks(self) -> None:
+        """Cancel pumps and watcher without awaiting (safe from __del__)."""
+        for t in list(self._pumps):
+            try:
+                t.cancel()
+            except Exception:
+                pass
+        if self._watcher is not None:
+            try:
+                self._watcher.cancel()
+            except Exception:
+                pass
+
+    def __del__(self) -> None:
+        """Best-effort cleanup so a leaked transport does not fire
+        BaseSubprocessTransport.__del__ on a closed loop.
+
+        Never schedules work: if no loop is running, it simply kills the
+        child and lets CPython reap the transport silently.
+        """
+        try:
+            self.cancel_tasks()
+        except Exception:
+            pass
+        if self.proc is None:
+            return
+        if self.proc.returncode is None:
+            try:
+                self.proc.kill()
+            except Exception:
+                pass
 
 
 class ProcessTool(BaseTool):
@@ -124,6 +166,8 @@ class ProcessTool(BaseTool):
         except Exception:
             self.cwd = os.getcwd()
         self.processes: Dict[str, ManagedProcess] = {}
+        self._shutdown_done = False
+        self._shutdown_lock: Optional[asyncio.Lock] = None
 
     # ------------------------------------------------------------------
     # ENV
@@ -192,6 +236,7 @@ class ProcessTool(BaseTool):
                 env=env,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
+                start_new_session=True,
             )
         except FileNotFoundError as e:
             return {"success": False, "error": f"Command not found: {e}",
@@ -206,6 +251,7 @@ class ProcessTool(BaseTool):
         pid = str(uuid.uuid4())[:8]
         mp = ManagedProcess(
             id=pid, command=command, pid=proc.pid or 0, proc=proc, cwd=cwd,
+            pgid=proc.pid,
         )
         self.processes[pid] = mp
 
@@ -461,14 +507,44 @@ class ProcessTool(BaseTool):
     # ------------------------------------------------------------------
 
     async def shutdown(self) -> None:
-        """Idempotent; safe to call multiple times."""
+        """Idempotent, bounded, always reaps every transport."""
+        if self._shutdown_done:
+            return
+        self._shutdown_done = True
+
         ids = list(self.processes.keys())
-        for pid in ids:
+        if not ids:
+            return
+
+        async def _stop_one(pid: str) -> None:
             try:
                 await self._stop({"process_id": pid}, force=True)
             except Exception as e:
                 logger.debug("process shutdown error for %s: %s", pid, e)
-        self.processes.clear()
+
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(
+                    *[_stop_one(pid) for pid in ids],
+                    return_exceptions=True,
+                ),
+                timeout=_SHUTDOWN_TIMEOUT_SECONDS,
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "ProcessTool shutdown timed out; forcing kill of %d process(es)",
+                len(self.processes),
+            )
+        finally:
+            # Whatever happened, ensure no transport survives us.
+            for mp in list(self.processes.values()):
+                try:
+                    if mp.running:
+                        mp.proc.kill()
+                except Exception:
+                    pass
+                mp.cancel_tasks()
+            self.processes.clear()
 
 
 __all__ = ["ProcessTool"]

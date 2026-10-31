@@ -392,26 +392,59 @@ class StdioTransport(MCPTransportBase):
     async def disconnect(self) -> None:
         self.state = MCPState.CLOSED
         self._fail_pending("MCP stdio server disconnected")
-        if self._stderr_task:
-            self._stderr_task.cancel()
-            try:
-                await self._stderr_task
-            except asyncio.CancelledError:
-                pass
-        if self._read_task:
-            self._read_task.cancel()
-            try:
-                await self._read_task
-            except asyncio.CancelledError:
-                pass
+        # Close the child first so its stdout/stderr reach EOF and the reader
+        # tasks finish naturally. Cancelling the readers before the process
+        # exits can leave the subprocess transport half-open; its __del__ then
+        # fires after the event loop is closed ("Event loop is closed").
         if self._process:
             try:
-                self._process.terminate()
-                await asyncio.wait_for(self._process.wait(), timeout=5.0)
-            except asyncio.TimeoutError:
-                self._process.kill()
-            except Exception:
-                pass
+                if self._process.stdin and not self._process.stdin.is_closing():
+                    self._process.stdin.close()
+                    try:
+                        await self._process.stdin.wait_closed()
+                    except Exception:
+                        pass
+                if self._process.returncode is None:
+                    try:
+                        self._process.terminate()
+                    except ProcessLookupError:
+                        pass
+                    try:
+                        await asyncio.wait_for(self._process.wait(), timeout=5.0)
+                    except asyncio.TimeoutError:
+                        try:
+                            self._process.kill()
+                        except ProcessLookupError:
+                            pass
+                    except Exception:
+                        pass
+                if self._process.returncode is None:
+                    try:
+                        self._process.kill()
+                    except ProcessLookupError:
+                        pass
+                await self._process.wait()
+            except Exception as exc:
+                logger.debug(
+                    "MCP stdio '%s' process cleanup failed: %s",
+                    self.config.name, exc,
+                )
+        for task in (self._read_task, self._stderr_task):
+            if task and not task.done():
+                task.cancel()
+            if task:
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+                except Exception as exc:
+                    logger.debug(
+                        "MCP stdio '%s' reader cleanup failed: %s",
+                        self.config.name, exc,
+                    )
+        self._read_task = None
+        self._stderr_task = None
+        self._process = None
         logger.info(f"stdio MCP '{self.config.name}' stopped")
 
     async def _send(self, message: Dict[str, Any]) -> None:

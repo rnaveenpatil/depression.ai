@@ -13,6 +13,11 @@ Env policy:
     * os.environ is copied, then overlayed with EnvManager.get_aws_env(),
       then overlayed with per-call env. This keeps subprocesses in sync
       with credentials saved mid-session.
+
+Shutdown:
+    Every command runs in its own session (start_new_session=True). On
+    timeout the child is killed AND its transport is awaited to completion
+    so no live BaseSubprocessTransport survives the event loop.
 """
 
 from __future__ import annotations
@@ -225,6 +230,7 @@ class TerminalTool(BaseTool):
                     stderr=asyncio.subprocess.PIPE,
                     cwd=cwd,
                     env=env,
+                    start_new_session=True,
                 )
             else:
                 parts = shlex.split(command)
@@ -234,6 +240,7 @@ class TerminalTool(BaseTool):
                     stderr=asyncio.subprocess.PIPE,
                     cwd=cwd,
                     env=env,
+                    start_new_session=True,
                 )
 
             try:
@@ -241,7 +248,8 @@ class TerminalTool(BaseTool):
                     proc.communicate(), timeout=timeout
                 )
             except asyncio.TimeoutError:
-                # Capture whatever was produced before killing.
+                # Capture whatever was produced before killing, then ensure
+                # the transport is fully reaped so nothing survives us.
                 try:
                     proc.kill()
                 except ProcessLookupError:
@@ -264,6 +272,11 @@ class TerminalTool(BaseTool):
                             partial_err = await asyncio.wait_for(
                                 proc.stderr.read(), timeout=0.5
                             )
+                    except Exception:
+                        pass
+                    # Final safety net: await the transport to completion.
+                    try:
+                        await asyncio.wait_for(proc.wait(), timeout=2)
                     except Exception:
                         pass
 
@@ -311,6 +324,16 @@ class TerminalTool(BaseTool):
             return {"success": False, "error": f"Permission denied: {e}",
                     "recoverable": False, "command": command, "cwd": cwd}
         except Exception as e:
+            # Even on unexpected failure, try to reap the transport.
+            if proc is not None and proc.returncode is None:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+                try:
+                    await asyncio.wait_for(proc.wait(), timeout=2)
+                except Exception:
+                    pass
             return {"success": False, "error": str(e),
                     "recoverable": True, "command": command, "cwd": cwd}
 

@@ -503,6 +503,13 @@ class WorkspaceManager:
             )
             stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=10)
             return {"success": proc.returncode == 0, "message": message, "stdout": stdout.decode(errors="replace")}
+        except asyncio.TimeoutError:
+            try:
+                proc.kill()
+                await asyncio.wait_for(proc.wait(), timeout=2)
+            except Exception:
+                pass
+            return {"success": False, "error": "snapshot timed out"}
         except Exception as e:
             return {"success": False, "error": str(e)}
 
@@ -519,5 +526,12 @@ class WorkspaceManager:
             )
             stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=10)
             return {"success": proc.returncode == 0, "stdout": stdout.decode(errors="replace"), "stderr": stderr.decode(errors="replace")}
+        except asyncio.TimeoutError:
+            try:
+                proc.kill()
+                await asyncio.wait_for(proc.wait(), timeout=2)
+            except Exception:
+                pass
+            return {"success": False, "error": "undo snapshot timed out"}
         except Exception as e:
             return {"success": False, "error": str(e)}

@@ -94,6 +94,11 @@ class DiagnosticsTool(BaseTool):
                 proc.communicate(), timeout=float(params.get("timeout", 60))
             )
         except asyncio.TimeoutError:
+            try:
+                proc.kill()
+                await asyncio.wait_for(proc.wait(), timeout=2)
+            except Exception:
+                pass
             return {"success": False, "error": "diagnostics timed out"}
         except FileNotFoundError:
             return {"success": False, "error": f"Command not found: {cmd[0]}"}
