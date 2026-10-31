@@ -1,0 +1,42 @@
+[
+  {
+    "id": "fix-off-by-one",
+    "prompt": "The function clamp in math_utils.py returns wrong values at the upper bound. Fix the bug and make the existing tests pass.",
+    "files": {
+      "math_utils.py": "def clamp(value, low, high):\n    if value < low:\n        return low\n    if value > high:\n        return high - 1\n    return value\n",
+      "test_math_utils.py": "from math_utils import clamp\n\n\ndef test_clamp_bounds():\n    assert clamp(-5, 0, 10) == 0\n    assert clamp(5, 0, 10) == 5\n    assert clamp(15, 0, 10) == 10\n"
+    },
+    "verify": "python -m pytest -q test_math_utils.py",
+    "max_seconds": 240
+  },
+  {
+    "id": "add-feature-slugify",
+    "prompt": "Add a slugify(text) function to text_utils.py. It should lowercase, strip surrounding whitespace, and replace runs of non-alphanumeric characters with a single hyphen. Make the provided tests pass.",
+    "files": {
+      "text_utils.py": "def reverse(text):\n    return text[::-1]\n",
+      "test_text_utils.py": "from text_utils import slugify\n\n\ndef test_slugify():\n    assert slugify('  Hello, World!  ') == 'hello-world'\n    assert slugify('a---b') == 'a-b'\n"
+    },
+    "verify": "python -m pytest -q test_text_utils.py",
+    "max_seconds": 240
+  },
+  {
+    "id": "refactor-duplication",
+    "prompt": "reports.py repeats the same discount calculation. Extract it into one helper, keep behavior identical, and make the tests pass.",
+    "files": {
+      "reports.py": "def total_a(prices):\n    return sum(p * 0.9 for p in prices)\n\n\ndef total_b(prices):\n    return sum(p * 0.9 for p in prices)\n\n\ndef total_c(prices):\n    return sum(p * 0.9 for p in prices)\n",
+      "test_reports.py": "from reports import total_a, total_b, total_c\n\n\ndef test_totals():\n    prices = [10, 20]\n    assert total_a(prices) == 27\n    assert total_b(prices) == 27\n    assert total_c(prices) == 27\n"
+    },
+    "verify": "python -m pytest -q test_reports.py && python -c \"import pathlib,sys; s=pathlib.Path('reports.py').read_text(); sys.exit(0 if s.count('0.9')==1 and s.count('def ')==4 else 1)\"",
+    "max_seconds": 240
+  },
+  {
+    "id": "validate-json-input",
+    "prompt": "load_config.py crashes with a confusing error when the JSON file is missing or malformed. Make it raise ValueError with a clear message and satisfy the tests.",
+    "files": {
+      "load_config.py": "import json\n\n\ndef load_config(path):\n    with open(path) as fh:\n        return json.load(fh)\n",
+      "test_load_config.py": "import json\nimport pytest\n\nfrom load_config import load_config\n\n\ndef test_missing(tmp_path):\n    with pytest.raises(ValueError):\n        load_config(tmp_path / 'missing.json')\n\n\ndef test_malformed(tmp_path):\n    path = tmp_path / 'bad.json'\n    path.write_text('{not json')\n    with pytest.raises(ValueError):\n        load_config(path)\n\n\ndef test_valid(tmp_path):\n    path = tmp_path / 'ok.json'\n    path.write_text(json.dumps({'a': 1}))\n    assert load_config(path) == {'a': 1}\n"
+    },
+    "verify": "python -m pytest -q test_load_config.py",
+    "max_seconds": 240
+  }
+]

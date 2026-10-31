@@ -77,12 +77,17 @@ import time
 from collections import deque
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Awaitable, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from agent.agent.planner import Plan, Planner, TaskStatus
+from agent.agent.verification import (
+    MAX_BATCH_VERIFY_ATTEMPTS,
+    VERIFICATION_MODES,
+    VerificationController,
+)
 from agent.llm.provider import Message, ToolCall, FinishReason, LLMResponse
 from agent.llm.runtime import MODEL_METADATA, LLMProviderRegistry
-from agent.tools.registry import ToolRegistry, INTENT_CATEGORIES
+from agent.tools.registry import ToolRegistry
 from agent.utils.errors import TimeoutError
 from agent.utils.logging import get_logger
 from agent.utils.redact import redact
@@ -93,9 +98,6 @@ logger = get_logger(__name__)
 
 PLAN_DRIVEN_MIN_TASKS = 3
 PLAN_TASK_MAX_ATTEMPTS = 3
-
-# [NEW] How many fix->verify rounds batch mode allows before giving up.
-MAX_BATCH_VERIFY_ATTEMPTS = 4
 
 # [STOP-2] How many consecutive acting iterations with no real progress
 # before the loop decides it is stuck.
@@ -132,8 +134,32 @@ _MUTATING_TOOL_NAMES = frozenset({
     "exec", "run", "execute",
 })
 
-# [NEW] Valid verification modes.
-_VERIFICATION_MODES = ("per_step", "batch", "off")
+# Valid verification modes (shared with VerificationController).
+_VERIFICATION_MODES = VERIFICATION_MODES
+
+# Commands that are considered read-only evidence for root-cause work.
+_SEARCH_TOOL_TOKENS = (
+    "glob", "grep", "find", "search", "symbol", "reference", "locate",
+)
+
+# Shell commands that gather evidence without mutating state. These are
+# allowed through the root-cause gate because they are how the model learns
+# what to change.
+_EVIDENCE_COMMAND_RE = re.compile(
+    r"(?:^|[\s;&|])(?:rg|grep|ag|ack|find|fd|ls|tree|cat|head|tail|sed|awk|"
+    r"git\s+(?:status|log|diff|show|blame|grep)|"
+    r"python[0-9.]*\s+-m\s+(?:pytest|unittest|mypy|ruff)|"
+    r"pytest|npm\s+(?:run\s+)?(?:test|lint|typecheck)|ruff|mypy|tsc|"
+    r"go\s+(?:test|vet)|cargo\s+(?:test|check)|wc|file|stat)\b",
+    re.I,
+)
+
+_COMPLEXITY_TOKENS = re.compile(
+    r"\b(refactor|migrate|architecture|across|multiple|all files|"
+    r"end-to-end|integration|performance|benchmark|parallel|concurren|"
+    r"database|schema|api|frontend|backend|deploy|release)\b",
+    re.I,
+)
 
 
 # ----------------------------------------------------------------------
@@ -526,6 +552,20 @@ class AgentLoop:
             config.get("no_progress_streak_cap", 6)
         )
 
+        # [QUALITY] Fill the evidence gap before mutating code for a bug fix
+        # or refactor. Disabled automatically for read-only work.
+        self.require_root_cause_evidence = bool(
+            config.get("require_root_cause_evidence", True)
+        )
+        # [STOP-3] Accept a final answer as success even at the iteration
+        # limit when the goal is actually complete.
+        self.enable_goal_completion_detection = bool(
+            config.get("enable_goal_completion_detection", True)
+        )
+        # [TOKENS] Reuse successful test/build output instead of asking the
+        # model to verify the same targets again.
+        self.reuse_test_evidence = bool(config.get("reuse_test_evidence", True))
+
         self.state = LoopState.IDLE
         self.context = LoopContext()
         self.current_plan: Optional[Plan] = None
@@ -551,6 +591,15 @@ class AgentLoop:
         self._last_checklist_signature: Optional[tuple] = None
 
         self._successful_call_history: Dict[str, List[tuple]] = {}
+        self.verification = self._build_verification_controller()
+
+    def _build_verification_controller(self) -> VerificationController:
+        return VerificationController(
+            self.context,
+            mode=self.verification_mode,
+            max_batch_attempts=self.max_batch_verify_attempts,
+            max_nudges=self.max_verification_nudges,
+        )
 
     @property
     def model_context(self):
@@ -721,14 +770,151 @@ class AgentLoop:
         logger.error("No schema provider found on tool registry")
         return []
 
+    async def _ensure_mcp_health(self) -> None:
+        """Re-register MCP tools and recover servers reported unhealthy.
+
+        Registration is idempotent, so doing it before every run fixes the
+        common "server reconnected but its tools disappeared from the
+        registry" failure. Actual reconnects run in the background so a slow
+        server cannot delay the user's turn.
+        """
+        mcp = getattr(self.agent, "mcp_client", None)
+        if mcp is None:
+            return
+        try:
+            register = getattr(mcp, "register_tools_into", None)
+            if callable(register):
+                register(self.tool_registry)
+        except Exception as exc:
+            logger.debug("MCP tool re-registration failed: %s", exc)
+
+        try:
+            status_fn = getattr(mcp, "get_status", None)
+            status = status_fn() if callable(status_fn) else {}
+            errors = dict(status.get("errors") or {})
+            unhealthy = [
+                s for s in (status.get("servers") or [])
+                if str(s.get("state", "")).lower() not in ("connected", "ready")
+            ]
+            if not errors and not unhealthy:
+                return
+            logger.warning(
+                "MCP unhealthy at run start: errors=%s servers=%s",
+                list(errors), [s.get("name") for s in unhealthy],
+            )
+            health = getattr(mcp, "_health_check", None)
+            if callable(health):
+                async def _recover() -> None:
+                    try:
+                        await health()
+                        register2 = getattr(mcp, "register_tools_into", None)
+                        if callable(register2):
+                            register2(self.tool_registry)
+                    except Exception as exc:
+                        logger.debug("MCP background recovery failed: %s", exc)
+
+                task = asyncio.create_task(_recover())
+                task.add_done_callback(
+                    lambda t: t.exception() if not t.cancelled() else None
+                )
+        except Exception as exc:
+            logger.debug("MCP health probe failed: %s", exc)
+
+    async def _recover_mcp_tool(self, tool_name: str) -> None:
+        """Attempt one reconnect for the server behind an MCP tool call."""
+        if not str(tool_name).startswith("mcp__"):
+            return
+        mcp = getattr(self.agent, "mcp_client", None)
+        if mcp is None:
+            return
+        parts = str(tool_name).split("__", 2)
+        server = parts[1] if len(parts) >= 3 else ""
+        if not server:
+            return
+        try:
+            connect = getattr(mcp, "connect_server", None)
+            if callable(connect):
+                ok = connect(server)
+                if inspect.isawaitable(ok):
+                    ok = await ok
+                logger.info("MCP reconnect for %s: %s", server, ok)
+            register = getattr(mcp, "register_tools_into", None)
+            if callable(register):
+                register(self.tool_registry)
+        except Exception as exc:
+            logger.debug("MCP recovery for %s failed: %s", server, exc)
+
+    @staticmethod
+    def _normalize_tool_result(result: Any, name: str) -> Dict[str, Any]:
+        """Coerce every tool response into the one shape the loop expects."""
+        if isinstance(result, dict):
+            out = dict(result)
+        elif result is None:
+            out = {"success": True, "result": ""}
+        else:
+            out = {"success": True, "result": result}
+        out.setdefault("tool", name)
+        if "success" not in out:
+            out["success"] = not bool(out.get("error"))
+        return out
+
+    def _mcp_failure_is_connection(self, result: Dict[str, Any]) -> bool:
+        error = str(result.get("error") or "").lower()
+        return any(token in error for token in (
+            "not connected", "disconnected", "connection", "transport",
+            "broken pipe", "closed", "timeout", "eof",
+        ))
+
     async def _registry_execute(self, name: str, args: Dict[str, Any]) -> Any:
+        # Validate before executing so malformed arguments produce one clear,
+        # recoverable error instead of a tool-specific exception.
+        validate = getattr(self.tool_registry, "validate_arguments", None)
+        if callable(validate):
+            try:
+                err = validate(name, args)
+            except Exception:
+                err = None
+            if err:
+                return {
+                    "success": False,
+                    "tool": name,
+                    "error": err,
+                    "recoverable": True,
+                    "invalid_arguments": True,
+                    "suggestion": (
+                        "Re-emit the call with arguments matching the tool "
+                        "schema. Do not repeat the exact same arguments."
+                    ),
+                }
+
+        result = await self._execute_uncached(name, args)
+
+        # One transparent reconnect for MCP transport failures.
+        if (
+            str(name).startswith("mcp__")
+            and isinstance(result, dict)
+            and not result.get("success", False)
+            and self._mcp_failure_is_connection(result)
+        ):
+            logger.warning("MCP tool %s failed; attempting one reconnect", name)
+            await self._recover_mcp_tool(name)
+            retry = await self._execute_uncached(name, args)
+            if isinstance(retry, dict) and retry.get("success", False):
+                retry["recovered_after_reconnect"] = True
+                return retry
+            result = retry
+        return result
+
+    async def _execute_uncached(self, name: str, args: Dict[str, Any]) -> Any:
         agent_exec = getattr(self.agent, "execute_tool", None)
         if callable(agent_exec):
             try:
                 result = agent_exec(name, args)
                 if inspect.isawaitable(result):
                     result = await result
-                return result
+                return self._normalize_tool_result(result, name)
+            except asyncio.CancelledError:
+                raise
             except Exception as exc:
                 logger.error(
                     "agent.execute_tool(%s) failed: %s", name, exc, exc_info=True
@@ -754,7 +940,9 @@ class AgentLoop:
             result = probe(name, args)
             if inspect.isawaitable(result):
                 result = await result
-            return result
+            return self._normalize_tool_result(result, name)
+        except asyncio.CancelledError:
+            raise
         except Exception as exc:
             logger.error("registry execute(%s) failed: %s", name, exc, exc_info=True)
             return {
@@ -867,8 +1055,10 @@ class AgentLoop:
         max_turns: Optional[int] = None,
     ) -> Dict[str, Any]:
         self.context = LoopContext()
+        self.verification = self._build_verification_controller()
         self._checkpoint_goal = query
         self._recovered_checkpoint = None
+        await self._ensure_mcp_health()
         try:
             from agent.context.checkpoint import TaskCheckpointStore
             session = getattr(self.agent, "session", None)
@@ -1211,14 +1401,9 @@ class AgentLoop:
             # A final answer with no further tool requests is the natural
             # completion signal. Do not manufacture more work for read-only
             # tasks; only actual outstanding modifications require validation.
-            if (response_text and not self.context.unverified_mutations
-                    and not self._pending_verification_entries()
-                    and not self.context.metadata.get("stopped_on_failures")
-                    and not (
-                        (self.context.metadata.get("requires_action") is True
-                         or self.context.intent in ("feature", "bugfix", "refactor"))
-                        and not self.context.metadata.get("action_attempted")
-                    )):
+            if self._goal_achieved(response_text):
+                if self.enable_goal_completion_detection:
+                    self.context.metadata["goal_achieved"] = True
                 self.state = LoopState.STOPPED
                 self._update_metrics()
                 response_text = await self._ensure_demo_offer(response_text)
@@ -1269,12 +1454,8 @@ class AgentLoop:
             # verification, nothing is declared unverified, and there were
             # no hard tool failures. Return immediately — do not spend
             # another turn re-asking the model or re-entering batch verify.
-            if (
-                response_text
-                and not self._pending_verification_entries()
-                and not self._declared_unverified(response_text)
-                and not self.context.metadata.get("stopped_on_failures")
-            ):
+            if self._goal_achieved(response_text):
+                self.context.metadata["goal_achieved"] = True
                 self.state = LoopState.STOPPED
                 self._update_metrics()
                 response_text = await self._ensure_demo_offer(response_text)
@@ -1343,6 +1524,12 @@ class AgentLoop:
                 "I hit the iteration limit before finishing. "
                 "Here's what I have so far; tell me how you'd like to continue."
             )
+        goal_achieved = bool(
+            self.enable_goal_completion_detection
+            and self._goal_achieved(final)
+        )
+        if goal_achieved:
+            self.context.metadata["goal_achieved"] = True
         final = await self._ensure_demo_offer(final)
         final, has_unverified = self._finalize_verification_report(final)
         self._update_metrics()
@@ -1353,7 +1540,7 @@ class AgentLoop:
         success = bool(
             final and final.strip()
             and not has_unverified
-            and not self.context.hit_iteration_limit
+            and (not self.context.hit_iteration_limit or goal_achieved)
             and not stopped_on_failures
             and not stopped_on_no_progress
             and not self.should_stop
@@ -1363,7 +1550,7 @@ class AgentLoop:
             error = "stopped by user"
         elif has_unverified:
             error = "unverified changes remain"
-        elif self.context.hit_iteration_limit:
+        elif self.context.hit_iteration_limit and not goal_achieved:
             error = "iteration limit reached"
         elif stopped_on_failures:
             error = "stopped after repeated tool failures"
@@ -1464,6 +1651,31 @@ class AgentLoop:
             return True
         return False
 
+    def _goal_achieved(self, response_text: str) -> bool:
+        """Evidence-based stop: has the user's requested outcome been met?
+
+        This is deliberately independent of the iteration counter. A final
+        answer that proves the work is done should stop the loop even if the
+        budget was exhausted while it was being produced.
+        """
+        if not self.enable_goal_completion_detection:
+            return False
+        if not response_text or not response_text.strip():
+            return False
+        if self._pending_verification_entries():
+            return False
+        if self._declared_unverified(response_text):
+            return False
+        if self.context.metadata.get("stopped_on_failures"):
+            return False
+        requires_action = bool(
+            self.context.metadata.get("requires_action") is True
+            or self.context.intent in ("feature", "bugfix", "refactor")
+        )
+        if requires_action and not self.context.metadata.get("action_attempted"):
+            return False
+        return True
+
     # [NEW] Batch-verification decision.
     def _should_batch_verify(self, response_text: str) -> bool:
         """True when we must inject a verification turn before accepting
@@ -1476,19 +1688,16 @@ class AgentLoop:
           * we have not used up the attempt budget (4 by default)
           * the model did not declare UNVERIFIED
         """
-        if self.verification_mode != "batch":
-            return False
-        if self.should_stop:
-            return False
-        if not self._pending_verification_entries():
-            return False
-        if self.context.batch_verify_attempts >= self.max_batch_verify_attempts:
-            return False
-        if self.context.iteration >= self.max_iterations:
-            return False
-        if self._declared_unverified(response_text):
-            return False
-        return True
+        if self.reuse_test_evidence:
+            self.verification.refresh_from_evidence()
+        return self.verification.should_verify(
+            response_text,
+            declared_unverified=self._declared_unverified(response_text),
+            should_stop=self.should_stop,
+            iteration=self.context.iteration,
+            max_iterations=self.max_iterations,
+            max_batch_attempts=self.max_batch_verify_attempts,
+        )
 
     async def _inject_batch_verification_guidance(self) -> None:
         """One round of batch verification.
@@ -1501,12 +1710,15 @@ class AgentLoop:
         """
         pending = self._pending_verification_entries()
         targets = sorted({m.get("target") or "?" for m in pending})
-        self.context.batch_verify_attempts += 1
-        attempt = self.context.batch_verify_attempts
+        attempt = self.verification.begin_attempt()
         total = self.max_batch_verify_attempts
 
         names = sorted({m.get("tool") or "write/edit" for m in pending})
         count = len(targets)
+        evidence = (
+            self.verification.evidence_summary()
+            if self.reuse_test_evidence else ""
+        )
 
         if attempt < total:
             tail = (
@@ -1523,7 +1735,8 @@ class AgentLoop:
         msg = (
             f"Verification attempt {attempt}/{total}.\n"
             f"You have made {count} change(s) via {', '.join(names)}.\n"
-            f"Changed targets:\n" + "\n".join(f"  - {t}" for t in targets) +
+            + (f"{evidence}\n" if evidence else "")
+            + f"Changed targets:\n" + "\n".join(f"  - {t}" for t in targets) +
             "\n\nNow verify ALL of them in ONE pass — do not verify one at a time:\n"
             "  1. Read back each changed file (or run `git diff` once).\n"
             "  2. Run the relevant test/command once and quote its output.\n"
@@ -2344,12 +2557,26 @@ Stop when the goal is achieved.
     # PLANNING
     # ==================================================================
 
+    def _is_simple_task(self, q: str, intent: str = "unknown") -> bool:
+        """Skip planning overhead for short read-only asks."""
+        text = (q or "").strip()
+        if not text:
+            return True
+        if intent not in ("question", "chat"):
+            return False
+        if _COMPLEXITY_TOKENS.search(text):
+            return False
+        words = re.findall(r"[A-Za-z0-9_]+", text)
+        return len(words) <= 10
+
     async def _should_plan(self, q: str, intent: str = "unknown") -> bool:
         """Use model judgment, not keyword and word-count heuristics."""
         value = self.context.metadata.get("intent_needs_plan")
         if isinstance(value, bool):
             return value
         if not (q or "").strip():
+            return False
+        if self._is_simple_task(q, intent):
             return False
         try:
             self.context.llm_calls += 1
@@ -2543,7 +2770,7 @@ Stop when the goal is achieved.
         import re
 
         goal = str(getattr(self, "_checkpoint_goal", "") or "")[:500]
-        actions = list(getattr(self.context, "actions", []) or [])[-60:]
+        actions = list(getattr(self.context, "actions_taken", []) or [])[-60:]
         files, failures, completed = [], [], []
         for action in actions:
             if not isinstance(action, dict):
@@ -2576,12 +2803,33 @@ Stop when the goal is achieved.
                 pending = [str(t.description)[:160] for t in plan.get_pending_tasks()][:8]
             except Exception:
                 pass
-        next_step = pending[0] if pending else (
-            "Verify outstanding changes" if self.context.unverified_mutations
-            else "Continue the current task using the latest tool results"
-        )
+        if pending:
+            next_step = pending[0]
+        elif self.context.unverified_mutations:
+            next_step = "Verify outstanding changes"
+        elif (
+            self.context.intent in ("bugfix", "refactor")
+            and not self.context.metadata.get("evidence_observed")
+        ):
+            next_step = "Inspect the relevant code before making changes"
+        else:
+            next_step = "Continue the current task using the latest tool results"
+        discoveries = list(
+            self.context.metadata.get("discoveries") or []
+        )[-20:]
+        decisions = list(self.context.metadata.get("decisions") or [])[-10:]
+        if plan:
+            try:
+                decisions.extend(
+                    f"Completed: {str(t.description)[:140]}"
+                    for t in plan._all_tasks()
+                    if t.status == TaskStatus.COMPLETED
+                )
+            except Exception:
+                pass
+            decisions = list(dict.fromkeys(decisions))[-10:]
         return {
-            "version": 1,
+            "version": 2,
             "goal": goal,
             "completed_tools": list(dict.fromkeys(completed))[-12:],
             "modified_files": list(dict.fromkeys(files))[-16:],
@@ -2589,6 +2837,8 @@ Stop when the goal is achieved.
             "pending_tasks": pending,
             "next_step": next_step,
             "unverified_changes": len(self.context.unverified_mutations),
+            "discoveries": discoveries,
+            "decisions": decisions,
         }
 
     def _save_task_checkpoint(self, checkpoint: Dict[str, Any]) -> None:
@@ -2845,6 +3095,25 @@ Stop when the goal is achieved.
         return self._registry_get_schemas()
 
     async def _get_state_context(self) -> Dict[str, Any]:
+        evidence = bool(self.context.metadata.get("evidence_observed"))
+        pending = len(self._pending_verification_entries())
+        if pending:
+            next_step = (
+                "Verify the modified targets (run tests or read the changed "
+                "files) before answering."
+            )
+        elif (
+            self.context.intent in ("feature", "bugfix", "refactor")
+            and not evidence
+        ):
+            next_step = (
+                "Locate the relevant code with glob/grep/read before editing; "
+                "edit only after the root cause is observed."
+            )
+        elif self.context.metadata.get("goal_achieved"):
+            next_step = "Work is complete; summarize the outcome."
+        else:
+            next_step = "Continue with the single most informative action."
         return {
             "iteration": self.context.iteration,
             "intent": self.context.intent,
@@ -2855,6 +3124,10 @@ Stop when the goal is achieved.
             "no_progress_streak": int(
                 self.context.metadata.get("no_progress_streak", 0) or 0
             ),
+            "evidence_observed": evidence,
+            "code_searched": bool(self.context.metadata.get("code_searched")),
+            "pending_verification": pending,
+            "recommended_next_step": next_step,
         }
 
     def _get_plan_context(self) -> Dict[str, Any]:
@@ -2988,6 +3261,46 @@ Stop when the goal is achieved.
         args = getattr(call, "arguments", {}) or {}
         if not isinstance(args, dict):
             args = {}
+
+        gate_error = (
+            self._root_cause_gate(name, args)
+            if persist and track_verification else None
+        )
+        if gate_error:
+            logger.info("Root-cause gate refused %s", name)
+            refusals = int(
+                self.context.metadata.get("root_cause_refusals", 0) or 0
+            ) + 1
+            self.context.metadata["root_cause_refusals"] = refusals
+            # Never deadlock: if the model insists twice, let it proceed and
+            # rely on verification/reporting to catch an incorrect guess.
+            if refusals >= 2:
+                self.context.metadata["root_cause_waived"] = True
+            result = {
+                "success": False,
+                "error": gate_error,
+                "recoverable": True,
+                "needs_evidence": True,
+                "suggestion": (
+                    "Run a targeted search or read first, then retry the edit "
+                    "with evidence-based arguments."
+                ),
+            }
+            await self._safe_add_tool_result(call, result, persist=persist)
+            self.completed_tool_calls.append(call)
+            self.context.add_action({
+                "tool": name, "tool_call_id": call_id,
+                "params": args, "result": result,
+                "time": 0.0, "refused": True,
+            })
+            await self._trigger_event("on_tool_executed", {
+                "tool": name, "tool_call_id": call_id,
+                "params": args, "result": result, "refused": True,
+            })
+            return {
+                "tool": name, "tool_call_id": call_id,
+                "result": result, "success": False, "params": args,
+            }
 
         if self._is_duplicate_failing_call(name, args):
             logger.info("Refusing duplicate failing call: %s", name)
@@ -3171,6 +3484,7 @@ Stop when the goal is achieved.
                     }
                 if track_verification:
                     self._track_mutation_or_read(name, args, call_id, result)
+                self._record_evidence(name, args, result)
                 if self._is_read_only(name):
                     self._remember_successful_call(name, args, result)
                 else:
@@ -3340,6 +3654,81 @@ Stop when the goal is achieved.
         return {"note": "duplicate successful call; earlier result was identical"}
 
     # ------------------------------------------------------------------
+    # Evidence / discovery bookkeeping
+    # ------------------------------------------------------------------
+
+    def _remember_discovery(self, tool: str, target: str) -> None:
+        """Track inspected paths so compaction and prompts keep them."""
+        if not target:
+            return
+        discovered = self.context.metadata.setdefault("discoveries", [])
+        entry = f"{tool}:{str(target)[:200]}"
+        if entry in discovered:
+            return
+        discovered.append(entry)
+        if len(discovered) > 40:
+            del discovered[:-40]
+
+    def _record_evidence(
+        self,
+        tool: str,
+        args: Dict[str, Any],
+        result: Dict[str, Any],
+    ) -> None:
+        """Record facts the model has actually observed this session."""
+        if not isinstance(result, dict) or not result.get("success", False):
+            return
+        name_l = str(tool or "").lower()
+        if self._is_read_only(tool):
+            target = _read_target(tool, args)
+            if target:
+                self._remember_discovery(tool, target)
+            self.context.metadata["evidence_observed"] = True
+            if any(tok in name_l for tok in _SEARCH_TOOL_TOKENS):
+                self.context.metadata["code_searched"] = True
+        else:
+            self.context.metadata["action_attempted"] = True
+            if self.reuse_test_evidence:
+                self.verification.record_test_evidence(tool, args, result)
+
+    def _root_cause_gate(
+        self,
+        name: str,
+        args: Dict[str, Any],
+    ) -> Optional[str]:
+        """Require code evidence before editing an existing artifact.
+
+        Bug fixes and refactors must be based on something actually observed
+        (a read, search, failing test, or diff), not on a guess. Creating new
+        files and running evidence-gathering shell commands stay allowed.
+        """
+        if not self.require_root_cause_evidence:
+            return None
+        if self.context.metadata.get("evidence_observed"):
+            return None
+        if self.context.metadata.get("root_cause_waived"):
+            return None
+        if self.context.intent not in ("bugfix", "refactor"):
+            return None
+        name_l = str(name or "").lower()
+        if name_l not in (
+            "edit", "apply_patch", "patch", "str_replace", "replace",
+            "multiedit", "multi_edit",
+        ):
+            return None
+        command = ""
+        if isinstance(args, dict):
+            command = str(args.get("command") or args.get("cmd") or "")
+        if command and _EVIDENCE_COMMAND_RE.search(command):
+            return None
+        return (
+            f"Refusing to run '{name}' before observing the code. No file, "
+            "symbol, error, or test output has been inspected yet. First use "
+            "glob/grep/read (or run the failing test) to identify the actual "
+            "root cause, then apply the smallest targeted edit."
+        )
+
+    # ------------------------------------------------------------------
     # Verification gate (per-step AND batch bookkeeping)
     # ------------------------------------------------------------------
 
@@ -3356,35 +3745,19 @@ Stop when the goal is achieved.
         # A read only verifies the target it actually read. It must never
         # clear unrelated pending changes.
         if self._is_read_only(name):
-            if _read_target(name, args):
+            target = _read_target(name, args)
+            if target:
                 self._clear_unverified_mutations(name, args)
+                self._remember_discovery(name, target)
             return
 
         target = _mutation_target(name, args)
-        # A plain shell command (ls, git status, pytest, ...) is evidence in
-        # its own output. Only shell commands that redirect to a file have a
-        # durable target that must be read back.
-        if target and target.startswith("cmd::"):
-            return
-        if target and target not in self.context.batch_changed_targets:
-            self.context.batch_changed_targets.append(target)
-
-        for entry in list(self.context.unverified_mutations):
-            if entry.get("tool") == name and entry.get("target") == target:
-                entry["time"] = time.time()
-                entry["call_id"] = call_id
-                return
-        self.context.unverified_mutations.append({
-            "tool": name,
-            "args": args,
-            "target": target,
-            "call_id": call_id,
-            "time": time.time(),
-        })
-        logger.debug(
-            "Recorded unverified mutation: %s target=%s (%d pending)",
-            name, target, len(self.context.unverified_mutations),
-        )
+        self.verification.record_mutation(name, args, target, call_id)
+        if target and not str(target).startswith("cmd::"):
+            logger.debug(
+                "Recorded unverified mutation: %s target=%s (%d pending)",
+                name, target, len(self.context.unverified_mutations),
+            )
 
     def _clear_unverified_mutations(
         self,
@@ -3394,19 +3767,14 @@ Stop when the goal is achieved.
         if not self.context.unverified_mutations:
             return
         if by_args is None:
-            self.context.unverified_mutations.clear()
+            self.verification.clear_all()
             return
 
         target = _read_target(by_tool, by_args)
         if not target:
             return
 
-        remaining = [
-            m for m in self.context.unverified_mutations
-            if m.get("target") != target
-        ]
-        cleared = len(self.context.unverified_mutations) - len(remaining)
-        self.context.unverified_mutations = remaining
+        cleared = self.verification.clear_target(target)
         if cleared:
             logger.debug(
                 "Cleared %d unverified mutation(s) for target=%s",
@@ -3446,7 +3814,9 @@ Stop when the goal is achieved.
     def _pending_verification_entries(self) -> List[Dict[str, Any]]:
         if self.verification_mode == "off":
             return []
-        return list(self.context.unverified_mutations)
+        if self.reuse_test_evidence:
+            self.verification.refresh_from_evidence()
+        return self.verification.pending
 
     def _finalize_verification_report(self, text: str) -> tuple[str, bool]:
         """Append an explicit UNVERIFIED section for any remaining targets.
@@ -3456,32 +3826,10 @@ Stop when the goal is achieved.
         fully verified. This method is the single place that turns pending
         bookkeeping into a user-visible report.
         """
-        pending = self._pending_verification_entries()
-        if self.verification_mode != "batch" or not pending:
-            return text, False
-
-        targets = sorted({str(m.get("target") or "?") for m in pending})
-        tools = sorted({str(m.get("tool") or "?") for m in pending})
-        attempted = self.context.batch_verify_attempts
-        total = self.max_batch_verify_attempts
-        self.context.metadata["unverified_targets"] = targets
-        self.context.metadata["unverified_declared"] = True
-
-        bullets = "\n".join(f"  - {t}" for t in targets)
-        if self._declared_unverified(text):
-            report = "\n\nRemaining unverified targets:\n" + bullets
-        else:
-            report = (
-                f"\n\nUNVERIFIED: {len(targets)} change(s) could not be "
-                f"verified after {attempted}/{total} verification attempt(s).\n"
-                f"Changed via: {', '.join(tools)}\n"
-                f"Targets:\n{bullets}\n"
-                "Run the relevant checks or read the files back before "
-                "treating these changes as complete."
-            )
-        if not text.strip():
-            return report.lstrip("\n"), True
-        return text.rstrip() + report, True
+        return self.verification.finalize_report(
+            text,
+            declared_unverified=self._declared_unverified(text),
+        )
 
     # ------------------------------------------------------------------
     # Failure signature bookkeeping
@@ -3849,12 +4197,14 @@ Stop when the goal is achieved.
 
     async def reset(self) -> None:
         self.context = LoopContext()
+        self.verification = self._build_verification_controller()
         self.max_iterations = self._configured_max_iterations
         self.current_plan = None
         self.pending_tool_calls = []
         self.completed_tool_calls = []
         self.tool_result_cache.clear()
         self._successful_call_history.clear()
+        self.tool_execution_times.clear()
         self._cache_epoch = self._registry_epoch()
         self.should_stop = False
         self.is_paused = False
@@ -3863,6 +4213,10 @@ Stop when the goal is achieved.
         self._system_prompt_fp = None
         self._checklist_rendered = False
         self._last_checklist_signature = None
+        self._checkpoint_goal = ""
+        self._recovered_checkpoint = None
+        self._project_ctx = None
+        self._project_ctx_ts = 0.0
 
     def pause(self) -> None:
         self.is_paused = True

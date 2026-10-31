@@ -816,6 +816,28 @@ class ContextManager:
             merged.extend(keep_verbatim)
             merged.sort(key=lambda m: getattr(m, "timestamp", 0))
 
+            # Pin the live execution state (goal, plan, pending verification,
+            # discovered paths) so the next turn does not lose the task.
+            if state_block and state_block.strip():
+                merged = [
+                    m for m in merged
+                    if not (getattr(m, "metadata", {}) or {}).get("task_state")
+                ]
+                pinned_state = (
+                    "[Task state - pinned across compaction]\n"
+                    + state_block.strip()[:3000]
+                )
+                merged.insert(
+                    0,
+                    ContextMessage(
+                        role="system",
+                        content=pinned_state,
+                        tokens=self._estimate_tokens(pinned_state),
+                        metadata={"task_state": True},
+                        pinned=True,
+                    ),
+                )
+
             # [READ-CACHE] Survive compaction: pin a summary of files
             # already read this session so the model does not re-read them.
             index_text = self.read_cache.index_summary()
