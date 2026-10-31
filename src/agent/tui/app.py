@@ -953,16 +953,29 @@ class ContextPanel(Vertical):
             if not used:
                 used = int(self._app.tokens_used or 0)
 
+            # The live loop token counter is cumulative billing usage, not
+            # current prompt occupancy. Display retained context separately.
+            active = None
+            coordinator = getattr(self._app, "coordinator", None)
+            agent = getattr(coordinator, "build_agent", None)
+            if getattr(coordinator, "current_mode", None) == "plan":
+                agent = getattr(coordinator, "plan_agent", None)
+            manager = getattr(agent, "context_manager", None)
+            if manager is not None:
+                try:
+                    active = int(manager.total_tokens())
+                except Exception:
+                    pass
             window = max(1, self._app.context_window)
-            pct = min(100.0, (used / window) * 100.0)
+            pct = min(100.0, ((active if active is not None else used) / window) * 100.0)
             bar_w = 30
             filled = int(bar_w * pct / 100.0)
             bar = "█" * filled + "░" * (bar_w - filled)
             color = GREEN if pct < 60 else AMBER if pct < 85 else ERROR
             self.query_one("#ctx-bar", Static).update(f"[{color}]{bar}[/]")
             self.query_one("#ctx-tokens", Static).update(
-                f"[{MUTED}]tokens[/]  [{TEXT}]{used:,} / {window:,}  "
-                f"([{color}]{pct:.1f}%[/])[/]")
+                f"[{MUTED}]context[/] [{TEXT}]{(active if active is not None else used):,} / {window:,} "
+                f"([{color}]{pct:.1f}%[/])  total used: {used:,}[/]")
 
             cost = 0.0
             if live is not None:

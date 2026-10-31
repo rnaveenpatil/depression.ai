@@ -346,9 +346,12 @@ class Compactor:
         return combined, True
 
     async def _generate_summary(self, transcript: str) -> str:
-        max_chars = self.max_summary_tokens * 4
+        max_chars = max(3200, self.max_summary_tokens * 8)
         if len(transcript) > max_chars:
-            transcript = transcript[:max_chars] + "\n… (truncated)"
+            # Preserve both the original request and the most recent findings.
+            head = max_chars // 3
+            tail = max_chars - head
+            transcript = transcript[:head] + "\n… (middle omitted) …\n" + transcript[-tail:]
 
         try:
             result = await self.llm.complete(

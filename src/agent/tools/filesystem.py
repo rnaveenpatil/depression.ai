@@ -31,7 +31,7 @@ logger = get_logger(__name__)
 
 
 DIFF_SIZE_CAP = 50 * 1024           # bytes per side, for diff rendering
-DEFAULT_MAX_BYTES = 1_048_576       # 1 MiB cap on read() content
+DEFAULT_MAX_BYTES = 32 * 1024       # bounded default; request larger slices explicitly
 READ_CONTENT_HARD_CAP = 512 * 1024  # never exceed 512 KiB of content returned
 ALLOWED_ABS_ROOTS = ("/tmp", "/var/tmp", os.path.expanduser("~/.cache"))
 
@@ -78,6 +78,9 @@ class FileSystemTool(BaseTool):
             "pattern": {"type": "string"},
             "recursive": {"type": "boolean", "default": False},
             "max_bytes": {"type": "integer", "default": DEFAULT_MAX_BYTES},
+            "offset_bytes": {"type": "integer", "default": 0, "description": "Start byte offset for a bounded file slice."},
+            "start_line": {"type": "integer", "minimum": 1, "description": "Optional 1-based first line to read; use with end_line."},
+            "end_line": {"type": "integer", "minimum": 1, "description": "Optional inclusive last line; defaults to start_line + 99."},
             "max_files": {"type": "integer", "default": 500},
             "include_diff": {
                 "type": "boolean",
@@ -263,11 +266,69 @@ class FileSystemTool(BaseTool):
         if not target.is_file():
             return _err(f"Not a regular file: {target}")
 
+        if "start_line" in params or "end_line" in params:
+            if "start_line" not in params:
+                return _err("start_line is required when end_line is specified")
+            try:
+                first = int(params["start_line"])
+                last = int(params.get("end_line", first + 99))
+            except (TypeError, ValueError):
+                return _err("start_line and end_line must be integers")
+            if first < 1 or last < first:
+                return _err("Invalid line range: require 1 <= start_line <= end_line")
+            byte_limit = max(1, min(int(params.get("max_bytes", DEFAULT_MAX_BYTES)),
+                                    READ_CONTENT_HARD_CAP))
+
+            def _read_lines():
+                import itertools
+                chunks = []
+                used = 0
+                next_line = first
+                reached_end = False
+                with open(target, "rb") as stream:
+                    for line_no, raw_line in enumerate(
+                        itertools.islice(stream, first - 1, last), first
+                    ):
+                        if used + len(raw_line) > byte_limit:
+                            # Respect byte cap even for a single very long line.
+                            # Never return half a line: the caller can resume
+                            # with next_line without losing bytes.
+                            break
+                        chunks.append(raw_line)
+                        used += len(raw_line)
+                        next_line = line_no + 1
+                    else:
+                        reached_end = True
+                return b"".join(chunks), next_line, reached_end
+
+            try:
+                raw, next_line, complete = await asyncio.to_thread(_read_lines)
+                size = target.stat().st_size
+            except Exception as exc:
+                return _err(f"Failed to read {target}: {exc}")
+            if b"\x00" in raw[:2048]:
+                return _err(f"Binary file not supported: {target}", binary=True)
+            content, encoding = self._decode(raw)
+            if content is None:
+                return _err(f"Could not decode {target} as text", encoding_failed=True)
+            if not include_content:
+                content = ""
+            return {
+                "success": True, "path": str(target), "type": "file",
+                "content": content, "encoding": encoding, "size": size,
+                "start_line": first, "end_line": last,
+                "next_line": next_line, "truncated": not complete,
+                "content_omitted": not include_content,
+                "sha256": _sha256_bytes(raw),
+            }
+
         max_bytes = int(params.get("max_bytes", DEFAULT_MAX_BYTES))
         max_bytes = max(1, min(max_bytes, READ_CONTENT_HARD_CAP))
+        offset = max(0, int(params.get("offset_bytes", 0)))
 
         def _read_bytes():
             with open(target, "rb") as f:
+                f.seek(offset)
                 raw = f.read(max_bytes + 1)
             truncated = len(raw) > max_bytes
             if truncated:
@@ -292,6 +353,8 @@ class FileSystemTool(BaseTool):
                 "size": size,
                 "sha256": digest,
                 "truncated": truncated,
+                "offset_bytes": offset,
+                "next_offset_bytes": offset + len(raw),
                 "content_omitted": True,
             }
 
@@ -318,6 +381,8 @@ class FileSystemTool(BaseTool):
             "content": content,
             "encoding": encoding,
             "truncated": truncated,
+            "offset_bytes": offset,
+            "next_offset_bytes": offset + len(raw),
             "size": size,
             "lines": content.count("\n") + (
                 1 if content and not content.endswith("\n") else 0

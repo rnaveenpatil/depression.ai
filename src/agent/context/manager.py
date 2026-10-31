@@ -740,11 +740,16 @@ class ContextManager:
             protected = _cap_protected(protected, MAX_PINNED_MESSAGES)
 
             # Everything older than the verbatim window goes into the summary.
-            if len(rest) <= KEEP_VERBATIM:
+            # At high occupancy, even a short history of large tool outputs
+            # must compact. Preserve fewer recent messages if necessary.
+            keep_count = KEEP_VERBATIM
+            if self.usage_pct(system_prompt, tool_schemas, state_block) >= self.compaction_threshold:
+                keep_count = max(2, min(KEEP_VERBATIM, len(rest) // 2))
+            if len(rest) <= keep_count:
                 return {"compacted": False, "reason": "below verbatim window"}
 
-            to_summarise = rest[:-KEEP_VERBATIM]
-            keep_verbatim = rest[-KEEP_VERBATIM:]
+            to_summarise = rest[:-keep_count]
+            keep_verbatim = rest[-keep_count:]
 
             # Build a compact, tool-stubbed digest of the older messages.
             digest_lines: List[str] = []
