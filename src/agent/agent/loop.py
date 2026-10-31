@@ -2362,6 +2362,14 @@ Stop when the goal is achieved.
             return value
         if not (q or "").strip():
             return False
+        # Straightforward single-action requests do not need a second LLM
+        # request solely to decide whether to make a plan.
+        if re.match(
+            r"^\s*(?:fix|edit|change|rename|read|show|explain|run|test|"
+            r"open|delete|create)\b", q, re.I
+        ) and not re.search(r"\b(?:and then|after that|across|multiple|entire|"
+                            r"all files|several|end.to.end)\b", q, re.I):
+            return False
         try:
             self.context.llm_calls += 1
             response = await self.llm.complete(
