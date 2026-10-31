@@ -1021,7 +1021,7 @@ class TodoPanel(Vertical):
 
     def on_mount(self) -> None:
         self.refresh_from_store(force=True)
-        self.set_interval(0.5, self.refresh_from_store)
+        self.set_interval(1.0, self.refresh_from_store)
 
     def set_entries(self, entries: list[dict]) -> None:
         # [Todo fix] Accept empty lists so the panel clears correctly.
@@ -1456,7 +1456,7 @@ class LLMCostPanel(Vertical):
 
     def on_mount(self) -> None:
         self.refresh_values()
-        self.set_interval(0.5, self.refresh_values)
+        self.set_interval(1.0, self.refresh_values)
 
     def _coordinator_status(self) -> dict:
         try:
@@ -2163,7 +2163,7 @@ class DepressionApp(App):
         self._apply_sidebar_layout()
 
         # [Spinner fix] Animate the mode chip independently of message_count.
-        self.set_interval(0.12, self._tick_spinner)
+        self.set_interval(0.25, self._tick_spinner)
 
         self._mounted = True
 
@@ -4178,19 +4178,42 @@ class DepressionApp(App):
             self._error("usage: /run <command>")
             return
         self._system(f"$ {cmd}")
+        self._run_shell_async(cmd)
+
+    @work(exclusive=True, group="user-shell")
+    async def _run_shell_async(self, cmd: str) -> None:
+        """Keep /run off the Textual event loop; reap children on cancellation."""
+        proc = None
         try:
-            proc = subprocess.run(
-                cmd, shell=True, capture_output=True, text=True, timeout=30,
+            proc = await asyncio.create_subprocess_shell(
+                cmd, stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
             )
-            if proc.stdout:
-                for line in proc.stdout.splitlines():
-                    self._write(f"  {line}", "agent")
-            if proc.stderr:
-                for line in proc.stderr.splitlines():
-                    self._write(f"  {line}", "error")
+            try:
+                out, err = await asyncio.wait_for(proc.communicate(), timeout=30)
+            except asyncio.TimeoutError:
+                self._error("run timed out after 30 seconds")
+                return
+            for line in out.decode(errors="replace").splitlines():
+                self._write(f"  {line}", "agent")
+            for line in err.decode(errors="replace").splitlines():
+                self._write(f"  {line}", "error")
             self._system(f"exit {proc.returncode}")
+        except asyncio.CancelledError:
+            raise
         except Exception as exc:
             self._error(f"run failed: {exc}")
+        finally:
+            if proc is not None:
+                if proc.returncode is None:
+                    try:
+                        proc.kill()
+                    except ProcessLookupError:
+                        pass
+                try:
+                    await asyncio.wait_for(proc.communicate(), timeout=2)
+                except Exception:
+                    pass
 
     def _request_agent_stop(self) -> None:
         """Ask the running loop to stop gracefully and summarize its work."""
