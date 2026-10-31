@@ -518,3 +518,20 @@ async def test_read_only_answer_stops_after_one_observation():
     assert result["success"] is True
     assert llm.calls == 2
     assert len(agent.executed) == 1
+
+
+def test_shared_verification_budget_is_risk_aware():
+    loop, _, _ = make_loop([])
+    assert loop._verification_budget([]) == 0
+    assert loop._verification_budget([{"tool": "write", "target": "a.py"}]) == 1
+    assert loop._verification_budget([
+        {"tool": "write", "target": "a.py"},
+        {"tool": "edit", "target": "b.py"},
+    ]) == 2
+
+
+@pytest.mark.asyncio
+async def test_straightforward_task_skips_planning_llm_call():
+    loop, _, llm = make_loop([])
+    assert await loop._should_plan("fix parser.py") is False
+    assert llm.calls == 0
