@@ -1464,6 +1464,21 @@ class AgentLoop:
             return True
         return False
 
+    def _verification_budget(self, pending: Any) -> int:
+        """Shared risk-aware verification budget for both execution modes."""
+        entries = list(pending.values()) if isinstance(pending, dict) else list(pending)
+        if not entries or not self.require_verification:
+            return 0
+        names = {str(e.get("tool") or "").lower() for e in entries}
+        targets = {str(e.get("target") or "") for e in entries}
+        # One straightforward file edit: one focused verification pass.
+        simple = {"write", "edit", "write_file", "edit_file", "apply_patch", "patch"}
+        if len(targets) == 1 and names <= simple:
+            return 1
+        # Multiple artifacts, shell operations and deployments need more care,
+        # but cannot cause unlimited independent verification turns.
+        return min(2, self.max_batch_verify_attempts)
+
     # [NEW] Batch-verification decision.
     def _should_batch_verify(self, response_text: str) -> bool:
         """True when we must inject a verification turn before accepting
@@ -1482,7 +1497,7 @@ class AgentLoop:
             return False
         if not self._pending_verification_entries():
             return False
-        if self.context.batch_verify_attempts >= self.max_batch_verify_attempts:
+        if self.context.batch_verify_attempts >= self._verification_budget(self._pending_verification_entries()):
             return False
         if self.context.iteration >= self.max_iterations:
             return False
@@ -1503,7 +1518,7 @@ class AgentLoop:
         targets = sorted({m.get("target") or "?" for m in pending})
         self.context.batch_verify_attempts += 1
         attempt = self.context.batch_verify_attempts
-        total = self.max_batch_verify_attempts
+        total = self._verification_budget(pending)
 
         names = sorted({m.get("tool") or "write/edit" for m in pending})
         count = len(targets)
@@ -1808,11 +1823,7 @@ class AgentLoop:
                     }
                 # Task-local verification. Reads clear only the target they
                 # actually checked; the budget is per task, not global.
-                verify_budget = (
-                    self.max_batch_verify_attempts
-                    if self.verification_mode == "batch"
-                    else max(1, self.max_verification_nudges)
-                )
+                verify_budget = self._verification_budget(local_unverified)
                 if (
                     self.require_verification
                     and local_unverified
@@ -1909,7 +1920,7 @@ class AgentLoop:
                 tool_args = x.get("params") or {}
                 if self._is_read_only(tool):
                     target = _read_target(tool, tool_args)
-                    if target:
+                    if target and target in local_unverified:
                         local_unverified.pop(target, None)
                 else:
                     target = (
@@ -2350,6 +2361,14 @@ Stop when the goal is achieved.
         if isinstance(value, bool):
             return value
         if not (q or "").strip():
+            return False
+        # Straightforward single-action requests do not need a second LLM
+        # request solely to decide whether to make a plan.
+        if re.match(
+            r"^\s*(?:fix|edit|change|rename|read|show|explain|run|test|"
+            r"open|delete|create)\b", q, re.I
+        ) and not re.search(r"\b(?:and then|after that|across|multiple|entire|"
+                            r"all files|several|end.to.end)\b", q, re.I):
             return False
         try:
             self.context.llm_calls += 1
