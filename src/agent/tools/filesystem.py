@@ -79,6 +79,8 @@ class FileSystemTool(BaseTool):
             "recursive": {"type": "boolean", "default": False},
             "max_bytes": {"type": "integer", "default": DEFAULT_MAX_BYTES},
             "offset_bytes": {"type": "integer", "default": 0, "description": "Start byte offset for a bounded file slice."},
+            "start_line": {"type": "integer", "minimum": 1, "description": "Optional 1-based first line to read; use with end_line."},
+            "end_line": {"type": "integer", "minimum": 1, "description": "Optional inclusive last line; defaults to start_line + 99."},
             "max_files": {"type": "integer", "default": 500},
             "include_diff": {
                 "type": "boolean",
@@ -263,6 +265,64 @@ class FileSystemTool(BaseTool):
 
         if not target.is_file():
             return _err(f"Not a regular file: {target}")
+
+        if "start_line" in params or "end_line" in params:
+            if "start_line" not in params:
+                return _err("start_line is required when end_line is specified")
+            try:
+                first = int(params["start_line"])
+                last = int(params.get("end_line", first + 99))
+            except (TypeError, ValueError):
+                return _err("start_line and end_line must be integers")
+            if first < 1 or last < first:
+                return _err("Invalid line range: require 1 <= start_line <= end_line")
+            byte_limit = max(1, min(int(params.get("max_bytes", DEFAULT_MAX_BYTES)),
+                                    READ_CONTENT_HARD_CAP))
+
+            def _read_lines():
+                import itertools
+                chunks = []
+                used = 0
+                next_line = first
+                reached_end = False
+                with open(target, "rb") as stream:
+                    for line_no, raw_line in enumerate(
+                        itertools.islice(stream, first - 1, last), first
+                    ):
+                        if used + len(raw_line) > byte_limit:
+                            # Respect byte cap even for a single very long line.
+                            room = byte_limit - used
+                            if room > 0:
+                                chunks.append(raw_line[:room])
+                                used += room
+                            break
+                        chunks.append(raw_line)
+                        used += len(raw_line)
+                        next_line = line_no + 1
+                    else:
+                        reached_end = True
+                return b"".join(chunks), next_line, reached_end
+
+            try:
+                raw, next_line, complete = await asyncio.to_thread(_read_lines)
+                size = target.stat().st_size
+            except Exception as exc:
+                return _err(f"Failed to read {target}: {exc}")
+            if b"\\x00" in raw[:2048]:
+                return _err(f"Binary file not supported: {target}", binary=True)
+            content, encoding = self._decode(raw)
+            if content is None:
+                return _err(f"Could not decode {target} as text", encoding_failed=True)
+            if not include_content:
+                content = ""
+            return {
+                "success": True, "path": str(target), "type": "file",
+                "content": content, "encoding": encoding, "size": size,
+                "start_line": first, "end_line": last,
+                "next_line": next_line, "truncated": not complete,
+                "content_omitted": not include_content,
+                "sha256": _sha256_bytes(raw),
+            }
 
         max_bytes = int(params.get("max_bytes", DEFAULT_MAX_BYTES))
         max_bytes = max(1, min(max_bytes, READ_CONTENT_HARD_CAP))
