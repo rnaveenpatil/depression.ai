@@ -105,7 +105,7 @@ async def test_reconnect_does_not_change_config_or_register_stale_tools(monkeypa
             await pilot.pause()
             if client.reload_count:
                 break
-        assert client.reload_count == 1
+        assert client.reload_count == 1  # fallback for clients lacking targeted connect methods
         assert registry.has_tool("mcp__example__read")
         assert not registry.has_tool("mcp__stale__old")
         assert not registry.is_read_only("mcp__example__read")
@@ -130,3 +130,53 @@ async def test_mcp_reconnect_is_disabled_while_agent_busy():
         app._reconnect_mcp()
         await pilot.pause()
         assert client.reload_count == 0
+
+
+@pytest.mark.asyncio
+async def test_sync_mcp_tools_updates_both_agent_registries():
+    client = DummyClient()
+    build_registry, plan_registry = ToolRegistry(), ToolRegistry()
+    for registry in (build_registry, plan_registry):
+        registry.register_external("mcp__stale__old", handler=lambda **kwargs: None)
+    coordinator = SimpleNamespace(
+        build_agent=SimpleNamespace(mcp_client=client, tool_registry=build_registry, loop=None),
+        plan_agent=SimpleNamespace(mcp_client=client, tool_registry=plan_registry, loop=None),
+    )
+    app = DepressionApp(coordinator=coordinator, skip_onboarding=True)
+    app._sync_mcp_tools(client)
+    for registry in (build_registry, plan_registry):
+        assert registry.has_tool("mcp__example__read")
+        assert not registry.has_tool("mcp__stale__old")
+        assert registry.is_mutating("mcp__example__read")
+
+
+@pytest.mark.asyncio
+async def test_targeted_mcp_reconnect_preserves_healthy_server(monkeypatch):
+    client = DummyClient()
+    client.connection_errors = {}
+    called = []
+    async def connect(name):
+        called.append(name)
+        client.transports[name] = SimpleNamespace(state=SimpleNamespace(value="ready"))
+    async def disconnect(name):
+        client.transports.pop(name, None)
+    client.connect_server = connect
+    client.disconnect_server = disconnect
+    client.update_config = lambda cfg: None
+    client.servers_cfg.append(SimpleNamespace(name="broken", transport=SimpleNamespace(value="stdio")))
+    monkeypatch.setattr(
+        "agent.config.loader.ConfigLoader.load",
+        lambda self, **kwargs: SimpleNamespace(
+            to_dict=lambda **options: {"mcp": {"enabled": True, "servers": [{"name": "example"}, {"name": "broken"}]}}
+        ),
+    )
+    registry = ToolRegistry()
+    coordinator = SimpleNamespace(build_agent=SimpleNamespace(mcp_client=client, tool_registry=registry, loop=None), plan_agent=None)
+    app = DepressionApp(coordinator=coordinator, skip_onboarding=True)
+    async with app.run_test() as pilot:
+        app._slash("/mcp")
+        await pilot.pause()
+        await app._reconnect_mcp()
+        assert called == ["broken"]
+        assert client.reload_count == 0
+        assert "example" in client.transports
