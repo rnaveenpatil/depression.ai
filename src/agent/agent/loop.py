@@ -537,12 +537,11 @@ class AgentLoop:
         if not bool(config.get("require_verification", True)):
             self.verification_mode = "off"
         self.require_verification = self.verification_mode != "off"
+        # Batch mode confirms edited files once, without running test cycles.
         # Max nudges applies only to per_step mode.
         self.max_verification_nudges = int(config.get("max_verification_nudges", 1))
-        # [NEW] Cap on batch fix->verify rounds. Hard-coded to 4 per request.
-        self.max_batch_verify_attempts = int(
-            config.get("max_batch_verify_attempts", MAX_BATCH_VERIFY_ATTEMPTS)
-        )
+        # File confirmation is a single batch pass; no automatic fix/test retries.
+        self.max_batch_verify_attempts = 1
         self.require_demo_offer = bool(config.get("require_demo_offer", True))
         self.retry_tool_timeout = bool(config.get("retry_tool_timeout", False))
         self.enable_parallel_reads = bool(config.get("enable_parallel_reads", True))
@@ -1678,8 +1677,6 @@ class AgentLoop:
           * we have not used up the attempt budget (4 by default)
           * the model did not declare UNVERIFIED
         """
-        if self.reuse_test_evidence:
-            self.verification.refresh_from_evidence()
         return self.verification.should_verify(
             response_text,
             declared_unverified=self._declared_unverified(response_text),
@@ -1690,54 +1687,29 @@ class AgentLoop:
         )
 
     async def _inject_batch_verification_guidance(self) -> None:
-        """One round of batch verification.
-
-        Lists every *still unverified* target and asks the model to verify +
-        fix + reverify inside the same turn. A successful read of a target
-        clears only that target, so the loop stops early once everything has
-        actually been checked. If the attempt budget runs out, the caller
-        reports the remaining targets as UNVERIFIED.
-        """
+        """Confirm changed files once; do not automatically test or repair."""
         pending = self._pending_verification_entries()
-        targets = sorted({m.get("target") or "?" for m in pending})
-        attempt = self.verification.begin_attempt()
-        total = self.max_batch_verify_attempts
-
-        names = sorted({m.get("tool") or "write/edit" for m in pending})
-        count = len(targets)
-        evidence = (
-            self.verification.evidence_summary()
-            if self.reuse_test_evidence else ""
-        )
-
-        if attempt < total:
-            tail = (
-                "If anything is wrong: FIX IT and re-run the check in this "
-                "same turn, then report the new evidence."
-            )
-        else:
-            tail = (
-                "This is the FINAL verification attempt. If you cannot fix "
-                "everything, begin your reply with:\n"
-                "    UNVERIFIED: <concrete reason>"
-            )
-
+        targets = sorted({
+            str(m.get("target") or "") for m in pending
+            if m.get("target") and not str(m.get("target")).startswith("cmd::")
+        })
+        self.verification.begin_attempt()
+        if not targets:
+            return
         msg = (
-            f"Verification attempt {attempt}/{total}.\n"
-            f"You have made {count} change(s) via {', '.join(names)}.\n"
-            + (f"{evidence}\n" if evidence else "")
-            + f"Changed targets:\n" + "\n".join(f"  - {t}" for t in targets) +
-            "\n\nNow verify ALL of them in ONE pass — do not verify one at a time:\n"
-            "  1. Read back each changed file (or run `git diff` once).\n"
-            "  2. Run the relevant test/command once and quote its output.\n"
-            "  3. " + tail + "\n"
-            "If verification is genuinely impossible, begin your reply with:\n"
-            "    UNVERIFIED: <concrete reason>"
+            "One-pass file confirmation only. Confirm these modified files "
+            "exist and their saved contents are readable:\n"
+            + "\n".join(f"  - {t}" for t in targets)
+            + "\nUse targeted read tools or one git diff when appropriate. "
+            "Do not run tests, lint, builds, launch commands, or an additional "
+            "verification/fix cycle unless the user explicitly requested them. "
+            "If a file cannot be confirmed, report UNVERIFIED with the reason; "
+            "do not claim its contents were checked."
         )
         try:
             await self.model_context.add_system_message(msg)
         except Exception as exc:
-            logger.debug("add_system_message (batch verification) failed: %s", exc)
+            logger.debug("add_system_message (file confirmation) failed: %s", exc)
 
     # ==================================================================
     # PLAN-DRIVEN LOOP
@@ -3780,7 +3752,7 @@ Achieve what the user intends, not merely what their words literally suggest. Be
     def _pending_verification_entries(self) -> List[Dict[str, Any]]:
         if self.verification_mode == "off":
             return []
-        if self.reuse_test_evidence:
+        if self.reuse_test_evidence and self.verification_mode != "batch":
             self.verification.refresh_from_evidence()
         return self.verification.pending
 
