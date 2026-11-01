@@ -841,6 +841,9 @@ class ContextManager:
             # [READ-CACHE] Survive compaction: pin a summary of files
             # already read this session so the model does not re-read them.
             index_text = self.read_cache.index_summary()
+            landmarks = self.read_cache.knowledge_summary()
+            if landmarks:
+                index_text = (index_text + "\n" + landmarks).strip()
             if index_text:
                 merged.insert(
                     1,

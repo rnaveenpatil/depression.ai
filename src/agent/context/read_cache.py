@@ -256,6 +256,34 @@ class ReadCache:
             )
             return "\n".join(lines)
 
+    def knowledge_summary(self, max_entries: int = 8, max_chars: int = 1800) -> str:
+        """Bounded, source-grounded code landmarks retained across compaction.
+
+        This is a reminder, not a substitute for retrieving exact file content.
+        Never expose stale excerpts after a file changes.
+        """
+        with self._lock:
+            entries = list(self._index.values())[-max_entries:]
+            lines = ["[Recent file landmarks; fetch exact code if needed]"]
+            for entry in reversed(entries):
+                cached = self._content.get(entry.path)
+                if cached is None or cached.sha != entry.sha:
+                    continue
+                stat = self._stat(entry.path)
+                if stat is None or stat != (cached.mtime, cached.size):
+                    continue
+                landmarks = []
+                for raw in cached.content.splitlines():
+                    line = raw.strip()
+                    if line.startswith(("class ", "def ", "async def ", "from ", "import ")):
+                        landmarks.append(line[:115])
+                    if len(landmarks) >= 8:
+                        break
+                if landmarks:
+                    lines.append(f"- {entry.path} ({entry.sha}): " + "; ".join(landmarks))
+            content = "\n".join(lines)
+            return content[:max_chars] if len(lines) > 1 else ""
+
     # ------------------------------------------------------------------
     # SLICE STORE
     # ------------------------------------------------------------------

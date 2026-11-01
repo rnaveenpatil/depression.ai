@@ -2835,6 +2835,12 @@ Understand → Decide → Act if needed → Observe → Lightweight batch verifi
                 checkpoint["next_step"] = checkpoint["pending_tasks"][0]
         self._recovered_checkpoint = checkpoint
         state_parts["checkpoint"] = checkpoint
+        # Keep bounded code landmarks visible even before compaction occurs.
+        read_cache = getattr(self.model_context, "read_cache", None)
+        if read_cache is not None:
+            landmarks = read_cache.knowledge_summary()
+            if landmarks:
+                state_parts["file_knowledge"] = landmarks
         self._save_task_checkpoint(checkpoint)
         state_block = json.dumps(state_parts, default=str)
 

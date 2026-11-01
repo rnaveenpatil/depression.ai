@@ -543,25 +543,31 @@ async def add_tool_result(
         result, cap=cap, read_cache=read_cache, path_hint=path_hint,
     )
 
-    # Record this file in the read index so compaction can pin a reminder.
-    if read_cache is not None and path_hint:
+    # Index only successful file reads. Hash and cache the ORIGINAL body,
+    # never the truncated tool payload (which has different content/hash).
+    tool_name = str(getattr(call, "name", "") or "").lower()
+    file_read = tool_name in {"read", "read_file", "readfile", "cat"}
+    if read_cache is not None and path_hint and file_read:
         try:
+            import os
             from agent.context.read_cache import _hash_str
-            body = None
-            if isinstance(payload, dict):
-                body = payload.get("content")
-            if isinstance(body, str):
+            original = result if isinstance(result, dict) else {}
+            body = original.get("content")
+            if original.get("success", True) and isinstance(body, str):
                 sha = _hash_str(body)
-                read_cache.record_read(
-                    path_hint,
-                    sha=sha,
-                    tokens=max(1, len(body) // 4),
-                    size=len(body.encode("utf-8")),
-                    truncated=bool(
-                        isinstance(payload, dict) and payload.get("_truncated")
-                    ),
+                stat = os.stat(path_hint)
+                # Avoid caching range reads as if they represented whole files.
+                args = getattr(call, "arguments", {}) or {}
+                ranged = isinstance(args, dict) and any(
+                    key in args for key in ("offset", "limit", "start_line", "end_line", "slice_token")
                 )
-        except Exception:
+                if not ranged and len(body.encode("utf-8")) == stat.st_size:
+                    read_cache.put_content(path_hint, body, stat.st_mtime, stat.st_size)
+                    read_cache.record_read(
+                        path_hint, sha=sha, tokens=max(1, len(body) // 4),
+                        size=stat.st_size, truncated=bool(payload.get("_truncated")),
+                    )
+        except (OSError, ValueError, TypeError):
             pass
 
     await context_manager.add_message(
