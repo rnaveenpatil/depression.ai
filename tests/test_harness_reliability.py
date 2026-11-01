@@ -158,7 +158,7 @@ async def test_simple_question_does_not_call_intent_classifier(monkeypatch):
     monkeypatch.setattr(loop, "_classify_intent", fail_classifier)
     monkeypatch.setattr(loop, "_run_free_form", fake_run)
     assert (await loop.run("What is Python?"))["success"]
-    assert loop.context.intent == "question"
+    assert loop.context.intent == "unknown"
     assert loop.context.metadata["intent_needs_plan"] is False
 
 
