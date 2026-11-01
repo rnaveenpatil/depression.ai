@@ -177,6 +177,12 @@ class StreamingOutput(Vertical):
     }}
     """
 
+    # Coalesce tokens instead of repainting the whole Static on every one.
+    # Streaming providers can emit hundreds of tokens per second; updating
+    # the widget each time makes the UI quadratic in reply length and
+    # starves key handling, which reads as the TUI freezing.
+    FLUSH_INTERVAL = 0.05
+
     def __init__(self, header: str = "◆ depression.ai", **kwargs: Any) -> None:
         super().__init__(**kwargs)
         self._header = header
@@ -184,6 +190,8 @@ class StreamingOutput(Vertical):
         # so we don't re-join / re-escape the whole transcript on every token.
         self._raw: list[str] = []
         self._escaped: list[str] = []
+        self._pending: list[str] = []
+        self._flush_timer: Any = None
         self._body: Optional[Static] = None
 
     def compose(self) -> ComposeResult:
@@ -203,17 +211,54 @@ class StreamingOutput(Vertical):
         except Exception:
             self._body = None
 
+    def on_unmount(self) -> None:
+        self._cancel_flush_timer()
+        self._body = None
+
     def append_token(self, delta: str) -> None:
         if not delta:
             return
         self._raw.append(delta)
-        # Escape only the incoming delta; append to the escaped list.
-        self._escaped.append(delta.replace("[", r"\["))
+        # Escape only the incoming delta; buffer it until the next repaint.
+        self._pending.append(delta.replace("[", r"\["))
+        if self._flush_timer is None:
+            try:
+                self._flush_timer = self.set_timer(
+                    self.FLUSH_INTERVAL, self._flush
+                )
+            except Exception:
+                self._flush()
+
+    def _cancel_flush_timer(self) -> None:
+        timer = self._flush_timer
+        self._flush_timer = None
+        if timer is not None:
+            try:
+                timer.stop()
+            except Exception:
+                pass
+
+    def _flush(self) -> None:
+        self._flush_timer = None
+        if not self._pending:
+            return
+        self._escaped.extend(self._pending)
+        self._pending.clear()
         if self._body is not None:
             try:
                 self._body.update("".join(self._escaped))
             except Exception:
                 pass
+        # Follow the stream here rather than on every token.
+        try:
+            self.app._scroll_transcript_end()
+        except Exception:
+            pass
+
+    def flush(self) -> None:
+        """Render any buffered tokens immediately."""
+        self._cancel_flush_timer()
+        self._flush()
 
     def get_text(self) -> str:
         return "".join(self._raw)
@@ -2468,12 +2513,9 @@ class DepressionApp(App):
                     return
                 self._streaming_widget = widget
 
+        # append_token batches repaints and scrolls, so this stays cheap even
+        # when the provider streams tokens faster than the UI can render them.
         self._streaming_widget.append_token(delta)
-        try:
-            transcript = self.query_one("#transcript", VerticalScroll)
-            self._scroll_transcript_end()
-        except Exception:
-            pass
 
     async def _on_token_end(self, event: AgentEvent) -> None:
         # [Streaming fix] Same rationale as _on_token — no is_running gate.
@@ -2481,6 +2523,9 @@ class DepressionApp(App):
         # _render_output once the turn's result comes back.
         if self._is_shutting_down:
             return
+        widget = self._streaming_widget
+        if widget is not None and widget.is_mounted:
+            widget.flush()
 
     # ------------------------------------------------------------------
     # AGENT EVENTS
@@ -3082,7 +3127,12 @@ class DepressionApp(App):
         return sorted(files)
 
     def action_complete_file(self) -> None:
-        files = self._project_files()
+        self.run_worker(self._open_file_picker(), group="file-complete")
+
+    async def _open_file_picker(self) -> None:
+        # Walking a large repository can take a noticeable moment; keep it
+        # off the UI loop so the TUI stays responsive.
+        files = await asyncio.to_thread(self._project_files)
         if not files:
             self._error("no project files found")
             return
@@ -3985,16 +4035,25 @@ class DepressionApp(App):
     # TRANSCRIPT ACTIONS
     # ------------------------------------------------------------------
 
-    def _copy_last_output(self) -> None:
+    @work(exclusive=True, group="clipboard")
+    async def _copy_last_output(self) -> None:
         if not self._last_output:
             self._system("nothing to copy yet")
             return
         from agent.utils.clipboard import copy_text
 
-        outcome = copy_text(
-            self._last_output, terminal_copy=self.copy_to_clipboard
-        )
-        chars = len(self._last_output)
+        text = self._last_output
+        # Native clipboard tools can take seconds (or hit their timeout) on
+        # a misconfigured display server. Never run them on the UI loop.
+        outcome = await asyncio.to_thread(copy_text, text)
+        if outcome == "unavailable":
+            # OSC 52 must be written from the UI thread.
+            try:
+                self.copy_to_clipboard(text)
+                outcome = "terminal"
+            except Exception:
+                outcome = "unavailable"
+        chars = len(text)
         if outcome == "copied":
             self._system(f"copied last reply ({chars:,} chars) to the clipboard")
         elif outcome == "terminal":

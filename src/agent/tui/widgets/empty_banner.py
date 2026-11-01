@@ -425,5 +425,9 @@ class EmptyBanner(Static):
     def _tick_effects(self) -> None:
         if not self._alive:
             return
+        # The banner is hidden as soon as the transcript has content; don't
+        # keep rebuilding the wordmark every 140ms behind the transcript.
+        if not self.display:
+            return
         self._scan_tick += 1
         self._render_wordmark()

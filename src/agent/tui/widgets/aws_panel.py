@@ -370,6 +370,10 @@ class AWSPanel(Vertical):
     # ------------------------------------------------------------------
 
     def _tick(self) -> None:
+        # Skip rendering while this sidebar panel is hidden; the timer keeps
+        # running so the animation resumes when it is shown again.
+        if not self.display:
+            return
         self._breath_i += 1
         dirty = False
 

@@ -285,6 +285,7 @@ class ToolCallWidget(Vertical):
         self._expanded = False
         self._header_static: Optional[Static] = None
         self._body_static: Optional[Static] = None
+        self._tick_timer: Any = None
         self._alive = True
 
         # AWS metadata computed once per widget.
@@ -310,12 +311,22 @@ class ToolCallWidget(Vertical):
         self.add_class("running")
         if self._is_aws:
             self.add_class("aws")
-        self.set_interval(0.09, self._tick)
+        self._tick_timer = self.set_interval(0.09, self._tick)
 
     def on_unmount(self) -> None:
         self._alive = False
+        self._stop_tick()
         self._header_static = None
         self._body_static = None
+
+    def _stop_tick(self) -> None:
+        timer = self._tick_timer
+        self._tick_timer = None
+        if timer is not None:
+            try:
+                timer.stop()
+            except Exception:
+                pass
 
     def _tick(self) -> None:
         if not self._alive:
@@ -378,6 +389,12 @@ class ToolCallWidget(Vertical):
             self._state = "error"
 
         self._set_state_class(self._state)
+
+        # Completed cards are never removed from the transcript, so leaving
+        # their animation timer running accumulates dozens of callbacks per
+        # second over a long session.
+        if self._state not in ("pending", "running", "background"):
+            self._stop_tick()
 
         if self._header_static is not None:
             try:
