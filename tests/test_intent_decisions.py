@@ -86,3 +86,26 @@ def test_plan_priority_comes_from_explicit_annotation_only():
         "medium", "high", "low"
     ]
     assert plan.entries[1].content == "Fix bug"
+
+
+@pytest.mark.asyncio
+async def test_batch_confirmation_is_file_only_and_single_pass():
+    loop = make_loop([])
+    loop.verification_mode = "batch"
+    loop.max_batch_verify_attempts = 1
+    loop.context.unverified_mutations = [
+        {"tool": "edit", "target": "src/main.py", "call_id": "1"},
+        {"tool": "write", "target": "src/helper.py", "call_id": "2"},
+    ]
+    messages = []
+    async def capture(message):
+        messages.append(message)
+    loop.agent.context_manager = SimpleNamespace(add_system_message=capture)
+    loop.verification = loop._build_verification_controller()
+    await loop._inject_batch_verification_guidance()
+    assert len(messages) == 1
+    guidance = messages[0].lower()
+    assert "src/main.py" in guidance and "src/helper.py" in guidance
+    assert "do not run tests" in guidance
+    assert "one-pass file confirmation" in guidance
+    assert loop.context.batch_verify_attempts == 1
