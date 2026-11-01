@@ -256,33 +256,56 @@ class ReadCache:
             )
             return "\n".join(lines)
 
-    def knowledge_summary(self, max_entries: int = 8, max_chars: int = 1800) -> str:
-        """Bounded, source-grounded code landmarks retained across compaction.
+    def knowledge_summary(
+        self, max_entries: int = 8, max_chars: int = 1800,
+        relevant_paths: Optional[list[str]] = None,
+    ) -> str:
+        """Keep bounded, relevant code landmarks visible without full-file reads.
 
-        This is a reminder, not a substitute for retrieving exact file content.
-        Never expose stale excerpts after a file changes.
+        Prefer currently referenced files, then the most recently read ones.
+        Spread landmarks throughout long files rather than only showing imports.
         """
         with self._lock:
-            entries = list(self._index.values())[-max_entries:]
-            lines = ["[Recent file landmarks; fetch exact code if needed]"]
-            for entry in reversed(entries):
+            if max_entries <= 0 or max_chars <= 0:
+                return ""
+            preferred = {os.path.normpath(p) for p in (relevant_paths or []) if p}
+            entries = list(self._index.values())
+            entries.sort(
+                key=lambda e: (os.path.normpath(e.path) in preferred, e.last_seen),
+                reverse=True,
+            )
+            lines = ["[Cached code landmarks; retrieve exact sections when needed]"]
+            for entry in entries:
+                if len(lines) > max_entries:
+                    break
                 cached = self._content.get(entry.path)
                 if cached is None or cached.sha != entry.sha:
                     continue
                 stat = self._stat(entry.path)
                 if stat is None or stat != (cached.mtime, cached.size):
                     continue
-                landmarks = []
-                for raw in cached.content.splitlines():
+                # Prefer useful definitions, retaining the file-wide spread.
+                symbols = []
+                for number, raw in enumerate(cached.content.splitlines(), 1):
                     line = raw.strip()
-                    if line.startswith(("class ", "def ", "async def ", "from ", "import ")):
-                        landmarks.append(line[:115])
-                    if len(landmarks) >= 8:
+                    if line.startswith(("class ", "def ", "async def ")):
+                        symbols.append((number, line[:105]))
+                if not symbols:
+                    continue
+                slots = min(8, len(symbols))
+                chosen = [symbols[(i * (len(symbols) - 1)) // max(1, slots - 1)]
+                          for i in range(slots)]
+                unique = list(dict.fromkeys(chosen))
+                summary = f"- {entry.path} (sha {entry.sha}): " + "; ".join(
+                    f"L{n} {line}" for n, line in unique
+                )
+                if len("\n".join(lines + [summary])) > max_chars:
+                    remaining = max_chars - len("\n".join(lines)) - 2
+                    if remaining < 70:
                         break
-                if landmarks:
-                    lines.append(f"- {entry.path} ({entry.sha}): " + "; ".join(landmarks))
-            content = "\n".join(lines)
-            return content[:max_chars] if len(lines) > 1 else ""
+                    summary = summary[:remaining].rsplit("; ", 1)[0]
+                lines.append(summary)
+            return "\n".join(lines) if len(lines) > 1 else ""
 
     # ------------------------------------------------------------------
     # SLICE STORE

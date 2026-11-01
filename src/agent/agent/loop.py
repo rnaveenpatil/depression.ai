@@ -2838,7 +2838,8 @@ Understand → Decide → Act if needed → Observe → Lightweight batch verifi
         # Keep bounded code landmarks visible even before compaction occurs.
         read_cache = getattr(self.model_context, "read_cache", None)
         if read_cache is not None:
-            landmarks = read_cache.knowledge_summary()
+            relevant = checkpoint.get("modified_files", []) + checkpoint.get("completed_tools", [])
+            landmarks = read_cache.knowledge_summary(relevant_paths=relevant[:16])
             if landmarks:
                 state_parts["file_knowledge"] = landmarks
         self._save_task_checkpoint(checkpoint)
