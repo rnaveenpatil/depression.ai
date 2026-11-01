@@ -516,7 +516,9 @@ class AgentLoop:
         self.default_timeout = config.get("timeout", 3600)
         self.project_ctx_ttl = config.get("project_context_ttl", 30.0)
         self.enable_plan_driven = config.get("enable_plan_driven", True)
-        self.enable_intent_classification = config.get("enable_intent_classification", True)
+        self.enable_intent_classification = config.get("enable_intent_classification", False)
+        # The main response selects answer or tools; old preflight is optional.
+        self.preflight_planning = bool(config.get("preflight_planning", False))
         # [CHANGED] QA verification is OFF by default — batch verify covers it.
         self.enable_qa_verification = config.get("enable_qa_verification", False)
         self.reserve_output_tokens = int(config.get("reserve_output_tokens", 4000))
@@ -1080,29 +1082,19 @@ class AgentLoop:
         try:
             self.state = LoopState.INITIALIZING
 
-            # Do not route an unambiguous greeting into repository inspection.
+            # Only greetings need deterministic routing. Everything else
+            # goes directly to the main model with tools available.
             greeting = bool(re.fullmatch(
                 r"\s*(?:hi|hello|hey|hiya|good morning|good evening|"
                 r"good afternoon|thanks|thank you|ok|okay)[!.\s]*",
                 query or "", re.I,
             ))
             self.context.metadata["direct_greeting"] = greeting
-            # Avoid extra intent/planning model requests for unambiguous questions.
-            simple_question = greeting or bool(re.match(
-                r"^\s*(what is|what are|who is|why does|how does|"
-                r"define|explain|tell me about)\b", query, re.I,
-            )) and not bool(re.search(
-                r"\b(implement|modify|change|create|build|fix|run|execute|"
-                r"delete|install|update|test|deploy|launch|edit|write)\b",
-                query, re.I,
-            ))
-            if simple_question:
-                intent = "question"
-                self.context.metadata.update({
-                    "intent_needs_plan": False, "requires_action": False,
-                })
-            else:
+            if self.enable_intent_classification and not greeting:
                 intent = await self._classify_intent(query)
+            else:
+                intent = "question" if greeting else "unknown"
+                self.context.metadata["intent_needs_plan"] = False
             self.context.intent = intent
             logger.info("Classified intent: %s", intent)
 
@@ -1112,7 +1104,7 @@ class AgentLoop:
             if self.context.user_declined_demo:
                 self.context.user_asked_to_show = False
 
-            if self.enable_planning and await self._should_plan(query, intent=intent):
+            if self.enable_planning and self.preflight_planning and await self._should_plan(query, intent=intent):
                 await self._create_plan(query, context, intent=intent)
 
             if (
@@ -2369,6 +2361,8 @@ You are depression.ai, an autonomous, general-purpose AI CLI agent. Understand u
 ## INTENT & AUTONOMY
 - Understand natural language, typos, follow-ups, preferences, and conversation context. Preserve existing requirements unless changed.
 - Prioritize the user's intended outcome. Answer directly when existing knowledge is sufficient; use tools only when needed for current information, investigation, execution, or verification.
+- Distinguish answer-only, read-only inspection, and execution using the full request and conversation. "Check", "review", and "analyze" do not authorize modifications unless explicitly requested.
+- Decide whether to answer or call tools in the main response. Respect negations and mixed requests: "explain but do not change" is read-only; "explain and implement" requires action.
 - Perform requested actions rather than merely describing them. Ask only when essential information, safety, or authorization is unclear.
 - Independently choose strategies, tools, and execution order. Be creative when appropriate, precise when required, and avoid unnecessary scope expansion.
 - Plan complex tasks when useful; execute straightforward tasks directly. No rigid workflow is mandatory.
