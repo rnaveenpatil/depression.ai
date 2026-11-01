@@ -93,6 +93,23 @@ from agent.utils.logging import get_logger
 from agent.utils.redact import redact
 from agent.context.runtime import add_tool_call, add_tool_result, get_model_messages
 
+from agent.agent.loop_tool_policy import (
+    TOOL_FALLBACKS,
+    _DEMO_OFFER_PATTERNS,
+    _USER_DECLINED_PATTERNS,
+    _looks_destructive_call,
+    _mutation_target,
+    _read_target,
+    _bash_fallback_write,
+    _bash_fallback_read,
+    _bash_fallback_edit,
+    _bash_fallback_list,
+    _bash_fallback_glob,
+    _bash_fallback_grep,
+    _bash_fallback_patch,
+    _fallback_error_command,
+)
+
 logger = get_logger(__name__)
 
 
@@ -161,264 +178,6 @@ _COMPLEXITY_TOKENS = re.compile(
     re.I,
 )
 
-
-# ----------------------------------------------------------------------
-# Bash/terminal fallback transforms
-# ----------------------------------------------------------------------
-
-def _sh_single(s: str) -> str:
-    return str(s).replace("'", "'\\''")
-
-
-def _fallback_error_command(msg: str) -> Dict[str, Any]:
-    return {"command": f"echo {_sh_single('FALLBACK ERROR: ' + msg)} >&2; exit 1"}
-
-
-def _bash_fallback_write(args: Dict[str, Any]) -> Dict[str, Any]:
-    path = args.get("filePath") or args.get("path") or args.get("filename") or ""
-    content = args.get("content")
-    if content is None:
-        content = args.get("text") or args.get("data") or ""
-    if not path:
-        return _fallback_error_command(
-            "write called without filePath/path; cannot fall back to bash."
-        )
-    # Base64 avoids heredoc delimiters and shell expansion entirely.  A
-    # model-supplied line equal to the old EOF marker could otherwise escape
-    # the heredoc and run arbitrary shell commands.
-    encoded = base64.b64encode(str(content).encode("utf-8")).decode("ascii")
-    script = (
-        "import base64,pathlib,sys;"
-        "pathlib.Path(sys.argv[1]).write_bytes(base64.b64decode(sys.argv[2]))"
-    )
-    return {
-        "command": (
-            f"python3 -c '{script}' "
-            f"'{_sh_single(path)}' '{encoded}'"
-        )
-    }
-
-
-def _bash_fallback_read(args: Dict[str, Any]) -> Dict[str, Any]:
-    path = args.get("filePath") or args.get("path") or args.get("filename") or ""
-    if not path:
-        return _fallback_error_command(
-            "read called without filePath/path; cannot fall back to bash."
-        )
-    return {"command": f"cat '{_sh_single(path)}'"}
-
-
-def _bash_fallback_list(args: Dict[str, Any]) -> Dict[str, Any]:
-    path = args.get("path") or args.get("dir") or "."
-    return {"command": f"ls -la '{_sh_single(path)}'"}
-
-
-def _bash_fallback_edit(args: Dict[str, Any]) -> Dict[str, Any]:
-    path = args.get("filePath") or args.get("path") or args.get("filename") or ""
-    old_str = args.get("oldString") or args.get("old_text") or ""
-    new_str = args.get("newString") or args.get("new_text") or ""
-    if not path:
-        return _fallback_error_command(
-            "edit called without filePath/path; cannot fall back to bash."
-        )
-    if not old_str:
-        return _fallback_error_command(
-            "edit called without oldString; cannot fall back to bash."
-        )
-    old_b64 = base64.b64encode(old_str.encode("utf-8")).decode("ascii")
-    new_b64 = base64.b64encode(new_str.encode("utf-8")).decode("ascii")
-    script = (
-        "import base64,pathlib,sys;"
-        "p=pathlib.Path(sys.argv[1]);"
-        "s=p.read_text();"
-        "old=base64.b64decode(sys.argv[2]).decode();"
-        "new=base64.b64decode(sys.argv[3]).decode();"
-        "sys.exit(3) if old not in s else (p.write_text(s.replace(old,new,1)) or 0)"
-    )
-    return {
-        "command": (
-            f"python3 -c '{script}' "
-            f"'{_sh_single(path)}' '{old_b64}' '{new_b64}'"
-        )
-    }
-
-
-def _bash_fallback_glob(args: Dict[str, Any]) -> Dict[str, Any]:
-    root = args.get("path") or args.get("dir") or "."
-    pattern = args.get("pattern") or args.get("glob") or "*"
-    return {
-        "command": (
-            f"find '{_sh_single(root)}' -name '{_sh_single(pattern)}' -type f"
-        )
-    }
-
-
-def _bash_fallback_grep(args: Dict[str, Any]) -> Dict[str, Any]:
-    pattern = args.get("pattern") or args.get("query") or ""
-    root = args.get("path") or args.get("dir") or "."
-    if not pattern:
-        return _fallback_error_command(
-            "grep called without pattern; cannot fall back to bash."
-        )
-    return {
-        "command": f"grep -rn -- '{_sh_single(pattern)}' '{_sh_single(root)}'"
-    }
-
-
-def _bash_fallback_patch(args: Dict[str, Any]) -> Dict[str, Any]:
-    patch_file = (
-        args.get("patchFile") or args.get("patch_file")
-        or args.get("path") or ""
-    )
-    if not patch_file:
-        return _fallback_error_command(
-            "apply_patch called without patchFile/path; cannot fall back to bash."
-        )
-    return {"command": f"patch -p1 < '{_sh_single(patch_file)}'"}
-
-
-def _bash_fallback_filesystem(args: Dict[str, Any]) -> Dict[str, Any]:
-    path = args.get("path") or args.get("dir") or "."
-    return {"command": f"ls -la '{_sh_single(path)}'"}
-
-
-TOOL_FALLBACKS: Dict[str, List[tuple]] = {
-    "write": [("bash", _bash_fallback_write), ("terminal", _bash_fallback_write)],
-    "edit": [("bash", _bash_fallback_edit), ("terminal", _bash_fallback_edit)],
-    "apply_patch": [("bash", _bash_fallback_patch), ("terminal", _bash_fallback_patch)],
-    "read": [("bash", _bash_fallback_read), ("terminal", _bash_fallback_read)],
-    "list": [("bash", _bash_fallback_list), ("terminal", _bash_fallback_list)],
-    "glob": [("bash", _bash_fallback_glob), ("terminal", _bash_fallback_glob)],
-    "grep": [("bash", _bash_fallback_grep), ("terminal", _bash_fallback_grep)],
-    "filesystem": [
-        ("bash", _bash_fallback_filesystem),
-        ("terminal", _bash_fallback_filesystem),
-    ],
-    "patch": [("bash", _bash_fallback_patch), ("terminal", _bash_fallback_patch)],
-}
-
-
-# ----------------------------------------------------------------------
-# Destructive-call detection
-# ----------------------------------------------------------------------
-_DESTRUCTIVE_TOOL_TOKENS = (
-    "delete", "remove", "unlink", "destroy", "purge", "wipe", "erase",
-    "rmdir", "shred", "truncate", "drop",
-)
-
-_DESTRUCTIVE_ACTION_TOKENS = (
-    "delete", "remove", "reset", "clean", "drop", "prune",
-    "destroy", "purge", "wipe", "erase", "truncate",
-    "force", "overwrite", "hard", "kill", "terminate",
-)
-
-_SHELL_TOOL_TOKENS = ("bash", "terminal", "shell", "exec", "process", "proc")
-_SHELL_ARG_KEYS = frozenset({"command", "cmd", "script", "shell", "exec", "cmdline"})
-
-_DESTRUCTIVE_SHELL_PATTERNS = (
-    re.compile(r"\brm\b"),
-    re.compile(r"\brmdir\b"),
-    re.compile(r"\bunlink\b"),
-    re.compile(r"\bshred\b"),
-    re.compile(r"\btruncate\b"),
-    re.compile(r"\bdd\b.*\bof="),
-    re.compile(r"\bmkfs\b"),
-    re.compile(r">\s*/dev/sd"),
-    re.compile(r"\bgit\s+reset\s+--hard\b"),
-    re.compile(r"\bgit\s+clean\s+-[a-z]*f"),
-    re.compile(r"\bgit\s+push\s+--force\b"),
-    re.compile(r"\bkubectl\s+delete\b"),
-    re.compile(r"\baws\s+s3\s+rm\b"),
-    re.compile(r"\baws\s+s3api\s+delete"),
-    re.compile(r"\baws\s+ec2\s+terminate"),
-    re.compile(r"\baws\s+rds\s+delete"),
-    re.compile(r"\bdocker\s+rm\b"),
-    re.compile(r"\bdocker\s+rmi\b"),
-    re.compile(r"\bdocker\s+system\s+prune\b"),
-    re.compile(r"\bdocker\s+volume\s+rm\b"),
-    re.compile(r"\bfind\b.*\s-delete\b"),
-    re.compile(r"curl\b.*\|\s*(?:ba)?sh\b"),
-    re.compile(r"wget\b.*\|\s*(?:ba)?sh\b"),
-)
-
-_DEMO_OFFER_PATTERNS = (
-    re.compile(r"\bwould you like me to\b", re.I),
-    re.compile(r"\bwant me to (run|show|launch|demo|open|execute)\b", re.I),
-    re.compile(r"\bshall i (run|show|launch|demo|open|execute)\b", re.I),
-    re.compile(r"\bi can (run|show|launch|demo|open|execute)\b", re.I),
-    re.compile(r"\bready (for me )?to (run|show|launch|demo)\b", re.I),
-)
-
-_USER_DECLINED_PATTERNS = (
-    re.compile(r"\bno\b\s*,?\s*(thanks|thank you|thx)\b", re.I),
-    re.compile(r"\bdon'?t\b.*\b(run|launch|show)\b", re.I),
-    re.compile(r"\bnot?\b.*\b(run|launch|show)\b", re.I),
-    re.compile(r"\bjust\b.*\b(explain|tell me|describe)\b", re.I),
-)
-
-
-def _looks_destructive_call(name: str, args: Dict[str, Any]) -> bool:
-    name_l = (name or "").lower()
-
-    for tok in _DESTRUCTIVE_TOOL_TOKENS:
-        if tok in name_l:
-            return True
-
-    action = ""
-    if isinstance(args, dict):
-        for k in ("action", "operation", "op", "verb"):
-            v = args.get(k)
-            if isinstance(v, str) and v.strip():
-                action = v.strip().lower()
-                break
-    if not action:
-        for tok in _DESTRUCTIVE_ACTION_TOKENS:
-            if tok in name_l:
-                action = tok
-                break
-    if action:
-        for tok in _DESTRUCTIVE_ACTION_TOKENS:
-            if tok in action:
-                return True
-
-    if isinstance(args, dict):
-        is_shell_tool = any(tok in name_l for tok in _SHELL_TOOL_TOKENS)
-        for key, val in args.items():
-            if not isinstance(val, str) or not val:
-                continue
-            if not is_shell_tool and str(key).lower() not in _SHELL_ARG_KEYS:
-                continue
-            for pat in _DESTRUCTIVE_SHELL_PATTERNS:
-                if pat.search(val):
-                    return True
-
-    return False
-
-
-def _mutation_target(name: str, args: Dict[str, Any]) -> Optional[str]:
-    """Best-effort target identity for a mutating call.
-
-    Used to scope verification clearing so a read of file A does not clear
-    a pending verification for file B.
-    """
-    if not isinstance(args, dict):
-        return None
-    for key in ("path", "filePath", "file_path", "filename", "file", "target"):
-        v = args.get(key)
-        if isinstance(v, str) and v.strip():
-            return v.strip()
-    cmd = args.get("command")
-    if isinstance(cmd, str) and cmd.strip():
-        m = re.search(r">\s*([^\s|;&]+)", cmd)
-        if m:
-            return m.group(1).strip()
-        return f"cmd::{cmd.strip()[:120]}"
-    return None
-
-
-def _read_target(name: str, args: Dict[str, Any]) -> Optional[str]:
-    """Target identity for a read call, matching _mutation_target keys."""
-    return _mutation_target(name, args)
 
 
 class LoopState(Enum):
@@ -516,7 +275,9 @@ class AgentLoop:
         self.default_timeout = config.get("timeout", 3600)
         self.project_ctx_ttl = config.get("project_context_ttl", 30.0)
         self.enable_plan_driven = config.get("enable_plan_driven", True)
-        self.enable_intent_classification = config.get("enable_intent_classification", True)
+        self.enable_intent_classification = config.get("enable_intent_classification", False)
+        # The main response selects answer or tools; old preflight is optional.
+        self.preflight_planning = bool(config.get("preflight_planning", False))
         # [CHANGED] QA verification is OFF by default — batch verify covers it.
         self.enable_qa_verification = config.get("enable_qa_verification", False)
         self.reserve_output_tokens = int(config.get("reserve_output_tokens", 4000))
@@ -524,18 +285,22 @@ class AgentLoop:
             config.get("require_permission_for_destructive", True)
         )
 
-        # [CHANGED] Verification mode is now explicit.
-        mode = str(config.get("verification_mode", "batch")).lower()
+        # Verification is user-directed, never an automatic loop stage.
+        # Explicit "test/verify/check the result" requests are handled by
+        # the main model through ordinary tool calls, without forced retries.
+        mode = "off"
+        # Legacy configuration is intentionally not allowed to turn
+        # automatic verification back on in this streamlined loop.
+        # Previous default: config.get("verification_mode", "batch")
+        # mode = str(config.get("verification_mode", "batch")).lower()
         if mode not in _VERIFICATION_MODES:
             logger.warning(
                 "Unknown verification_mode=%r, falling back to 'batch'", mode
             )
             mode = "batch"
         self.verification_mode = mode
-        # Legacy flag kept for backwards compat: if someone sets
-        # require_verification=False we honor it by switching mode to "off".
-        if not bool(config.get("require_verification", True)):
-            self.verification_mode = "off"
+        # Mutation tracking, verification nudges, and batch retries are off.
+        self.verification_mode = "off"
         self.require_verification = self.verification_mode != "off"
         # Max nudges applies only to per_step mode.
         self.max_verification_nudges = int(config.get("max_verification_nudges", 1))
@@ -1080,29 +845,19 @@ class AgentLoop:
         try:
             self.state = LoopState.INITIALIZING
 
-            # Do not route an unambiguous greeting into repository inspection.
+            # Only greetings need deterministic routing. Everything else
+            # goes directly to the main model with tools available.
             greeting = bool(re.fullmatch(
                 r"\s*(?:hi|hello|hey|hiya|good morning|good evening|"
                 r"good afternoon|thanks|thank you|ok|okay)[!.\s]*",
                 query or "", re.I,
             ))
             self.context.metadata["direct_greeting"] = greeting
-            # Avoid extra intent/planning model requests for unambiguous questions.
-            simple_question = greeting or bool(re.match(
-                r"^\s*(what is|what are|who is|why does|how does|"
-                r"define|explain|tell me about)\b", query, re.I,
-            )) and not bool(re.search(
-                r"\b(implement|modify|change|create|build|fix|run|execute|"
-                r"delete|install|update|test|deploy|launch|edit|write)\b",
-                query, re.I,
-            ))
-            if simple_question:
-                intent = "question"
-                self.context.metadata.update({
-                    "intent_needs_plan": False, "requires_action": False,
-                })
-            else:
+            if self.enable_intent_classification and not greeting:
                 intent = await self._classify_intent(query)
+            else:
+                intent = "question" if greeting else "unknown"
+                self.context.metadata["intent_needs_plan"] = False
             self.context.intent = intent
             logger.info("Classified intent: %s", intent)
 
@@ -1112,7 +867,7 @@ class AgentLoop:
             if self.context.user_declined_demo:
                 self.context.user_asked_to_show = False
 
-            if self.enable_planning and await self._should_plan(query, intent=intent):
+            if self.enable_planning and self.preflight_planning and await self._should_plan(query, intent=intent):
                 await self._create_plan(query, context, intent=intent)
 
             if (
@@ -2369,6 +2124,8 @@ You are depression.ai, an autonomous, general-purpose AI CLI agent. Understand u
 ## INTENT & AUTONOMY
 - Understand natural language, typos, follow-ups, preferences, and conversation context. Preserve existing requirements unless changed.
 - Prioritize the user's intended outcome. Answer directly when existing knowledge is sufficient; use tools only when needed for current information, investigation, execution, or verification.
+- Distinguish answer-only, read-only inspection, and execution using the full request and conversation. "Check", "review", and "analyze" do not authorize modifications unless explicitly requested.
+- Decide whether to answer or call tools in the main response. Respect negations and mixed requests: "explain but do not change" is read-only; "explain and implement" requires action.
 - Perform requested actions rather than merely describing them. Ask only when essential information, safety, or authorization is unclear.
 - Independently choose strategies, tools, and execution order. Be creative when appropriate, precise when required, and avoid unnecessary scope expansion.
 - Plan complex tasks when useful; execute straightforward tasks directly. No rigid workflow is mandatory.
@@ -2390,8 +2147,8 @@ You are depression.ai, an autonomous, general-purpose AI CLI agent. Understand u
 
 ## QUALITY & VERIFICATION
 - Deliver complete, reliable, maintainable solutions.
-- Verify proportionally to task complexity and risk: direct answers need no execution checks; small edits need focused validation; bug fixes need relevant tests; complex changes may require broader checks.
-- Reuse valid verification evidence. Repeat checks only when changes or failures justify them.
+- Do not automatically run tests, builds, linting, read-back checks, or a separate verification phase after edits. Run verification only when the user explicitly requests it (including clear equivalents such as "test it" or "make sure it works").
+- When verification is requested, choose focused checks as ordinary tools, avoid redundant tests, and truthfully report their results.
 - For UI tasks, validate visible behavior only when user ask for it.
 - Never claim success without evidence. Clearly report incomplete, failed, or unverified work.
 - never spend too much time on only verification try to get work done quickly.
@@ -2411,7 +2168,7 @@ You are depression.ai, an autonomous, general-purpose AI CLI agent. Understand u
 - explain what you done in simple and short way
 
 ## CORE PRINCIPLE
-Understand → Decide → Act → Observe → Adapt → Verify when needed → Stop.
+Understand → Decide → Act when requested → Observe → Stop. Verify only when the user asks.
 
 Maximize successful outcomes, not tool calls. Preserve independent reasoning, creativity, and autonomy within security boundaries.
 """

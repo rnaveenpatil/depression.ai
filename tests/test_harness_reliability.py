@@ -10,6 +10,16 @@ from agent.agent.loop import AgentLoop
 from agent.mcp.client import MCPClient, MCPServerConfig, MCPState, MCPTransportBase, MCPTransport
 
 
+def test_extracted_policy_preserves_loop_symbols_and_safety():
+    from agent.agent import loop
+    from agent.agent.loop_tool_policy import TOOL_FALLBACKS, _looks_destructive_call
+
+    assert loop.TOOL_FALLBACKS is TOOL_FALLBACKS
+    assert "bash" in [name for name, _ in TOOL_FALLBACKS["read"]]
+    assert _looks_destructive_call("terminal", {"command": "rm -rf example"})
+    assert not _looks_destructive_call("read", {"path": "example.txt"})
+
+
 @pytest.mark.asyncio
 async def test_tool_order_does_not_move_reads_ahead_of_writes():
     loop = AgentLoop(
@@ -158,8 +168,75 @@ async def test_simple_question_does_not_call_intent_classifier(monkeypatch):
     monkeypatch.setattr(loop, "_classify_intent", fail_classifier)
     monkeypatch.setattr(loop, "_run_free_form", fake_run)
     assert (await loop.run("What is Python?"))["success"]
-    assert loop.context.intent == "question"
+    assert loop.context.intent == "unknown"
     assert loop.context.metadata["intent_needs_plan"] is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("request", [
+    "Why does Python use indentation?",
+    "Check whether the TUI is fixed, but do not modify files.",
+    "Explain how to fix the TUI, but make no changes.",
+    "Explain the issue and implement the fix.",
+    "Fix the TUI freeze and verify the changes.",
+])
+async def test_single_pass_routes_requests_without_preflight(request, monkeypatch):
+    loop = AgentLoop(
+        agent=SimpleNamespace(), llm=SimpleNamespace(),
+        tool_registry=SimpleNamespace(), planner=None,
+        config={"enable_planning": True},
+    )
+    async def unexpected(*args, **kwargs):
+        raise AssertionError("preflight LLM classifier/planner must not run")
+    async def fake_run(query):
+        return {"success": True, "response": "model decides"}
+    monkeypatch.setattr(loop, "_classify_intent", unexpected)
+    monkeypatch.setattr(loop, "_should_plan", unexpected)
+    monkeypatch.setattr(loop, "_run_free_form", fake_run)
+    result = await loop.run(request)
+    assert result["success"] is True
+    assert loop.context.intent == "unknown"
+    assert loop.context.metadata["intent_needs_plan"] is False
+
+
+@pytest.mark.parametrize("config", [
+    {},
+    {"verification_mode": "batch", "require_verification": True},
+    {"verification_mode": "per_step", "require_verification": True},
+])
+def test_automatic_verification_is_disabled(config):
+    loop = AgentLoop(
+        agent=SimpleNamespace(), llm=SimpleNamespace(),
+        tool_registry=SimpleNamespace(), planner=None,
+        config=config,
+    )
+    assert loop.verification_mode == "off"
+    assert loop.require_verification is False
+    assert loop.verification.enabled is False
+
+
+@pytest.mark.asyncio
+async def test_legacy_preflight_is_explicit_opt_in(monkeypatch):
+    loop = AgentLoop(
+        agent=SimpleNamespace(), llm=SimpleNamespace(),
+        tool_registry=SimpleNamespace(), planner=None,
+        config={"enable_intent_classification": True, "enable_planning": True,
+                "preflight_planning": True},
+    )
+    called = []
+    async def classify(query):
+        called.append("classify")
+        return "question"
+    async def should_plan(query, intent="unknown"):
+        called.append("plan")
+        return False
+    async def fake_run(query):
+        return {"success": True, "response": "answered"}
+    monkeypatch.setattr(loop, "_classify_intent", classify)
+    monkeypatch.setattr(loop, "_should_plan", should_plan)
+    monkeypatch.setattr(loop, "_run_free_form", fake_run)
+    await loop.run("Explain why shell commands freeze the TUI")
+    assert called == ["classify", "plan"]
 
 
 @pytest.mark.asyncio
