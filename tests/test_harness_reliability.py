@@ -163,6 +163,57 @@ async def test_simple_question_does_not_call_intent_classifier(monkeypatch):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("request", [
+    "Why does Python use indentation?",
+    "Check whether the TUI is fixed, but do not modify files.",
+    "Explain how to fix the TUI, but make no changes.",
+    "Explain the issue and implement the fix.",
+    "Fix the TUI freeze and verify the changes.",
+])
+async def test_single_pass_routes_requests_without_preflight(request, monkeypatch):
+    loop = AgentLoop(
+        agent=SimpleNamespace(), llm=SimpleNamespace(),
+        tool_registry=SimpleNamespace(), planner=None,
+        config={"enable_planning": True},
+    )
+    async def unexpected(*args, **kwargs):
+        raise AssertionError("preflight LLM classifier/planner must not run")
+    async def fake_run(query):
+        return {"success": True, "response": "model decides"}
+    monkeypatch.setattr(loop, "_classify_intent", unexpected)
+    monkeypatch.setattr(loop, "_should_plan", unexpected)
+    monkeypatch.setattr(loop, "_run_free_form", fake_run)
+    result = await loop.run(request)
+    assert result["success"] is True
+    assert loop.context.intent == "unknown"
+    assert loop.context.metadata["intent_needs_plan"] is False
+
+
+@pytest.mark.asyncio
+async def test_legacy_preflight_is_explicit_opt_in(monkeypatch):
+    loop = AgentLoop(
+        agent=SimpleNamespace(), llm=SimpleNamespace(),
+        tool_registry=SimpleNamespace(), planner=None,
+        config={"enable_intent_classification": True, "enable_planning": True,
+                "preflight_planning": True},
+    )
+    called = []
+    async def classify(query):
+        called.append("classify")
+        return "question"
+    async def should_plan(query, intent="unknown"):
+        called.append("plan")
+        return False
+    async def fake_run(query):
+        return {"success": True, "response": "answered"}
+    monkeypatch.setattr(loop, "_classify_intent", classify)
+    monkeypatch.setattr(loop, "_should_plan", should_plan)
+    monkeypatch.setattr(loop, "_run_free_form", fake_run)
+    await loop.run("Explain why shell commands freeze the TUI")
+    assert called == ["classify", "plan"]
+
+
+@pytest.mark.asyncio
 async def test_coordinator_avoids_nested_build_planning():
     from agent.agent.dual_agent import AgentCoordinator
 
