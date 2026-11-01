@@ -45,6 +45,7 @@ from agent.llm.runtime import (
 from agent.utils.env_manager import (
     get_aws_credentials,
 )
+from agent.utils.shell import is_long_running, run_command
 
 from agent.tui.events import AgentEvent, EventBridge
 from agent.tui.theme import (
@@ -818,7 +819,7 @@ class AgentCommandProvider(Provider):
         ("/context", "Open context usage"),
         ("/llmcost", "Open token and API cost"),
         ("/todo", "Open the todo list"),
-        ("/run", "Run a shell command"),
+        ("/run", "Run a shell command (streams until /stop if long-running)"),
         ("/shot", "Open an image with the OS viewer"),
         ("/plan", "Switch to plan mode"),
         ("/build", "Switch to build mode"),
@@ -1723,7 +1724,7 @@ class HelpPanel(Vertical):
         yield Static("/export    export the transcript as Markdown", classes="help-row")
         yield Static("/search    search the transcript", classes="help-row")
         yield Static("/doctor    run local diagnostics", classes="help-row")
-        yield Static("/run CMD   run a shell command and show output", classes="help-row")
+        yield Static("/run CMD   run a shell command (long-running output streams; /stop ends it)", classes="help-row")
         yield Static("/shot PATH open a screenshot with the OS viewer", classes="help-row")
         yield Static("/plan      switch mode → plan", classes="help-row")
         yield Static("/build     switch mode → build", classes="help-row")
@@ -2094,6 +2095,7 @@ class DepressionApp(App):
         self.busy = False
         self._active_panel = "llm"
         self._agent_worker = None
+        self._user_shell_worker = None
         self._prompt_queue: list[str] = []
         self._draining = False
         self._is_shutting_down = False
@@ -4237,47 +4239,58 @@ class DepressionApp(App):
             self._error("usage: /run <command>")
             return
         self._system(f"$ {cmd}")
-        self._run_shell_async(cmd)
+        self._user_shell_worker = self._run_shell_async(cmd)
 
     @work(exclusive=True, group="user-shell")
     async def _run_shell_async(self, cmd: str) -> None:
-        """Keep /run off the Textual event loop; reap children on cancellation."""
-        proc = None
-        try:
-            proc = await asyncio.create_subprocess_shell(
-                cmd, stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
+        """Stream /run output without letting the child own the TUI terminal."""
+        long_running = is_long_running(cmd)
+        if long_running:
+            self._system(
+                f"long-running command ({long_running}); use /stop to terminate"
             )
-            try:
-                out, err = await asyncio.wait_for(proc.communicate(), timeout=30)
-            except asyncio.TimeoutError:
-                self._error("run timed out after 30 seconds")
-                return
-            for line in out.decode(errors="replace").splitlines():
-                self._write(f"  {line}", "agent")
-            for line in err.decode(errors="replace").splitlines():
-                self._write(f"  {line}", "error")
-            self._system(f"exit {proc.returncode}")
+
+        def on_output(stream: str, line: str) -> None:
+            self._write(
+                f"  {line}", "error" if stream == "stderr" else "agent"
+            )
+
+        try:
+            result = await run_command(
+                cmd,
+                timeout=None if long_running else 30.0,
+                on_output=on_output,
+            )
         except asyncio.CancelledError:
+            self._system("run stopped")
             raise
         except Exception as exc:
             self._error(f"run failed: {exc}")
-        finally:
-            if proc is not None:
-                if proc.returncode is None:
-                    try:
-                        proc.kill()
-                    except ProcessLookupError:
-                        pass
-                try:
-                    await asyncio.wait_for(proc.communicate(), timeout=2)
-                except Exception:
-                    pass
+            return
+
+        if result.timed_out:
+            self._error("run timed out after 30 seconds")
+            return
+        if result.truncated:
+            self._system("output truncated")
+        self._system(f"exit {result.exit_code}")
 
     def _request_agent_stop(self) -> None:
         """Ask the running loop to stop gracefully and summarize its work."""
-        if not (self.busy or self._draining):
+        shell_worker = self._user_shell_worker
+        shell_running = (
+            shell_worker is not None
+            and getattr(shell_worker, "is_running", False)
+        )
+        agent_running = self.busy or self._draining
+        if not agent_running and not shell_running:
             self._system("nothing is running")
+            return
+        if shell_running:
+            shell_worker.cancel()
+            self._user_shell_worker = None
+            self._system("shell command stopped")
+        if not agent_running:
             return
         self._prompt_queue.clear()
         self.queue_depth = 0
@@ -4698,8 +4711,16 @@ class DepressionApp(App):
             return
         worker = self._agent_worker
         running = worker is not None and getattr(worker, "is_running", False)
-        if not self.busy and not running:
+        shell_worker = self._user_shell_worker
+        shell_running = (
+            shell_worker is not None
+            and getattr(shell_worker, "is_running", False)
+        )
+        if not self.busy and not running and not shell_running:
             return
+        if shell_running:
+            shell_worker.cancel()
+            self._user_shell_worker = None
         if running:
             worker.cancel()
         if self._prompt_queue:

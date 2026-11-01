@@ -27,7 +27,6 @@ from __future__ import annotations
 
 import asyncio
 import os
-import signal
 import time
 import uuid
 from collections import deque
@@ -36,8 +35,9 @@ from pathlib import Path
 from typing import Any, Deque, Dict, List, Optional
 
 from agent.tools.registry import BaseTool
-from agent.utils.logging import get_logger
 from agent.utils.env_manager import EnvManager
+from agent.utils.logging import get_logger
+from agent.utils.shell import SIGKILL, SIGTERM, signal_process_group
 
 logger = get_logger(__name__)
 
@@ -115,10 +115,7 @@ class ManagedProcess:
         if self.proc is None:
             return
         if self.proc.returncode is None:
-            try:
-                self.proc.kill()
-            except Exception:
-                pass
+            signal_process_group(self.proc, SIGKILL)
 
 
 class ProcessTool(BaseTool):
@@ -232,6 +229,7 @@ class ProcessTool(BaseTool):
         try:
             proc = await asyncio.create_subprocess_shell(
                 command,
+                stdin=asyncio.subprocess.DEVNULL,
                 cwd=cwd,
                 env=env,
                 stdout=asyncio.subprocess.PIPE,
@@ -372,21 +370,15 @@ class ProcessTool(BaseTool):
             }
 
         if mp.running:
-            try:
-                if force:
-                    mp.proc.kill()
-                else:
-                    mp.proc.terminate()
-            except ProcessLookupError:
-                pass
-            except Exception as e:
-                logger.debug("stop signal failed: %s", e)
+            signal_process_group(
+                mp.proc, SIGKILL if force else SIGTERM
+            )
 
             try:
                 await asyncio.wait_for(mp.proc.wait(), timeout=_TERMINATE_GRACE_SECONDS)
             except asyncio.TimeoutError:
+                signal_process_group(mp.proc, SIGKILL)
                 try:
-                    mp.proc.kill()
                     await asyncio.wait_for(mp.proc.wait(), timeout=2)
                 except Exception:
                     pass
@@ -538,11 +530,8 @@ class ProcessTool(BaseTool):
         finally:
             # Whatever happened, ensure no transport survives us.
             for mp in list(self.processes.values()):
-                try:
-                    if mp.running:
-                        mp.proc.kill()
-                except Exception:
-                    pass
+                if mp.running:
+                    signal_process_group(mp.proc, SIGKILL)
                 mp.cancel_tasks()
             self.processes.clear()
 
