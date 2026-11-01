@@ -540,8 +540,8 @@ class AgentLoop:
         # Batch mode confirms edited files once, without running test cycles.
         # Max nudges applies only to per_step mode.
         self.max_verification_nudges = int(config.get("max_verification_nudges", 1))
-        # Bounded whole-batch verify -> targeted repair -> reverify.
-        self.max_batch_verify_attempts = max(1, min(4, int(config.get("max_batch_verify_attempts", 3))))
+        # Lightweight batch by default; one extra round for targeted repair.
+        self.max_batch_verify_attempts = max(1, min(3, int(config.get("max_batch_verify_attempts", 2))))
         self.require_demo_offer = bool(config.get("require_demo_offer", True))
         self.retry_tool_timeout = bool(config.get("retry_tool_timeout", False))
         self.enable_parallel_reads = bool(config.get("enable_parallel_reads", True))
@@ -1696,13 +1696,15 @@ class AgentLoop:
             f"Final batch verification, round {attempt}/{total}.\n"
             "Confirm ALL changes together, including modified file contents AND "
             "outcomes of commands that were executed. Inspect exit codes, errors "
-            "and relevant output. Run one focused final test/check appropriate "
-            "to the user's task when code was modified; do not run unrelated suites.\n"
+            "and relevant output. By default, verify by reading modified files "
+            "and reviewing existing command results; do not launch tests, builds "
+            "or linting unless explicitly requested. When full verification is "
+            "requested, run the relevant tests and checks.\n"
             "Pending targets:\n" + "\n".join(f"  - {t}" for t in targets) +
             "\nIf a check fails, diagnose and fix ONLY the failing part, then "
             "recheck the affected result and any dependencies it impacts. "
             "Never repeat a failed command unchanged without a reason. "
-            "After fixes, check the whole batch for regressions. "
+            "After fixes, recheck only affected files and command outcomes. "
             + ("Further bounded repair rounds are available. "
                if attempt < total else
                "This is the last round. Do not start another repair cycle. ")
