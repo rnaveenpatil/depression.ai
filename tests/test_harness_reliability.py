@@ -10,6 +10,16 @@ from agent.agent.loop import AgentLoop
 from agent.mcp.client import MCPClient, MCPServerConfig, MCPState, MCPTransportBase, MCPTransport
 
 
+def test_extracted_policy_preserves_loop_symbols_and_safety():
+    from agent.agent import loop
+    from agent.agent.loop_tool_policy import TOOL_FALLBACKS, _looks_destructive_call
+
+    assert loop.TOOL_FALLBACKS is TOOL_FALLBACKS
+    assert "bash" in [name for name, _ in TOOL_FALLBACKS["read"]]
+    assert _looks_destructive_call("terminal", {"command": "rm -rf example"})
+    assert not _looks_destructive_call("read", {"path": "example.txt"})
+
+
 @pytest.mark.asyncio
 async def test_tool_order_does_not_move_reads_ahead_of_writes():
     loop = AgentLoop(
