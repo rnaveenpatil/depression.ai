@@ -526,18 +526,22 @@ class AgentLoop:
             config.get("require_permission_for_destructive", True)
         )
 
-        # [CHANGED] Verification mode is now explicit.
-        mode = str(config.get("verification_mode", "batch")).lower()
+        # Verification is user-directed, never an automatic loop stage.
+        # Explicit "test/verify/check the result" requests are handled by
+        # the main model through ordinary tool calls, without forced retries.
+        mode = "off"
+        # Legacy configuration is intentionally not allowed to turn
+        # automatic verification back on in this streamlined loop.
+        # Previous default: config.get("verification_mode", "batch")
+        # mode = str(config.get("verification_mode", "batch")).lower()
         if mode not in _VERIFICATION_MODES:
             logger.warning(
                 "Unknown verification_mode=%r, falling back to 'batch'", mode
             )
             mode = "batch"
         self.verification_mode = mode
-        # Legacy flag kept for backwards compat: if someone sets
-        # require_verification=False we honor it by switching mode to "off".
-        if not bool(config.get("require_verification", True)):
-            self.verification_mode = "off"
+        # Mutation tracking, verification nudges, and batch retries are off.
+        self.verification_mode = "off"
         self.require_verification = self.verification_mode != "off"
         # Max nudges applies only to per_step mode.
         self.max_verification_nudges = int(config.get("max_verification_nudges", 1))
@@ -2384,8 +2388,8 @@ You are depression.ai, an autonomous, general-purpose AI CLI agent. Understand u
 
 ## QUALITY & VERIFICATION
 - Deliver complete, reliable, maintainable solutions.
-- Verify proportionally to task complexity and risk: direct answers need no execution checks; small edits need focused validation; bug fixes need relevant tests; complex changes may require broader checks.
-- Reuse valid verification evidence. Repeat checks only when changes or failures justify them.
+- Do not automatically run tests, builds, linting, read-back checks, or a separate verification phase after edits. Run verification only when the user explicitly requests it (including clear equivalents such as "test it" or "make sure it works").
+- When verification is requested, choose focused checks as ordinary tools, avoid redundant tests, and truthfully report their results.
 - For UI tasks, validate visible behavior only when user ask for it.
 - Never claim success without evidence. Clearly report incomplete, failed, or unverified work.
 - never spend too much time on only verification try to get work done quickly.
@@ -2405,7 +2409,7 @@ You are depression.ai, an autonomous, general-purpose AI CLI agent. Understand u
 - explain what you done in simple and short way
 
 ## CORE PRINCIPLE
-Understand → Decide → Act → Observe → Adapt → Verify when needed → Stop.
+Understand → Decide → Act when requested → Observe → Stop. Verify only when the user asks.
 
 Maximize successful outcomes, not tool calls. Preserve independent reasoning, creativity, and autonomy within security boundaries.
 """
