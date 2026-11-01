@@ -189,6 +189,22 @@ async def test_single_pass_routes_requests_without_preflight(request, monkeypatc
     assert loop.context.metadata["intent_needs_plan"] is False
 
 
+@pytest.mark.parametrize("config", [
+    {},
+    {"verification_mode": "batch", "require_verification": True},
+    {"verification_mode": "per_step", "require_verification": True},
+])
+def test_automatic_verification_is_disabled(config):
+    loop = AgentLoop(
+        agent=SimpleNamespace(), llm=SimpleNamespace(),
+        tool_registry=SimpleNamespace(), planner=None,
+        config=config,
+    )
+    assert loop.verification_mode == "off"
+    assert loop.require_verification is False
+    assert loop.verification.enabled is False
+
+
 @pytest.mark.asyncio
 async def test_legacy_preflight_is_explicit_opt_in(monkeypatch):
     loop = AgentLoop(
