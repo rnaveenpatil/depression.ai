@@ -972,7 +972,7 @@ class ContextPanel(Vertical):
 
     def on_mount(self) -> None:
         self.refresh_values()
-        self.set_interval(1.0, self.refresh_values)
+        self.set_interval(1.5, self.refresh_values)
 
     def _live_ctx(self) -> Any:
         # [Token-count fix] Same probe as LLMCostPanel so we see live tokens
@@ -1013,20 +1013,22 @@ class ContextPanel(Vertical):
                 except Exception:
                     pass
             window = max(1, self._app.context_window)
-            pct = min(100.0, ((active if active is not None else used) / window) * 100.0)
+            # Usage across all calls is not context occupancy. When active
+            # context is unavailable, show unknown instead of a fake 100%.
+            pct = min(100.0, (active / window) * 100.0) if active is not None else 0.0
             bar_w = 30
             filled = int(bar_w * pct / 100.0)
             bar = "█" * filled + "░" * (bar_w - filled)
             color = GREEN if pct < 60 else AMBER if pct < 85 else ERROR
             self.query_one("#ctx-bar", Static).update(f"[{color}]{bar}[/]")
             self.query_one("#ctx-tokens", Static).update(
-                f"[{MUTED}]context[/] [{TEXT}]{(active if active is not None else used):,} / {window:,} "
-                f"([{color}]{pct:.1f}%[/])  total used: {used:,}[/]")
+                f"[{MUTED}]context[/] [{TEXT}]{f'{active:,}' if active is not None else '—'} / {window:,} "
+                f"([{color}]{f'{pct:.1f}%' if active is not None else 'unknown'}[/])  total used: {used:,}[/]")
 
             cost = 0.0
             if live is not None:
                 cost = float(_get(live, "cost", default=0.0) or 0.0)
-            if not cost:
+            if live is None:
                 cost = float(self._app.cost or 0.0)
             self.query_one("#ctx-cost", Static).update(
                 f"[{MUTED}]cost[/]    [{TEXT}]${cost:.4f}[/]")
@@ -1386,7 +1388,7 @@ def _query_usage(coordinator: Any, query_start_ts: float) -> Dict[str, Any]:
         return total
 
     if not query_start_ts:
-        return _usage_snapshot(_probe_loop_context(coordinator))
+        return total
 
     found = False
     for agent in _usage_agents(coordinator):
@@ -1395,7 +1397,7 @@ def _query_usage(coordinator: Any, query_start_ts: float) -> Dict[str, Any]:
         if ctx is None:
             continue
         start = _usage_float(ctx, "start_time")
-        if start and start < query_start_ts - 0.001:
+        if not start or start < query_start_ts - 0.001:
             continue
         _usage_add(total, _usage_snapshot(ctx))
         found = True
@@ -1403,7 +1405,7 @@ def _query_usage(coordinator: Any, query_start_ts: float) -> Dict[str, Any]:
     if not found:
         ctx = _probe_loop_context(coordinator)
         start = _usage_float(ctx, "start_time")
-        if ctx is not None and (not start or start >= query_start_ts - 0.001):
+        if ctx is not None and start and start >= query_start_ts - 0.001:
             _usage_add(total, _usage_snapshot(ctx))
     return total
 
@@ -1433,7 +1435,7 @@ def _session_usage(coordinator: Any, now: Optional[float] = None) -> Dict[str, A
         if ctx is None:
             continue
         start = _usage_float(ctx, "start_time")
-        if start and start < query_started - 0.001:
+        if not start or start < query_started - 0.001:
             continue
         _usage_add(total, _usage_snapshot(ctx, now=current))
     return total
@@ -1502,7 +1504,7 @@ class LLMCostPanel(Vertical):
 
     def on_mount(self) -> None:
         self.refresh_values()
-        self.set_interval(1.0, self.refresh_values)
+        self.set_interval(1.5, self.refresh_values)
 
     def _coordinator_status(self) -> dict:
         try:
