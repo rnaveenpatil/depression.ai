@@ -1696,8 +1696,10 @@ class AgentLoop:
             f"Final batch verification, round {attempt}/{total}.\n"
             "Confirm ALL changes together, including modified file contents AND "
             "outcomes of commands that were executed. Inspect exit codes, errors "
-            "and relevant output. For lightweight verification, avoid launching extra tests, builds, or lint commands unless explicitly requested; use already available outcomes and read-back. When the user requests full verification, run the appropriate comprehensive checks. Previously: "
-            "to the user's task when code was modified; do not run unrelated suites.\n"
+            "and relevant output. By default, verify by reading modified files "
+            "and reviewing existing command results; do not launch tests, builds "
+            "or linting unless explicitly requested. When full verification is "
+            "requested, run the relevant tests and checks.\n"
             "Pending targets:\n" + "\n".join(f"  - {t}" for t in targets) +
             "\nIf a check fails, diagnose and fix ONLY the failing part, then "
             "recheck the affected result and any dependencies it impacts. "
