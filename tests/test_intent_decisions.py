@@ -89,23 +89,23 @@ def test_plan_priority_comes_from_explicit_annotation_only():
 
 
 @pytest.mark.asyncio
-async def test_batch_confirmation_is_file_only_and_single_pass():
+async def test_batch_verification_checks_files_commands_and_bounds_retries():
     loop = make_loop([])
     loop.verification_mode = "batch"
-    loop.max_batch_verify_attempts = 1
+    loop.max_batch_verify_attempts = 3
     loop.context.unverified_mutations = [
         {"tool": "edit", "target": "src/main.py", "call_id": "1"},
-        {"tool": "write", "target": "src/helper.py", "call_id": "2"},
+        {"tool": "bash", "target": "cmd::pytest -q", "call_id": "2"},
     ]
     messages = []
     async def capture(message):
         messages.append(message)
     loop.agent.context_manager = SimpleNamespace(add_system_message=capture)
-    loop.verification = loop._build_verification_controller()
     await loop._inject_batch_verification_guidance()
     assert len(messages) == 1
     guidance = messages[0].lower()
-    assert "src/main.py" in guidance and "src/helper.py" in guidance
-    assert "do not run tests" in guidance
-    assert "one-pass file confirmation" in guidance
-    assert loop.context.batch_verify_attempts == 1
+    assert "src/main.py" in guidance
+    assert "cmd::pytest -q" in guidance
+    assert "command" in guidance and "exit codes" in guidance
+    assert "fix only" in guidance
+    assert "round 1/3" in guidance
