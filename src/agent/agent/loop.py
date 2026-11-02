@@ -516,7 +516,7 @@ class AgentLoop:
         self.default_timeout = config.get("timeout", 3600)
         self.project_ctx_ttl = config.get("project_context_ttl", 30.0)
         self.enable_plan_driven = config.get("enable_plan_driven", True)
-        self.enable_intent_classification = config.get("enable_intent_classification", True)
+        self.enable_intent_classification = False  # Legacy preflight disabled
         # [CHANGED] QA verification is OFF by default — batch verify covers it.
         self.enable_qa_verification = config.get("enable_qa_verification", False)
         self.reserve_output_tokens = int(config.get("reserve_output_tokens", 4000))
@@ -1087,23 +1087,14 @@ class AgentLoop:
             ))
             self.context.metadata["direct_greeting"] = greeting
             # Avoid extra intent/planning model requests for unambiguous questions.
-            simple_question = greeting or bool(re.match(
-                r"^\s*(what is|what are|who is|why does|how does|"
-                r"define|explain|tell me about)\b", query, re.I,
-            )) and not bool(re.search(
-                r"\b(implement|modify|change|create|build|fix|run|execute|"
-                r"delete|install|update|test|deploy|launch|edit|write)\b",
-                query, re.I,
-            ))
-            if simple_question:
-                intent = "question"
-                self.context.metadata.update({
-                    "intent_needs_plan": False, "requires_action": False,
-                })
-            else:
-                intent = await self._classify_intent(query)
+            # Let the main model determine whether to answer or use tools.
+            # No separate intent-classification or planning-decision API calls.
+            intent = "unknown"
             self.context.intent = intent
-            logger.info("Classified intent: %s", intent)
+            self.context.metadata.update({
+                "intent_needs_plan": False,
+                "requires_action": False,
+            })
 
             self.context.user_declined_demo = any(
                 p.search(query) for p in _USER_DECLINED_PATTERNS
@@ -1111,8 +1102,6 @@ class AgentLoop:
             if self.context.user_declined_demo:
                 self.context.user_asked_to_show = False
 
-            if self.enable_planning and await self._should_plan(query, intent=intent):
-                await self._create_plan(query, context, intent=intent)
 
             if (
                 self.enable_plan_driven
