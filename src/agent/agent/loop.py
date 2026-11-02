@@ -511,7 +511,7 @@ class AgentLoop:
         self.max_iterations = self._configured_max_iterations
         self.max_tool_calls_per_iteration = config.get("max_tool_calls", 5)
         self.max_history_length = config.get("max_history_length", 40)
-        self.enable_planning = config.get("enable_planning", True)
+        self.enable_planning = False  # Main model decides directly
         self.enable_caching = config.get("enable_caching", True)
         self.default_timeout = config.get("timeout", 3600)
         self.project_ctx_ttl = config.get("project_context_ttl", 30.0)
@@ -531,14 +531,14 @@ class AgentLoop:
                 "Unknown verification_mode=%r, falling back to 'batch'", mode
             )
             mode = "batch"
-        self.verification_mode = mode
+        # Per-step verification was explicitly removed: batch or off only.
+        self.verification_mode = "off" if mode == "off" else "batch"
         # Legacy flag kept for backwards compat: if someone sets
         # require_verification=False we honor it by switching mode to "off".
         if not bool(config.get("require_verification", True)):
             self.verification_mode = "off"
         self.require_verification = self.verification_mode != "off"
-        # Batch mode confirms edited files once, without running test cycles.
-        # Max nudges applies only to per_step mode.
+        # Retained for legacy settings compatibility; never triggers per-step checks.
         self.max_verification_nudges = int(config.get("max_verification_nudges", 1))
         # Lightweight batch by default; one extra round for targeted repair.
         self.max_batch_verify_attempts = max(1, min(3, int(config.get("max_batch_verify_attempts", 2))))
@@ -1349,24 +1349,6 @@ class AgentLoop:
                         "Follow tool permissions and restrictions."
                     )
 
-                # [CHANGED] per_step verification: if mode is per_step and
-                # there are pending mutations, nudge immediately (old behavior).
-                if (
-                    self.verification_mode == "per_step"
-                    and self.context.unverified_mutations
-                    and self.context.verification_nudges < self.max_verification_nudges
-                    and self.context.iteration < self.max_iterations
-                ):
-                    self.context.verification_nudges += 1
-                    logger.info(
-                        "per_step verify: %d mutation(s) pending (nudge %d/%d)",
-                        len(self.context.unverified_mutations),
-                        self.context.verification_nudges,
-                        self.max_verification_nudges,
-                    )
-                    await self._inject_verification_guidance()
-                    continue
-
                 # Always let the model interpret read results and decide
                 # whether further work is needed. A read is not completion.
                 continue
@@ -1408,12 +1390,6 @@ class AgentLoop:
                 response_text = await self._ensure_demo_offer(response_text)
                 return self._result(True, response_text)
 
-            # A single file write/edit is cheap to verify directly. Read it
-            # back now instead of spending an extra LLM turn on the simple
-            # case; complex or multi-file changes still use the batch loop.
-            if self.verification_mode != "batch" and not self._declared_unverified(response_text):
-                await self._auto_verify_single_file_change()
-
             # [CHANGED] In batch mode, before accepting the final answer,
             # inject a verification turn. Up to max_batch_verify_attempts
             # fix->verify rounds are allowed.
@@ -1421,28 +1397,6 @@ class AgentLoop:
                 self.state = LoopState.VERIFYING
                 await self._trigger_event("on_phase", {"phase": "verifying"})
                 await self._inject_batch_verification_guidance()
-                continue
-
-            # [CHANGED] per_step mode keeps the old nudge gate; batch mode
-            # never reaches here with pending mutations because the batch
-            # turn above consumes them.
-            if (
-                self.verification_mode == "per_step"
-                and self.require_verification
-                and self.context.unverified_mutations
-                and self.context.verification_nudges < self.max_verification_nudges
-                and self.context.iteration < self.max_iterations
-                and not self._declared_unverified(response_text)
-            ):
-                self.context.verification_nudges += 1
-                logger.info(
-                    "Refusing final answer: %d unverified mutation(s) "
-                    "(nudge %d/%d)",
-                    len(self.context.unverified_mutations),
-                    self.context.verification_nudges,
-                    self.max_verification_nudges,
-                )
-                await self._inject_verification_guidance()
                 continue
 
             if self.context.unverified_mutations:
@@ -1565,51 +1519,6 @@ class AgentLoop:
                 return candidate
         return None
 
-    async def _auto_verify_single_file_change(self) -> None:
-        """Read back one simple file mutation without asking the LLM again.
-
-        Batch verification is still used for multi-target or shell changes.
-        This only handles the common "I wrote one file" case, where a direct
-        read is enough evidence and an extra model turn is pure overhead.
-        """
-        if self.verification_mode != "batch":
-            return
-        pending = self._pending_verification_entries()
-        if not pending:
-            return
-        targets = {str(m.get("target") or "") for m in pending}
-        if len(targets) != 1:
-            return
-        target = next(iter(targets))
-        if not target:
-            return
-        simple_tools = {"write", "edit", "apply_patch", "patch"}
-        if any(
-            str(m.get("tool") or "").lower() not in simple_tools
-            for m in pending
-        ):
-            return
-        read_tool = self._find_read_tool_name()
-        if read_tool is None:
-            return
-        try:
-            result = await self._registry_execute(
-                read_tool, {"filePath": target}
-            )
-        except Exception as exc:
-            logger.debug("Auto-verification read failed for %s: %s", target, exc)
-            return
-        if not isinstance(result, dict):
-            result = {"success": True, "result": result}
-        if not result.get("success", False):
-            return
-        self._clear_unverified_mutations(read_tool, {"filePath": target})
-        self.context.metadata.setdefault(
-            "auto_verified_targets", []
-        ).append(target)
-        logger.info("Auto-verified simple file change: %s", target)
-
-    # [STOP-2] Did any tool call in this iteration produce real progress?
     def _made_progress(self, results: List[Dict[str, Any]]) -> bool:
         """Count actual state-changing work, not arbitrary successful reads.
 
