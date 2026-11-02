@@ -1742,7 +1742,7 @@ class HelpPanel(Vertical):
         yield Static("Up / Down  browse prompt history", classes="help-row")
         yield Static("Ctrl+R     search prompt history", classes="help-row")
         yield Static("Ctrl+P     command palette", classes="help-row")
-        yield Static("Ctrl+Space complete @file references", classes="help-row")
+        yield Static("Ctrl+Space / F3  open file picker and insert @file reference", classes="help-row")
         yield Static("Ctrl+F     search the transcript", classes="help-row")
         yield Static("F2         pause / resume transcript auto-scroll", classes="help-row")
         yield Static("Tab        focus prompt / cycle mode", classes="help-row")
