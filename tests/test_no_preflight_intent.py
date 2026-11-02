@@ -17,3 +17,11 @@ def test_progress_guidance_and_batch_verification_remain():
     assert 'make the targeted change now instead of browsing more' in source
     assert 'if self._should_batch_verify(response_text):' in source
     assert 'self._root_cause_gate(name, args)' in source
+
+
+def test_instant_verification_is_removed_from_execution_path():
+    source = Path("src/agent/agent/loop.py").read_text(encoding="utf-8")
+    assert "_auto_verify_single_file_change" not in source
+    assert 'self.verification_mode == "per_step"' not in source
+    assert 'self.enable_planning = False' in source
+    assert 'if self._should_batch_verify(response_text):' in source
