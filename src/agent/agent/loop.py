@@ -511,12 +511,12 @@ class AgentLoop:
         self.max_iterations = self._configured_max_iterations
         self.max_tool_calls_per_iteration = config.get("max_tool_calls", 5)
         self.max_history_length = config.get("max_history_length", 40)
-        self.enable_planning = config.get("enable_planning", True)
+        self.enable_planning = False  # Main model decides directly
         self.enable_caching = config.get("enable_caching", True)
         self.default_timeout = config.get("timeout", 3600)
         self.project_ctx_ttl = config.get("project_context_ttl", 30.0)
         self.enable_plan_driven = config.get("enable_plan_driven", True)
-        self.enable_intent_classification = config.get("enable_intent_classification", True)
+        self.enable_intent_classification = False  # Legacy preflight disabled
         # [CHANGED] QA verification is OFF by default — batch verify covers it.
         self.enable_qa_verification = config.get("enable_qa_verification", False)
         self.reserve_output_tokens = int(config.get("reserve_output_tokens", 4000))
@@ -531,14 +531,14 @@ class AgentLoop:
                 "Unknown verification_mode=%r, falling back to 'batch'", mode
             )
             mode = "batch"
-        self.verification_mode = mode
+        # Per-step verification was explicitly removed: batch or off only.
+        self.verification_mode = "off" if mode == "off" else "batch"
         # Legacy flag kept for backwards compat: if someone sets
         # require_verification=False we honor it by switching mode to "off".
         if not bool(config.get("require_verification", True)):
             self.verification_mode = "off"
         self.require_verification = self.verification_mode != "off"
-        # Batch mode confirms edited files once, without running test cycles.
-        # Max nudges applies only to per_step mode.
+        # Retained for legacy settings compatibility; never triggers per-step checks.
         self.max_verification_nudges = int(config.get("max_verification_nudges", 1))
         # Lightweight batch by default; one extra round for targeted repair.
         self.max_batch_verify_attempts = max(1, min(3, int(config.get("max_batch_verify_attempts", 2))))
@@ -1087,23 +1087,14 @@ class AgentLoop:
             ))
             self.context.metadata["direct_greeting"] = greeting
             # Avoid extra intent/planning model requests for unambiguous questions.
-            simple_question = greeting or bool(re.match(
-                r"^\s*(what is|what are|who is|why does|how does|"
-                r"define|explain|tell me about)\b", query, re.I,
-            )) and not bool(re.search(
-                r"\b(implement|modify|change|create|build|fix|run|execute|"
-                r"delete|install|update|test|deploy|launch|edit|write)\b",
-                query, re.I,
-            ))
-            if simple_question:
-                intent = "question"
-                self.context.metadata.update({
-                    "intent_needs_plan": False, "requires_action": False,
-                })
-            else:
-                intent = await self._classify_intent(query)
+            # Let the main model determine whether to answer or use tools.
+            # No separate intent-classification or planning-decision API calls.
+            intent = "unknown"
             self.context.intent = intent
-            logger.info("Classified intent: %s", intent)
+            self.context.metadata.update({
+                "intent_needs_plan": False,
+                "requires_action": False,
+            })
 
             self.context.user_declined_demo = any(
                 p.search(query) for p in _USER_DECLINED_PATTERNS
@@ -1111,8 +1102,6 @@ class AgentLoop:
             if self.context.user_declined_demo:
                 self.context.user_asked_to_show = False
 
-            if self.enable_planning and await self._should_plan(query, intent=intent):
-                await self._create_plan(query, context, intent=intent)
 
             if (
                 self.enable_plan_driven
@@ -1339,23 +1328,26 @@ class AgentLoop:
                         self.context.metadata["stopped_on_no_progress"] = True
                         break
 
-                # [CHANGED] per_step verification: if mode is per_step and
-                # there are pending mutations, nudge immediately (old behavior).
+                # Transition from discovery to implementation after sufficient evidence.
+                # This is guidance, not a forced action: a legitimate blocker or
+                # read-only request may still require investigation or an answer.
+                metadata = self.context.metadata
                 if (
-                    self.verification_mode == "per_step"
-                    and self.context.unverified_mutations
-                    and self.context.verification_nudges < self.max_verification_nudges
-                    and self.context.iteration < self.max_iterations
+                    metadata.get("evidence_observed")
+                    and not metadata.get("action_attempted")
+                    and not metadata.get("implementation_guidance_sent")
+                    and len(metadata.get("discoveries", [])) >= 2
+                    and not metadata.get("stopped_on_failures")
                 ):
-                    self.context.verification_nudges += 1
-                    logger.info(
-                        "per_step verify: %d mutation(s) pending (nudge %d/%d)",
-                        len(self.context.unverified_mutations),
-                        self.context.verification_nudges,
-                        self.max_verification_nudges,
+                    metadata["implementation_guidance_sent"] = True
+                    await self.model_context.add_system_message(
+                        "You have inspected relevant code. If the user's task "
+                        "requires implementation and you have sufficient evidence, "
+                        "make the targeted change now instead of browsing more. "
+                        "Read another file only if a specific missing fact is "
+                        "needed. For read-only requests, report the findings. "
+                        "Follow tool permissions and restrictions."
                     )
-                    await self._inject_verification_guidance()
-                    continue
 
                 # Always let the model interpret read results and decide
                 # whether further work is needed. A read is not completion.
@@ -1398,12 +1390,6 @@ class AgentLoop:
                 response_text = await self._ensure_demo_offer(response_text)
                 return self._result(True, response_text)
 
-            # A single file write/edit is cheap to verify directly. Read it
-            # back now instead of spending an extra LLM turn on the simple
-            # case; complex or multi-file changes still use the batch loop.
-            if self.verification_mode != "batch" and not self._declared_unverified(response_text):
-                await self._auto_verify_single_file_change()
-
             # [CHANGED] In batch mode, before accepting the final answer,
             # inject a verification turn. Up to max_batch_verify_attempts
             # fix->verify rounds are allowed.
@@ -1411,28 +1397,6 @@ class AgentLoop:
                 self.state = LoopState.VERIFYING
                 await self._trigger_event("on_phase", {"phase": "verifying"})
                 await self._inject_batch_verification_guidance()
-                continue
-
-            # [CHANGED] per_step mode keeps the old nudge gate; batch mode
-            # never reaches here with pending mutations because the batch
-            # turn above consumes them.
-            if (
-                self.verification_mode == "per_step"
-                and self.require_verification
-                and self.context.unverified_mutations
-                and self.context.verification_nudges < self.max_verification_nudges
-                and self.context.iteration < self.max_iterations
-                and not self._declared_unverified(response_text)
-            ):
-                self.context.verification_nudges += 1
-                logger.info(
-                    "Refusing final answer: %d unverified mutation(s) "
-                    "(nudge %d/%d)",
-                    len(self.context.unverified_mutations),
-                    self.context.verification_nudges,
-                    self.max_verification_nudges,
-                )
-                await self._inject_verification_guidance()
                 continue
 
             if self.context.unverified_mutations:
@@ -1555,51 +1519,6 @@ class AgentLoop:
                 return candidate
         return None
 
-    async def _auto_verify_single_file_change(self) -> None:
-        """Read back one simple file mutation without asking the LLM again.
-
-        Batch verification is still used for multi-target or shell changes.
-        This only handles the common "I wrote one file" case, where a direct
-        read is enough evidence and an extra model turn is pure overhead.
-        """
-        if self.verification_mode != "batch":
-            return
-        pending = self._pending_verification_entries()
-        if not pending:
-            return
-        targets = {str(m.get("target") or "") for m in pending}
-        if len(targets) != 1:
-            return
-        target = next(iter(targets))
-        if not target:
-            return
-        simple_tools = {"write", "edit", "apply_patch", "patch"}
-        if any(
-            str(m.get("tool") or "").lower() not in simple_tools
-            for m in pending
-        ):
-            return
-        read_tool = self._find_read_tool_name()
-        if read_tool is None:
-            return
-        try:
-            result = await self._registry_execute(
-                read_tool, {"filePath": target}
-            )
-        except Exception as exc:
-            logger.debug("Auto-verification read failed for %s: %s", target, exc)
-            return
-        if not isinstance(result, dict):
-            result = {"success": True, "result": result}
-        if not result.get("success", False):
-            return
-        self._clear_unverified_mutations(read_tool, {"filePath": target})
-        self.context.metadata.setdefault(
-            "auto_verified_targets", []
-        ).append(target)
-        logger.info("Auto-verified simple file change: %s", target)
-
-    # [STOP-2] Did any tool call in this iteration produce real progress?
     def _made_progress(self, results: List[Dict[str, Any]]) -> bool:
         """Count actual state-changing work, not arbitrary successful reads.
 
@@ -3453,6 +3372,19 @@ Understand → Decide → Act if needed → Observe → Lightweight batch verifi
                 self._record_evidence(name, args, result)
                 if self._is_read_only(name):
                     self._remember_successful_call(name, args, result)
+                    # A second identical successful read is rarely useful.
+                    # Suggest targeted retrieval, but never block an authorized read.
+                    signature = self._call_signature(name, args)
+                    reads = self.context.metadata.setdefault("read_repeats", {})
+                    if signature:
+                        reads[signature] = reads.get(signature, 0) + 1
+                        if reads[signature] == 2:
+                            await self.model_context.add_system_message(
+                                "This read repeated an earlier successful inspection. "
+                                "Reuse cached findings where sufficient; inspect a "
+                                "specific symbol or range only when details are missing "
+                                "or the file changed. Continue the requested work."
+                            )
                 else:
                     # [READ-CACHE] A successful mutation invalidates the
                     # session read cache for that path so the next read
@@ -3674,8 +3606,11 @@ Understand → Decide → Act if needed → Observe → Lightweight batch verifi
             return None
         if self.context.metadata.get("root_cause_waived"):
             return None
-        if self.context.intent not in ("bugfix", "refactor"):
-            return None
+        # The main model owns intent; the evidence gate applies only when a
+        # task is explicitly marked as a fix/refactor by the caller.
+        # With preflight intent classification removed, protect edits regardless
+        # of a guessed intent: one successful inspection is sufficient.
+        # Creation and read-only tools are not subject to this gate.
         name_l = str(name or "").lower()
         if name_l not in (
             "edit", "apply_patch", "patch", "str_replace", "replace",
