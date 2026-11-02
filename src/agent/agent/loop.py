@@ -3463,6 +3463,19 @@ Understand → Decide → Act if needed → Observe → Lightweight batch verifi
                 self._record_evidence(name, args, result)
                 if self._is_read_only(name):
                     self._remember_successful_call(name, args, result)
+                    # A second identical successful read is rarely useful.
+                    # Suggest targeted retrieval, but never block an authorized read.
+                    signature = self._call_signature(name, args)
+                    reads = self.context.metadata.setdefault("read_repeats", {})
+                    if signature:
+                        reads[signature] = reads.get(signature, 0) + 1
+                        if reads[signature] == 2:
+                            await self.model_context.add_system_message(
+                                "This read repeated an earlier successful inspection. "
+                                "Reuse cached findings where sufficient; inspect a "
+                                "specific symbol or range only when details are missing "
+                                "or the file changed. Continue the requested work."
+                            )
                 else:
                     # [READ-CACHE] A successful mutation invalidates the
                     # session read cache for that path so the next read
@@ -3686,8 +3699,9 @@ Understand → Decide → Act if needed → Observe → Lightweight batch verifi
             return None
         # The main model owns intent; the evidence gate applies only when a
         # task is explicitly marked as a fix/refactor by the caller.
-        if self.context.intent not in ("bugfix", "refactor"):
-            return None
+        # With preflight intent classification removed, protect edits regardless
+        # of a guessed intent: one successful inspection is sufficient.
+        # Creation and read-only tools are not subject to this gate.
         name_l = str(name or "").lower()
         if name_l not in (
             "edit", "apply_patch", "patch", "str_replace", "replace",
