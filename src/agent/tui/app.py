@@ -2042,6 +2042,7 @@ class DepressionApp(App):
         Binding("ctrl+r", "history_search", "History", priority=True),
         Binding("ctrl+f", "search_transcript", "Search", priority=True),
         Binding("ctrl+space", "complete_file", "Files", priority=True),
+        Binding("f3", "complete_file", "Files", priority=True),
         Binding("f2", "toggle_auto_scroll", "Follow", priority=True),
         Binding("tab", "tab_or_mode", "Mode", priority=True),
         Binding("ctrl+e", "toggle_expand_tool", "Expand", priority=False),
@@ -2161,7 +2162,7 @@ class DepressionApp(App):
             yield Static(self._mode_chip(), id="mode-chip", markup=True)
             yield Static(
                 f"[{DIM}]enter submit · shift+enter newline · ctrl+p commands · "
-                f"type / for commands · ctrl+r history · ctrl+space @files · "
+                f"type / for commands · ctrl+r history · ctrl+space / f3 @files · "
                 f"f2 follow · ctrl+b sidebar · ctrl+q quit[/]",
                 id="hint", markup=True,
             )
