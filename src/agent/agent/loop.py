@@ -1328,6 +1328,27 @@ class AgentLoop:
                         self.context.metadata["stopped_on_no_progress"] = True
                         break
 
+                # Transition from discovery to implementation after sufficient evidence.
+                # This is guidance, not a forced action: a legitimate blocker or
+                # read-only request may still require investigation or an answer.
+                metadata = self.context.metadata
+                if (
+                    metadata.get("evidence_observed")
+                    and not metadata.get("action_attempted")
+                    and not metadata.get("implementation_guidance_sent")
+                    and len(metadata.get("discoveries", [])) >= 2
+                    and not metadata.get("stopped_on_failures")
+                ):
+                    metadata["implementation_guidance_sent"] = True
+                    await self.model_context.add_system_message(
+                        "You have inspected relevant code. If the user's task "
+                        "requires implementation and you have sufficient evidence, "
+                        "make the targeted change now instead of browsing more. "
+                        "Read another file only if a specific missing fact is "
+                        "needed. For read-only requests, report the findings. "
+                        "Follow tool permissions and restrictions."
+                    )
+
                 # [CHANGED] per_step verification: if mode is per_step and
                 # there are pending mutations, nudge immediately (old behavior).
                 if (
@@ -3663,6 +3684,8 @@ Understand → Decide → Act if needed → Observe → Lightweight batch verifi
             return None
         if self.context.metadata.get("root_cause_waived"):
             return None
+        # The main model owns intent; the evidence gate applies only when a
+        # task is explicitly marked as a fix/refactor by the caller.
         if self.context.intent not in ("bugfix", "refactor"):
             return None
         name_l = str(name or "").lower()
