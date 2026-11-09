@@ -272,6 +272,7 @@ class Agent:
         self,
         query: str,
         context: Optional[Dict[str, Any]] = None,
+        initial_plan: Any = None,
     ) -> Dict[str, Any]:
         if self.is_shutting_down:
             return {"success": False, "error": "Agent shutting down"}
@@ -281,13 +282,16 @@ class Agent:
             if subagent_calls:
                 return await self._handle_subagent_invocations(subagent_calls, context, query)
 
-        return await self._run_query_pipeline(query, context, record_user=True)
+        return await self._run_query_pipeline(
+            query, context, record_user=True, initial_plan=initial_plan
+        )
 
     async def _run_query_pipeline(
         self,
         query: str,
         context: Optional[Dict[str, Any]],
         record_user: bool = True,
+        initial_plan: Any = None,
     ) -> Dict[str, Any]:
         """The single execution path shared by top-level queries and follow-ups."""
         async with self._thinking_lock:
@@ -322,6 +326,7 @@ class Agent:
                         if self.context_manager else []
                     ),
                     max_turns=self.max_turns,
+                    initial_plan=initial_plan,
                 )
 
                 response_text = result.get("response", "")

@@ -161,6 +161,21 @@ _COMPLEXITY_TOKENS = re.compile(
     re.I,
 )
 
+# [Verification auto] Explicit requests to check the work. Only these turn
+# on a verification round; ordinary edits are confirmed by the tool result.
+_VERIFY_REQUEST_RE = re.compile(
+    r"\b("
+    r"tests?|testing|pytest|unittest|"
+    r"verify|verification|validate|validation|"
+    r"lint|linting|typecheck|type-check|type check|"
+    r"compile|compiles|coverage|"
+    r"make sure|ensure|"
+    r"run .{0,30}\btests?\b|"
+    r"check (?:that|if|whether|the result)"
+    r")\b",
+    re.I,
+)
+
 
 # ----------------------------------------------------------------------
 # Bash/terminal fallback transforms
@@ -524,15 +539,15 @@ class AgentLoop:
             config.get("require_permission_for_destructive", True)
         )
 
-        # [CHANGED] Verification mode is now explicit.
-        mode = str(config.get("verification_mode", "batch")).lower()
+        # [CHANGED] Verification is demand-driven by default ("auto").
+        mode = str(config.get("verification_mode", "auto")).lower()
         if mode not in _VERIFICATION_MODES:
             logger.warning(
-                "Unknown verification_mode=%r, falling back to 'batch'", mode
+                "Unknown verification_mode=%r, falling back to 'auto'", mode
             )
-            mode = "batch"
-        # Per-step verification was explicitly removed: batch or off only.
-        self.verification_mode = "off" if mode == "off" else "batch"
+            mode = "auto"
+        # Per-step verification is legacy; auto/batch/off are supported.
+        self.verification_mode = mode
         # Legacy flag kept for backwards compat: if someone sets
         # require_verification=False we honor it by switching mode to "off".
         if not bool(config.get("require_verification", True)):
@@ -541,8 +556,10 @@ class AgentLoop:
         # Retained for legacy settings compatibility; never triggers per-step checks.
         self.max_verification_nudges = int(config.get("max_verification_nudges", 1))
         # Lightweight batch by default; one extra round for targeted repair.
-        self.max_batch_verify_attempts = max(1, min(3, int(config.get("max_batch_verify_attempts", 2))))
-        self.require_demo_offer = bool(config.get("require_demo_offer", True))
+        self.max_batch_verify_attempts = max(
+            1, int(config.get("max_batch_verify_attempts", 2))
+        )
+        self.require_demo_offer = bool(config.get("require_demo_offer", False))
         self.retry_tool_timeout = bool(config.get("retry_tool_timeout", False))
         self.enable_parallel_reads = bool(config.get("enable_parallel_reads", True))
         self.enable_streaming = bool(config.get("enable_streaming", True))
@@ -1042,6 +1059,7 @@ class AgentLoop:
         context: Optional[Dict[str, Any]] = None,
         tool_outputs: Optional[List[Any]] = None,
         max_turns: Optional[int] = None,
+        initial_plan: Optional[Plan] = None,
     ) -> Dict[str, Any]:
         self.context = LoopContext()
         self.verification = self._build_verification_controller()
@@ -1056,7 +1074,8 @@ class AgentLoop:
                 self._recovered_checkpoint = TaskCheckpointStore().load(session_id, query[:500])
         except Exception as exc:
             logger.debug("Task checkpoint recovery failed: %s", exc)
-        self.current_plan = None
+        self.current_plan = initial_plan
+        self._explicit_plan = initial_plan is not None
         self.pending_tool_calls = []
         self.completed_tool_calls = []
         self.tool_result_cache.clear()
@@ -1094,6 +1113,11 @@ class AgentLoop:
             self.context.metadata.update({
                 "intent_needs_plan": False,
                 "requires_action": False,
+                # [Verification auto] Only run a verification round when the
+                # user explicitly asked for tests/checks.
+                "verification_requested": bool(
+                    _VERIFY_REQUEST_RE.search(query or "")
+                ),
             })
 
             self.context.user_declined_demo = any(
@@ -1106,7 +1130,10 @@ class AgentLoop:
             if (
                 self.enable_plan_driven
                 and self.current_plan is not None
-                and len(self.current_plan.tasks) >= PLAN_DRIVEN_MIN_TASKS
+                and (
+                    len(self.current_plan.tasks) >= PLAN_DRIVEN_MIN_TASKS
+                    or self._explicit_plan
+                )
             ):
                 plan_result = await self._run_plan_driven(query, context)
                 if plan_result is not None:
@@ -1388,6 +1415,9 @@ class AgentLoop:
                 self.state = LoopState.STOPPED
                 self._update_metrics()
                 response_text = await self._ensure_demo_offer(response_text)
+                response_text, _ = self._finalize_verification_report(
+                    response_text
+                )
                 return self._result(True, response_text)
 
             # [CHANGED] In batch mode, before accepting the final answer,
@@ -1825,9 +1855,10 @@ class AgentLoop:
         if qa:
             task_prompt += f"QA criterion (must pass to complete): {qa}\n\n"
         task_prompt += (
-            "Use tools as needed. VERIFY your work before declaring completion: "
-            "if you wrote or edited a file, read it back; if you ran a fix, "
-            "re-run the failing command and quote the output.\n"
+            "Use tools as needed. When you wrote or edited a file, read it "
+            "back to confirm the saved content. Run tests/builds/linting only "
+            "when the user asked for verification or when it is needed to "
+            "establish correctness; do not add extra checks otherwise.\n"
             "When the task is complete and verified, respond with a short "
             "summary prefixed by 'TASK COMPLETE:' that includes the exact "
             "evidence (command output or diff).\n"
@@ -1913,8 +1944,13 @@ class AgentLoop:
                     if self.verification_mode == "batch"
                     else max(1, self.max_verification_nudges)
                 )
+                needs_verify = (
+                    self.verification_mode == "batch"
+                    or self.verification.verification_requested
+                )
                 if (
                     self.require_verification
+                    and needs_verify
                     and local_unverified
                     and not self._declared_unverified(content)
                     and local_turns < max_local_turns
@@ -1949,7 +1985,11 @@ class AgentLoop:
                     if not summary:
                         summary = task.description
 
-                if local_unverified and not self._declared_unverified(content):
+                if (
+                    needs_verify
+                    and local_unverified
+                    and not self._declared_unverified(content)
+                ):
                     targets = sorted(local_unverified)
                     summary = (
                         f"UNVERIFIED: {len(targets)} change(s) remain "
@@ -1958,7 +1998,7 @@ class AgentLoop:
                         + "\n\n"
                         + summary
                     )
-                if local_unverified:
+                if needs_verify and local_unverified:
                     if not isinstance(task.metadata, dict):
                         task.metadata = {}
                     task.metadata["unverified"] = True
@@ -2252,7 +2292,35 @@ class AgentLoop:
             mcp_count = len(mcp.list_tools()) if mcp is not None else 0
         except Exception:
             mcp_count = 0
-        return (tools, perms, env_gen, ws_path, model, mcp_count, self.context.intent)
+        instructions_fp = ""
+        try:
+            from agent.context.instructions import load_project_instructions
+            _, instructions_meta = load_project_instructions(
+                self._workspace_root(), self._configured_instructions()
+            )
+            instructions_fp = str(instructions_meta.get("fingerprint", ""))
+        except Exception:
+            instructions_fp = ""
+        return (
+            tools, perms, env_gen, ws_path, model, mcp_count,
+            self.context.intent, instructions_fp,
+        )
+
+    def _workspace_root(self) -> str:
+        workspace = getattr(self.agent, "workspace", None)
+        return str(getattr(workspace, "project_dir", "") or "")
+
+    def _configured_instructions(self) -> List[Any]:
+        config = getattr(self.agent, "config", None)
+        if not isinstance(config, dict):
+            return []
+        context_cfg = config.get("context")
+        if isinstance(context_cfg, dict):
+            value = context_cfg.get("instructions")
+            if isinstance(value, list):
+                return value
+        value = config.get("instructions")
+        return list(value) if isinstance(value, list) else []
 
     async def _get_system_prompt(self) -> str:
         fp = await self._system_prompt_fingerprint()
@@ -2263,6 +2331,22 @@ class AgentLoop:
         perms = self._get_permissions_context()
         env_block = self._build_environment_block()
         aws_block = self._build_aws_guidance()
+        try:
+            from agent.context.instructions import load_project_instructions
+            instructions_text, _ = load_project_instructions(
+                self._workspace_root(), self._configured_instructions()
+            )
+        except Exception as exc:
+            logger.debug("Project instructions load failed: %s", exc)
+            instructions_text = ""
+        instructions_block = (
+            "\n\n## Project Instructions (from AGENTS.md / configured files)\n"
+            "Follow these project-specific rules unless the user explicitly "
+            "overrides them.\n\n"
+            + instructions_text
+            if instructions_text.strip()
+            else ""
+        )
 
         base_prompt = """
 You are depression.ai, an autonomous, general-purpose AI CLI agent. Understand the user's actual intent, think independently, and achieve the expected outcome using the simplest effective approach.
@@ -2293,15 +2377,15 @@ You are depression.ai, an autonomous, general-purpose AI CLI agent. Understand t
 - Avoid overanalysis, overengineering, and unnecessary scope expansion.
 
 ## VERIFICATION & RECOVERY
-- After modifications, perform one lightweight batch verification of changed files and available command outcomes.
-- Confirm that changes were saved and review relevant errors, exit codes, and existing output.
-- Do not automatically run additional tests, builds, linting, or comprehensive checks unless requested.
+- After a modification, confirm the change was saved (read the changed file back when useful).
+- Run tests, builds, linting, or type checks only when the user asks for verification or when they are needed to establish correctness. Do not add extra check rounds on your own.
 - If the user requests full verification, perform all relevant checks within the requested scope.
 - If the user explicitly says not to verify, skip optional verification.
 - If a check fails, identify the root cause, fix only the affected part, and recheck the failed operation and impacted dependencies.
 - Avoid unnecessary repeated checks and verification loops. Keep retries bounded.
-- use different approach if anything blocks you and try to solve it .
+- Use a different approach if something blocks you and try to solve it.
 - Distinguish successful, failed, and unverified results. Never claim success without evidence.
+- If no checks were run, say so plainly instead of implying the work was tested.
 
 ## AUTONOMY & QUALITY
 - Exercise independent judgment within the user's authorized scope.
@@ -2318,16 +2402,23 @@ You are depression.ai, an autonomous, general-purpose AI CLI agent. Understand t
 - Request confirmation for ambiguous destructive, irreversible, or high-impact actions.
 - Never bypass denied permissions or security controls.
 
+## PLANNING & EXPECTATIONS
+- Before the first tool batch on a non-trivial request, send one short line stating what you will do and why.
+- For work with more than two steps, keep a short plan/todo list and update it as you go.
+- When a plan already exists (Plan mode or Auto mode), follow it and state the next step instead of silently switching scope.
+- Ask a clarifying question only when the answer changes the outcome; otherwise state your assumption and proceed.
+- Do not append canned offers or ask permission after the work is already done.
+
 ## COMMUNICATION
 - Respond naturally, directly, and concisely.
-- Prioritize completed work over unnecessary explanations and progress updates.
-- Briefly report what was done, the outcome, and any important limitations.
+- Show real progress: what you are doing now, what you found, and what comes next. Do not spam updates for trivial steps.
+- On completion, report: what changed (files), evidence (commands/output), verification status (tests run or not run), and any remaining risk or next step.
 - Use tables, diagrams, emojis, or examples only when helpful.
 - Clearly distinguish confirmed results from assumptions or incomplete work.
 - Avoid repetitive suggestions, unnecessary questions, and excessive detail.
 
 ## CORE PRINCIPLE
-Understand → Decide → Act if needed → Observe → Lightweight batch verification → Targeted repair if needed → Final verdict → Stop.
+Understand → State intent → Plan when useful → Act → Observe → Verify only as requested/needed → Targeted repair → Final report → Stop.
 
 **Do what the user actually intends. Be creative when given freedom, precise when given constraints, and efficient at all times. Minimize unnecessary tools, tokens, and actions without sacrificing accuracy, security, or the requested outcome.**
 """
@@ -2335,6 +2426,7 @@ Understand → Decide → Act if needed → Observe → Lightweight batch verifi
             base_prompt
             + env_block
             + aws_block
+            + instructions_block
             + "\n\n## Project\n"
             + json.dumps(project, indent=2, default=str)
             + "\n\n## Permissions\n"
@@ -3157,9 +3249,9 @@ Understand → Decide → Act if needed → Observe → Lightweight batch verifi
                 self.context.metadata.get("root_cause_refusals", 0) or 0
             ) + 1
             self.context.metadata["root_cause_refusals"] = refusals
-            # Never deadlock: if the model insists twice, let it proceed and
+            # Never deadlock: after one refusal let the model proceed and
             # rely on verification/reporting to catch an incorrect guess.
-            if refusals >= 2:
+            if refusals >= 1:
                 self.context.metadata["root_cause_waived"] = True
             result = {
                 "success": False,
@@ -3714,6 +3806,11 @@ Understand → Decide → Act if needed → Observe → Lightweight batch verifi
 
     def _pending_verification_entries(self) -> List[Dict[str, Any]]:
         if self.verification_mode == "off":
+            return []
+        if (
+            self.verification_mode == "auto"
+            and not self.verification.verification_requested
+        ):
             return []
         if self.reuse_test_evidence and self.verification_mode != "batch":
             self.verification.refresh_from_evidence()

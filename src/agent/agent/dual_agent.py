@@ -22,6 +22,7 @@ from __future__ import annotations
 import inspect
 import asyncio
 import json
+import re
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -485,11 +486,15 @@ class BaseAgent:
         query: str,
         context: Optional[Dict[str, Any]] = None,
         record_user: bool = True,
+        initial_plan: Any = None,
     ) -> Dict[str, Any]:
         """
         [Bug 1] `record_user=False` is used by the coordinator for every
         orchestration prompt (plan / execute / review). Only the top-level
         user turn is recorded.
+
+        ``initial_plan`` lets the coordinator hand a pre-built plan to the
+        build loop so planning does not happen twice.
         """
         if self.is_shutting_down:
             return {"success": False, "error": "Agent shutting down"}
@@ -507,7 +512,7 @@ class BaseAgent:
                 )
 
         return await self._run_query_pipeline(
-            query, context, record_user=record_user
+            query, context, record_user=record_user, initial_plan=initial_plan
         )
 
     async def _run_query_pipeline(
@@ -515,6 +520,7 @@ class BaseAgent:
         query: str,
         context: Optional[Dict[str, Any]],
         record_user: bool = True,
+        initial_plan: Any = None,
     ) -> Dict[str, Any]:
         start = time.time()
         self._query_started_at = start
@@ -544,6 +550,7 @@ class BaseAgent:
                     if self.context_manager else []
                 ),
                 max_turns=self.max_turns,
+                initial_plan=initial_plan,
             )
 
             response_text = result.get("response", "")
@@ -914,6 +921,9 @@ class AgentCoordinator:
             if auto_execute:
                 logger.info("Plan mode: ignoring auto_execute (planning only)")
             auto_execute = False
+            planned = await self._plan_only(query, context)
+            if planned is not None:
+                return planned
 
         if effective_mode == "auto":
             return await self._process_auto(query, context, auto_execute, max_iterations)
@@ -937,6 +947,130 @@ class AgentCoordinator:
 
         result["mode"] = effective_mode
         return result
+
+    # ------------------------------------------------------------------
+    # PLANNING HELPERS
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _format_plan(plan: Any) -> str:
+        """Render a Planner plan as a compact, user-visible checklist."""
+        if plan is None:
+            return ""
+        goal = str(getattr(plan, "goal", "") or "").strip()
+        tasks = list(getattr(plan, "tasks", []) or [])
+        if not tasks:
+            return goal
+        lines = [f"Plan: {goal}" if goal else "Plan", ""]
+        for task in tasks:
+            desc = str(getattr(task, "description", "") or "").strip()
+            if desc:
+                lines.append(f"- [ ] {desc}")
+            for sub in getattr(task, "subtasks", []) or []:
+                sub_desc = str(getattr(sub, "description", "") or "").strip()
+                if sub_desc:
+                    lines.append(f"  - [ ] {sub_desc}")
+        return "\n".join(lines)
+
+    async def _emit_plan_events(self, loop: Any, plan: Any) -> None:
+        if loop is None or plan is None:
+            return
+        tasks = list(getattr(plan, "tasks", []) or [])
+        if not tasks:
+            return
+        entries = []
+        for index, task in enumerate(tasks):
+            desc = str(getattr(task, "description", "") or "").strip()
+            if not desc:
+                continue
+            entries.append({
+                "id": str(getattr(task, "id", "") or index),
+                "description": desc,
+                "status": "in_progress" if index == 0 else "pending",
+                "content": desc,
+            })
+        if not entries:
+            return
+        try:
+            await loop._trigger_event("on_plan_created", {
+                "plan_id": str(getattr(plan, "id", "") or ""),
+                "goal": str(getattr(plan, "goal", "") or ""),
+                "tasks": entries,
+                "count": len(entries),
+            })
+            await loop._trigger_event("on_plan_rendered", {
+                "entries": [
+                    {"content": e["description"], "status": e["status"]}
+                    for e in entries
+                ],
+                "source": "planner",
+            })
+        except Exception as exc:
+            logger.debug("Plan event emit failed: %s", exc)
+
+    @staticmethod
+    def _is_multi_step(query: str) -> bool:
+        """Conservative check for whether a planning call is worth it.
+
+        Simple one-shot asks stay on the fast free-form path. Only clearly
+        coordinated work spends a planning model call in Auto mode.
+        """
+        text = (query or "").strip()
+        if not text:
+            return False
+        if re.search(
+            r"\b(refactor|migrate|across|multiple|all files|end-to-end|"
+            r"integration|rewrite|redesign|architecture)\b",
+            text,
+            re.I,
+        ):
+            return True
+        action = (
+            r"(?:add|create|implement|fix|update|change|remove|delete|"
+            r"move|rename|refactor|test|verify|run|build|install|document)"
+        )
+        actions = re.findall(rf"\b{action}\b", text, re.I)
+        connector = re.search(
+            r"\b(and|then|also|after|finally|plus|followed by)\b", text, re.I
+        )
+        if len(actions) >= 2 and connector:
+            return True
+        if len(text.split()) >= 25 and len(actions) >= 2:
+            return True
+        return False
+
+    async def _plan_only(
+        self, query: str, context: Optional[Dict[str, Any]]
+    ) -> Optional[Dict[str, Any]]:
+        """Plan mode: produce a structured plan and do not execute it."""
+        planner = getattr(self.plan_agent, "planner", None)
+        if planner is None:
+            return None
+        try:
+            plan = await planner.create_plan(
+                goal=query,
+                context=dict(context or {}),
+                constraints={"mode": "plan", "execute": False},
+            )
+        except Exception as exc:
+            logger.warning("Plan-mode planning failed: %s", exc)
+            return None
+        if not getattr(plan, "tasks", None):
+            return None
+        plan_text = self._format_plan(plan)
+        loop = getattr(self.plan_agent, "loop", None)
+        await self._emit_plan_events(loop, plan)
+        return {
+            "success": True,
+            "plan": plan_text,
+            "response": plan_text,
+            "execution": None,
+            "mode": "plan",
+            "iterations": 0,
+            "tool_calls": 0,
+            "context": {},
+            "message": "Plan created. Switch to Build/Auto mode to execute it.",
+        }
 
     async def _execute_plan_with_build(
         self, plan: str, context: Optional[Dict[str, Any]]
@@ -979,19 +1113,19 @@ class AgentCoordinator:
         auto_execute: bool = True,
         max_iterations: int = 3,
     ) -> Dict[str, Any]:
-        """
-        Auto mode.
+        """Auto mode: one plan call, then one build loop.
 
-        [Bug 1] The real user turn is recorded ONCE here. Plan/execute
-        prompts use `record_user=False` and the final answer is written
-        once at the end.
+        The old design ran a full Plan-agent loop and then a full Build-agent
+        loop up to ``max_iterations`` times, which spent several model calls
+        re-planning the same work. Now planning happens once via the
+        deterministic Planner and the Build loop executes the plan.
         """
         logger.info(
             "Processing query (auto mode): %s (max_iterations=%d)",
             query[:100], max_iterations,
         )
 
-        # [Bug 1] Record the real user turn once, up front.
+        # Record the real user turn exactly once.
         if self.build_agent.context_manager:
             try:
                 await self.build_agent.context_manager.add_user_message(query, context)
@@ -1004,138 +1138,75 @@ class AgentCoordinator:
                 pass
 
         current_context = dict(context or {})
-        plan_data = ""
-        execution_history: List[Dict[str, Any]] = []
-        final_execution = ""
-        first_error: Optional[str] = None
+        planner = getattr(self.plan_agent, "planner", None)
+        build_loop = getattr(self.build_agent, "loop", None)
 
-        for iteration in range(max_iterations):
-            logger.info("=== Iteration %d/%d ===", iteration + 1, max_iterations)
-
-            plan_loop = getattr(self.plan_agent, "loop", None)
-            prev_planning = getattr(plan_loop, "enable_planning", True) if plan_loop else True
-
-            if iteration == 0:
-                plan_prompt = (
-                    f"Create a detailed execution plan for: {query}\n\n"
-                    f"Context: {json.dumps(current_context, default=str)}\n\n"
-                    f"Available tools for Build agent: "
-                    f"{', '.join(self.build_agent.get_available_tools())}\n\n"
-                    "Output format: JSON with tasks array, each with description, "
-                    "tools, dependencies, validation."
-                )
-            else:
-                prev_results = "\n\n".join(
-                    f"--- Iteration {i + 1} Results ---\n"
-                    f"{h.get('execution', '')[:2000]}"
-                    for i, h in enumerate(execution_history)
-                )
-                plan_prompt = (
-                    f"Previous plan execution results:\n{prev_results}\n\n"
-                    f"Original goal: {query}\n\n"
-                    "Review the results above. Some tasks may have failed or be incomplete.\n"
-                    "Create an UPDATED plan to complete the remaining work.\n"
-                    "Focus on fixing failures and completing unfinished tasks.\n\n"
-                    f"Available tools: {', '.join(self.build_agent.get_available_tools())}\n\n"
-                    "Output format: JSON with tasks array (description, tools, "
-                    "dependencies, validation)."
-                )
-
+        plan = None
+        plan_text = ""
+        if planner is not None and self._is_multi_step(query):
             try:
-                if plan_loop:
-                    plan_loop.enable_planning = False
-                # [Bug 1] Orchestration prompt: NOT a user turn.
-                plan_result = await self.plan_agent.process_query(
-                    query=plan_prompt, context=current_context, record_user=False,
+                plan = await planner.create_plan(
+                    goal=query, context=current_context,
                 )
-            finally:
-                if plan_loop:
-                    plan_loop.enable_planning = prev_planning
-
-            plan_data = plan_result.get("response", "")
-            logger.info(
-                "Plan created (iteration %d): %d chars",
-                iteration + 1, len(plan_data),
-            )
-
-            if not auto_execute:
-                return {
-                    "success": True,
-                    "plan": plan_data,
-                    "execution": None,
-                    "iteration": iteration + 1,
-                    "message": "Plan created. Use execute_plan() to run it.",
-                }
-
-            build_prompt = (
-                f"Execute this plan step by step:\n\n{plan_data}\n\n"
-                "For each task, call the appropriate tool(s). Report results after each step.\n"
-                "Continue until all tasks are complete or you encounter blockers.\n"
-                "Be specific about what you did and any errors encountered."
-            )
-            # The coordinator already planned this iteration. Avoid a
-            # second plan-generation pass in the Build agent.
-            build_loop = getattr(self.build_agent, "loop", None)
-            original_planning = getattr(build_loop, "enable_planning", False)
-            try:
-                if build_loop is not None:
-                    build_loop.enable_planning = False
-                build_result = await self.build_agent.process_query(
-                    query=build_prompt, context=current_context, record_user=False,
-                )
-            finally:
-                if build_loop is not None:
-                    build_loop.enable_planning = original_planning
-
-            execution_result = build_result.get("response", "")
-            execution_history.append({
-                "iteration": iteration + 1,
-                "plan": plan_data,
-                "execution": execution_result,
-                "success": build_result.get("success", True),
-                "tool_calls": build_result.get("tool_calls", 0),
-            })
-            final_execution = execution_result
-
-            if build_result.get("success", True):
+                if not getattr(plan, "tasks", None):
+                    plan = None
+                plan_text = self._format_plan(plan)
                 logger.info(
-                    "Plan completed successfully in %d iterations", iteration + 1
+                    "Auto plan created: %d task(s)",
+                    len(getattr(plan, "tasks", []) or []),
                 )
-                break
+            except Exception as exc:
+                logger.warning(
+                    "Auto-mode planning failed; running free-form: %s", exc
+                )
+                plan = None
+                plan_text = ""
 
-            if first_error is None and build_result.get("error"):
-                first_error = build_result.get("error")
-            if first_error is None and plan_result.get("error"):
-                first_error = plan_result.get("error")
+        if plan is not None:
+            if build_loop is not None and getattr(build_loop, "planner", None) is None:
+                build_loop.planner = planner
+            await self._emit_plan_events(build_loop, plan)
 
-            current_context["previous_execution"] = execution_result
-            current_context["iteration"] = iteration + 1
+        if not auto_execute:
+            return {
+                "success": True,
+                "plan": plan_text or None,
+                "execution": None,
+                "iterations": 0,
+                "tool_calls": 0,
+                "mode": "auto",
+                "message": "Plan created. Call again with auto_execute=True to run it.",
+            }
 
-        overall_success = all(h.get("success", True) for h in execution_history)
+        build_result = await self.build_agent.process_query(
+            query=query,
+            context=context,
+            record_user=False,
+            initial_plan=plan,
+        )
 
-        # [Bug 1] Store ONE assistant turn: the final answer to the user.
-        if final_execution:
+        execution = build_result.get("response", "")
+        if execution:
             try:
                 if self.build_agent.context_manager:
                     await self.build_agent.context_manager.add_assistant_message(
-                        final_execution
+                        execution
                     )
                 if self.build_agent.session:
-                    self.build_agent.session.add_assistant_message(final_execution)
+                    self.build_agent.session.add_assistant_message(execution)
             except Exception as exc:
                 logger.debug("auto-mode store final answer failed: %s", exc)
 
         result: Dict[str, Any] = {
-            "success": overall_success,
-            "plan": plan_data,
-            "execution": final_execution,
-            "iterations": len(execution_history),
-            "execution_history": execution_history,
-            "tool_calls": sum(h.get("tool_calls", 0) for h in execution_history),
+            "success": build_result.get("success", True),
+            "plan": plan_text or None,
+            "execution": execution,
+            "iterations": 1 if plan is not None else 0,
+            "tool_calls": int(build_result.get("tool_calls", 0) or 0),
             "mode": "auto",
         }
-        if not overall_success and first_error:
-            result["error"] = first_error
+        if not result["success"] and build_result.get("error"):
+            result["error"] = str(build_result.get("error"))
         return result
 
     def _is_plan_complete(self, execution: str, plan: str) -> bool:

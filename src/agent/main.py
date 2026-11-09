@@ -198,7 +198,7 @@ Examples:
         # Limits
         parser.add_argument("--max-turns", type=int, default=50, help="Max iterations per query (agent loop)")
         parser.add_argument("--max-iterations", type=int, default=3, help="Max plan-execute iterations (coordinator)")
-        parser.add_argument("--timeout", type=int, default=99999, help="Timeout in seconds")
+        parser.add_argument("--timeout", type=int, default=900, help="Timeout in seconds")
 
         # TUI options
         parser.add_argument("--no-sidebar", action="store_true", help="Hide sidebar in TUI")
@@ -548,8 +548,10 @@ Examples:
             spinner.stop()
 
         if result.get("success"):
-            if result.get("plan"):
+            plan_text = result.get("plan")
+            if isinstance(plan_text, str) and plan_text.strip():
                 self.ui.print_info("📋 Plan created, executing...")
+                self.ui.print_info(plan_text)
             self.ui.print_agent_message(result.get("execution") or result.get("response", ""))
         else:
             self.ui.print_error(result.get("error", "unknown error"))
@@ -665,8 +667,10 @@ Examples:
             spinner.stop()
 
         if result.get("success"):
-            if result.get("plan"):
+            plan_text = result.get("plan")
+            if isinstance(plan_text, str) and plan_text.strip():
                 self.ui.print_info("📋 Plan created, executing...")
+                self.ui.print_info(plan_text)
             self.ui.print_agent_message(result.get("execution") or result.get("response", ""))
             if self.args.verbose:
                 iterations = result.get("iterations", 1)

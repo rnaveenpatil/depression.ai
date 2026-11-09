@@ -2798,7 +2798,7 @@ class DepressionApp(App):
 
     def _plan_from_text(self, text: str) -> list:
         try:
-            from agent.tui.onboarding.plan_parser import (
+            from agent.tui.plan_parser import (
                 parse_plan_from_text, looks_like_plan,
             )
         except Exception:
@@ -4374,7 +4374,10 @@ class DepressionApp(App):
                 await self._render_output(str(output), started)
 
                 try:
-                    text_plan = self._plan_from_text(str(output))
+                    plan_source = result.get("plan")
+                    if not isinstance(plan_source, str) or not plan_source.strip():
+                        plan_source = output
+                    text_plan = self._plan_from_text(str(plan_source))
                     if text_plan:
                         normalised = self._normalise_plan_entries(text_plan)
                         if normalised:

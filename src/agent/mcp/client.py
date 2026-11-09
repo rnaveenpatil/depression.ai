@@ -102,6 +102,10 @@ class MCPServerConfig:
     max_reconnect_attempts: int = 5
     enabled: bool = True
     capabilities: Dict[str, Any] = field(default_factory=dict)
+    # Upper bound for a single stdio JSON-RPC frame. Some MCP servers (e.g.
+    # REA with ~229 tools) emit multi-megabyte `tools/list` responses on one
+    # line. asyncio's default 64 KiB StreamReader limit is far too small.
+    max_message_bytes: int = 64 * 1024 * 1024
     # Opt-in: overlay AWS credentials into the child environment. Off by
     # default because the previous heuristic (substring "aws" anywhere in the
     # name/args/env/command) handed live cloud credentials to any server whose
@@ -293,6 +297,7 @@ class StdioTransport(MCPTransportBase):
         self._process: Optional[asyncio.subprocess.Process] = None
         self._read_task: Optional[asyncio.Task] = None
         self._stderr_task: Optional[asyncio.Task] = None
+        self._stdout_buffer = bytearray()
 
     def _build_child_env(self) -> Dict[str, str]:
         """
@@ -378,6 +383,7 @@ class StdioTransport(MCPTransportBase):
                 stderr=asyncio.subprocess.PIPE,
                 env=env,
                 cwd=self.config.cwd,
+                limit=self.config.max_message_bytes,
             )
         except FileNotFoundError as e:
             raise MCPConnectionError(
@@ -445,6 +451,9 @@ class StdioTransport(MCPTransportBase):
         self._read_task = None
         self._stderr_task = None
         self._process = None
+        buffer = getattr(self, "_stdout_buffer", None)
+        if buffer is not None:
+            buffer.clear()
         logger.info("stdio MCP '%s' stopped", self.config.name)
 
     async def _send(self, message: Dict[str, Any]) -> None:
@@ -458,19 +467,62 @@ class StdioTransport(MCPTransportBase):
         """Prevent verbose child stderr from filling its pipe and stalling MCP."""
         try:
             assert self._process and self._process.stderr
-            while line := await self._process.stderr.readline():
-                logger.debug("MCP %s stderr: %s",
-                             self.config.name, line[:500].decode(errors="replace").rstrip())
+            pending = bytearray()
+            while chunk := await self._process.stderr.read(64 * 1024):
+                pending.extend(chunk)
+                while (index := pending.find(b"\n")) != -1:
+                    line = bytes(pending[:index])
+                    del pending[: index + 1]
+                    logger.debug(
+                        "MCP %s stderr: %s",
+                        self.config.name,
+                        line[:500].decode(errors="replace").rstrip(),
+                    )
+                # Never let a pathological stderr line grow without bound.
+                if len(pending) > self.config.max_message_bytes:
+                    pending.clear()
         except asyncio.CancelledError:
             raise
         except Exception as exc:
             logger.debug("MCP %s stderr reader stopped: %s", self.config.name, exc)
 
+    async def _read_stdout_line(self) -> bytes:
+        """Read one newline-delimited JSON-RPC frame of any supported size.
+
+        ``StreamReader.readline()`` enforces a fixed buffer limit and raises
+        ``ValueError`` once a frame exceeds it. MCP servers such as REA return
+        a multi-megabyte ``tools/list`` payload on a single line, so frames are
+        buffered manually and bounded by ``max_message_bytes`` instead.
+        """
+        assert self._process and self._process.stdout
+        while True:
+            index = self._stdout_buffer.find(b"\n")
+            if index != -1:
+                line = bytes(self._stdout_buffer[:index])
+                del self._stdout_buffer[: index + 1]
+                return line
+            if len(self._stdout_buffer) > self.config.max_message_bytes:
+                size = len(self._stdout_buffer)
+                self._stdout_buffer.clear()
+                raise MCPConnectionError(
+                    f"MCP frame from '{self.config.name}' exceeded "
+                    f"{self.config.max_message_bytes} bytes (buffered {size})"
+                )
+            chunk = await self._process.stdout.read(64 * 1024)
+            if not chunk:
+                if self._stdout_buffer:
+                    line = bytes(self._stdout_buffer)
+                    self._stdout_buffer.clear()
+                    return line
+                return b""
+            self._stdout_buffer.extend(chunk)
+
     async def _receive_loop(self) -> None:
+        failure: Optional[str] = None
         try:
             assert self._process and self._process.stdout
             while True:
-                line = await self._process.stdout.readline()
+                line = await self._read_stdout_line()
                 if not line:
                     break
                 line = line.strip()
@@ -484,11 +536,16 @@ class StdioTransport(MCPTransportBase):
         except asyncio.CancelledError:
             raise
         except Exception as e:
+            failure = str(e)
             logger.error(f"stdio receive loop error: {e}")
         finally:
+            self._stdout_buffer.clear()
             if self.state not in (MCPState.CLOSED, MCPState.DISCONNECTED):
                 self.state = MCPState.ERROR
-                self._fail_pending(f"MCP stdio server '{self.config.name}' exited")
+                self._fail_pending(
+                    failure
+                    or f"MCP stdio server '{self.config.name}' exited"
+                )
 
 
 # ======================================================================
@@ -1158,12 +1215,13 @@ class MCPClient:
                 url=s.get("url"),
                 headers=self._resolve_env(s.get("headers", {})),
                 api_key=s.get("api_key") or self._resolve_api_key(s),
-                timeout=s.get("timeout", 30.0),
+                timeout=s.get("timeout", self.config.get("timeout", 30.0)),
                 auto_reconnect=s.get("auto_reconnect", True),
                 max_reconnect_attempts=s.get("max_reconnect_attempts", 5),
                 enabled=True,
                 capabilities=s.get("capabilities", {}),
                 aws_credentials=s.get("aws_credentials", False),
+                max_message_bytes=self._resolve_max_message_bytes(s),
             ))
 
         # Format B: presets
@@ -1286,6 +1344,30 @@ class MCPClient:
         if env_var:
             return os.environ.get(env_var)
         return None
+
+    def _resolve_max_message_bytes(self, server_cfg: Dict[str, Any]) -> int:
+        """Resolve the per-frame stdio limit, tolerating bad config values."""
+        default = 64 * 1024 * 1024
+        raw = server_cfg.get(
+            "max_message_bytes",
+            self.config.get("max_message_bytes", default),
+        )
+        try:
+            value = int(raw)
+        except (TypeError, ValueError):
+            logger.warning(
+                "Invalid max_message_bytes %r for MCP server '%s'; using %d",
+                raw, server_cfg.get("name", "unnamed"), default,
+            )
+            return default
+        if value < 64 * 1024:
+            logger.warning(
+                "max_message_bytes for MCP server '%s' is below 64 KiB (%d); "
+                "using %d",
+                server_cfg.get("name", "unnamed"), value, default,
+            )
+            return default
+        return value
 
     # ------------------------------------------------------------------
     # LIFECYCLE

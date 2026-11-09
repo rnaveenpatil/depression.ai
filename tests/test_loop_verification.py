@@ -385,26 +385,59 @@ async def test_simple_shell_task_does_not_trigger_verification():
 
 
 @pytest.mark.asyncio
-async def test_simple_write_is_auto_verified_without_extra_llm_turn():
-    loop, agent, llm = make_loop([
-        tool_response(
-            ToolCall(
-                id="w1",
-                name="write",
-                arguments={"filePath": "hello.txt", "content": "hi"},
-            )
-        ),
-        text_response("Created hello.txt."),
-    ])
+async def test_simple_write_does_not_spend_an_extra_verification_turn():
+    loop, agent, llm = make_loop(
+        [
+            tool_response(
+                ToolCall(
+                    id="w1",
+                    name="write",
+                    arguments={"filePath": "hello.txt", "content": "hi"},
+                )
+            ),
+            text_response("Created hello.txt."),
+        ],
+        verification_mode="auto",
+    )
 
     result = await loop.run("create hello.txt")
 
     assert result["success"] is True, result
     assert llm.calls == 2
     assert loop.context.batch_verify_attempts == 0
-    assert loop.context.unverified_mutations == []
+    assert ("read", {"filePath": "hello.txt"}) not in agent.executed
+    assert "no tests or checks were run" in result["response"]
+
+
+@pytest.mark.asyncio
+async def test_explicit_verification_request_still_runs_a_check_turn():
+    loop, agent, llm = make_loop(
+        [
+            tool_response(
+                ToolCall(
+                    id="w1",
+                    name="write",
+                    arguments={"filePath": "hello.txt", "content": "hi"},
+                )
+            ),
+            text_response("Created hello.txt."),
+            tool_response(
+                ToolCall(
+                    id="r1", name="read",
+                    arguments={"filePath": "hello.txt"},
+                )
+            ),
+            text_response("Read it back: hi"),
+        ],
+        verification_mode="auto",
+    )
+
+    result = await loop.run("create hello.txt and verify it")
+
+    assert result["success"] is True, result
+    assert llm.calls == 4
+    assert loop.context.batch_verify_attempts == 1
     assert ("read", {"filePath": "hello.txt"}) in agent.executed
-    assert loop.context.metadata["auto_verified_targets"] == ["hello.txt"]
 
 
 @pytest.mark.asyncio

@@ -434,6 +434,7 @@ class ContextConfig:
     include_tool_outputs: bool = True
     recent_tool_outputs: int = 5
     recent_messages: int = 20
+    instructions: List[str] = field(default_factory=list)
 
 
 @dataclass
