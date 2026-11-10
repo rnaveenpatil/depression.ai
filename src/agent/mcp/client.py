@@ -102,6 +102,11 @@ class MCPServerConfig:
     max_reconnect_attempts: int = 5
     enabled: bool = True
     capabilities: Dict[str, Any] = field(default_factory=dict)
+    # Large catalogs (e.g. REA's 229 tools) can consume ~70k prompt tokens.
+    # "auto" exposes a small catalog directly and lazy-loads large ones.
+    tool_mode: Optional[str] = None  # None -> client-level default
+    allowed_tools: List[str] = field(default_factory=list)
+    disabled_tools: List[str] = field(default_factory=list)
     # Upper bound for a single stdio JSON-RPC frame. Some MCP servers (e.g.
     # REA with ~229 tools) emit multi-megabyte `tools/list` responses on one
     # line. asyncio's default 64 KiB StreamReader limit is far too small.
@@ -1168,6 +1173,18 @@ class MCPClient:
         self._health_task: Optional[asyncio.Task] = None
         self._heartbeat_interval = config.get("heartbeat_interval", 30.0)
 
+        # Lazy tool exposure. Large MCP catalogs are kept in memory but only
+        # a small direct set / on-demand activations reach the model prompt.
+        self.tool_mode = str(config.get("tool_mode", "auto")).strip().lower()
+        if self.tool_mode not in ("auto", "lazy", "all"):
+            self.tool_mode = "auto"
+        self.max_direct_tools = max(0, int(config.get("max_direct_tools", 12)))
+        self.max_direct_schema_chars = max(
+            0, int(config.get("max_direct_schema_chars", 24_000))
+        )
+        self.max_active_tools = max(1, int(config.get("max_active_tools", 12)))
+        self._active_tools: List[str] = []
+
         # The agent's ToolRegistry (set by initialize/register_tools_into).
         self._tool_registry: Any = None
         self.connection_errors: Dict[str, str] = {}
@@ -1220,6 +1237,9 @@ class MCPClient:
                 max_reconnect_attempts=s.get("max_reconnect_attempts", 5),
                 enabled=True,
                 capabilities=s.get("capabilities", {}),
+                tool_mode=s.get("tool_mode"),
+                allowed_tools=list(s.get("allowed_tools") or []),
+                disabled_tools=list(s.get("disabled_tools") or []),
                 aws_credentials=s.get("aws_credentials", False),
                 max_message_bytes=self._resolve_max_message_bytes(s),
             ))
@@ -1736,26 +1756,224 @@ class MCPClient:
         raise MCPError(f"Invalid MCP tool name: {full_name}")
 
     # ------------------------------------------------------------------
+    # LAZY TOOL EXPOSURE
+    # ------------------------------------------------------------------
+
+    def _server_cfg(self, server_name: str) -> Optional[MCPServerConfig]:
+        return next((c for c in self.servers_cfg if c.name == server_name), None)
+
+    @staticmethod
+    def _matches_tool_pattern(tool: Any, patterns: List[str]) -> bool:
+        for pattern in patterns:
+            value = str(pattern or "").strip()
+            if not value:
+                continue
+            if value in (
+                tool.name,
+                tool.full_name,
+                f"{tool.server}__{tool.name}",
+                f"{tool.server}:{tool.name}",
+            ):
+                return True
+        return False
+
+    def _tool_allowed(self, tool: Any) -> bool:
+        cfg = self._server_cfg(tool.server)
+        if cfg is not None:
+            if not cfg.enabled:
+                return False
+            if cfg.disabled_tools:
+                return not self._matches_tool_pattern(tool, cfg.disabled_tools)
+        return True
+
+    @staticmethod
+    def _tool_schema_chars(tool: Any) -> int:
+        payload = {
+            "name": tool.full_name,
+            "description": f"[{tool.server}] {tool.description}",
+            "parameters": tool.input_schema or {"type": "object", "properties": {}},
+        }
+        return len(json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
+
+    def _direct_names_for_server(self, cfg: MCPServerConfig) -> set[str]:
+        tools = [
+            t for t in self.tools.values()
+            if t.server == cfg.name and self._tool_allowed(t)
+        ]
+        always = {
+            t.full_name for t in tools
+            if cfg.allowed_tools and self._matches_tool_pattern(t, cfg.allowed_tools)
+        }
+        mode = (cfg.tool_mode or self.tool_mode or "auto").strip().lower()
+        if mode == "all":
+            return {t.full_name for t in tools}
+        if mode == "lazy":
+            return always
+        if (
+            len(tools) <= self.max_direct_tools
+            and sum(self._tool_schema_chars(t) for t in tools)
+            <= self.max_direct_schema_chars
+        ):
+            return {t.full_name for t in tools}
+        return always
+
+    def _exposed_tool_names(self) -> set[str]:
+        exposed: set[str] = set()
+        known_servers = {cfg.name for cfg in self.servers_cfg}
+        for cfg in self.servers_cfg:
+            # Skip disabled servers that may still linger in the tool map.
+            if not cfg.enabled:
+                continue
+            exposed.update(self._direct_names_for_server(cfg))
+        # Tools from a server no longer present in config: be conservative.
+        for tool in self.tools.values():
+            if tool.server not in known_servers and self._tool_allowed(tool):
+                exposed.add(tool.full_name)
+        exposed.update(
+            name for name in self._active_tools
+            if name in self.tools and self._tool_allowed(self.tools[name])
+        )
+        return exposed
+
+    def reset_active_tools(self) -> None:
+        """Drop tools activated by previous queries and re-sync the registry."""
+        self._active_tools.clear()
+        if self._tool_registry is not None:
+            self.register_tools_into(self._tool_registry)
+
+    def _normalise_tool_name(self, name: str) -> Optional[str]:
+        value = str(name or "").strip()
+        if not value:
+            return None
+        if value in self.tools:
+            return value
+        if value.startswith("mcp__"):
+            return value if value in self.tools else None
+        if ":" in value:
+            server, _, tool = value.partition(":")
+            candidate = f"mcp__{server}__{tool}"
+            return candidate if candidate in self.tools else None
+        if "__" in value:
+            candidate = f"mcp__{value}"
+            return candidate if candidate in self.tools else None
+        matches = [fn for fn, t in self.tools.items() if t.name == value]
+        return matches[0] if len(matches) == 1 else None
+
+    def activate_tool(self, name: str) -> Optional[str]:
+        """Expose one tool's full schema until the next query reset."""
+        full_name = self._normalise_tool_name(name)
+        if not full_name:
+            return None
+        tool = self.tools.get(full_name)
+        if tool is None or not self._tool_allowed(tool):
+            return None
+        if full_name not in self._active_tools:
+            self._active_tools.append(full_name)
+            if len(self._active_tools) > self.max_active_tools:
+                del self._active_tools[0]
+        if self._tool_registry is not None:
+            self.register_tools_into(self._tool_registry)
+        return full_name
+
+    def activate_tools(self, names: List[str]) -> List[str]:
+        activated = []
+        for name in names:
+            full_name = self.activate_tool(name)
+            if full_name:
+                activated.append(full_name)
+        return activated
+
+    def get_tool_schema(self, name: str) -> Optional[Dict[str, Any]]:
+        """Return one tool as an OpenAI-style function definition."""
+        full_name = self._normalise_tool_name(name)
+        if not full_name:
+            return None
+        tool = self.tools.get(full_name)
+        if tool is None:
+            return None
+        return {
+            "type": "function",
+            "function": {
+                "name": tool.full_name,
+                "description": f"[{tool.server}] {tool.description}",
+                "parameters": tool.input_schema or {
+                    "type": "object", "properties": {},
+                },
+            },
+        }
+
+    def search_tools(
+        self,
+        query: str = "",
+        server: Optional[str] = None,
+        limit: int = 10,
+    ) -> List[Dict[str, Any]]:
+        """Compact, on-demand tool search over the in-memory catalog."""
+        limit = max(1, min(int(limit or 10), 50))
+        candidates = [
+            t for t in self.tools.values()
+            if self._tool_allowed(t) and (not server or t.server == server)
+        ]
+        query = str(query or "").strip()
+        if query:
+            terms = re.findall(r"[a-z0-9_]+", query.lower())
+            scored = []
+            for tool in candidates:
+                name = tool.name.lower()
+                haystack = f"{tool.name} {tool.description}".lower()
+                score = sum(
+                    (3 if term in name else 1)
+                    for term in terms
+                    if term in haystack
+                )
+                if score:
+                    scored.append((score, tool))
+            scored.sort(key=lambda item: (-item[0], item[1].full_name))
+            candidates = [tool for _, tool in scored]
+        else:
+            candidates.sort(key=lambda tool: tool.full_name)
+
+        results = []
+        for tool in candidates[:limit]:
+            schema = tool.input_schema or {}
+            results.append({
+                "name": tool.full_name,
+                "tool": tool.name,
+                "server": tool.server,
+                "description": (tool.description or "")[:240],
+                "required": list(schema.get("required") or []),
+            })
+        return results
+
+    # ------------------------------------------------------------------
     # REGISTRATION INTO THE AGENT'S ToolRegistry
     # ------------------------------------------------------------------
 
     def register_tools_into(self, tool_registry: Any) -> int:
         """
-        Push every MCP tool into the agent's ToolRegistry as an external
-        tool. Idempotent — safe to call again after a reconnect or after
-        a `tools/list_changed` notification.
+        Push the currently exposed MCP tools into the agent's ToolRegistry.
 
-        Returns the number of tools successfully registered.
+        In `auto` mode small catalogs are registered directly; large catalogs
+        (e.g. REA's 229 tools) stay in memory and are exposed through the
+        `mcp` meta-tool until explicitly activated. Idempotent — safe to call
+        again after a reconnect or a `tools/list_changed` notification.
+
+        Returns the number of tools registered directly.
         """
         if tool_registry is None:
             return 0
 
-        # Drop stale MCP tools after failed reconnect or a server tool-list change.
+        exposed = self._exposed_tool_names()
+
+        # Drop stale/unexposed MCP tools after reconnect, config, or query reset.
         for old_name in tool_registry.list_tools():
-            if old_name.startswith("mcp__") and old_name not in self.tools:
+            if old_name.startswith("mcp__") and old_name not in exposed:
                 tool_registry.unregister_tool(old_name)
         count = 0
-        for full_name, tool in self.tools.items():
+        for full_name in exposed:
+            tool = self.tools.get(full_name)
+            if tool is None:
+                continue
             # Bind by default-arg to avoid late-binding closure bugs.
             async def _handler(_name: str = full_name, **kwargs):
                 return await self.call_tool(_name, kwargs)
@@ -1775,8 +1993,12 @@ class MCPClient:
                 count += 1
             except Exception as e:
                 logger.debug("Failed to register MCP tool %s: %s", full_name, e)
-        if count:
-            logger.info("Registered %d MCP tools into ToolRegistry", count)
+        hidden = len(self.tools) - count
+        logger.info(
+            "MCP tools exposed directly: %d, hidden behind mcp meta-tool: %d",
+            count, max(0, hidden),
+        )
+        self._tool_registry = tool_registry
         return count
 
     # ------------------------------------------------------------------

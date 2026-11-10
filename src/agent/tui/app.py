@@ -2913,6 +2913,38 @@ class DepressionApp(App):
         self.live_total_tokens = 0
         self._refresh_token_bar()
 
+    def _replay_session_history(self, session: Any) -> int:
+        """Render a resumed session's saved user/assistant turns."""
+        history = getattr(session, "history", None)
+        if history is None:
+            return 0
+        try:
+            entries = list(history.all()) if hasattr(history, "all") else list(history)
+        except Exception:
+            return 0
+
+        self._clear_transcript()
+        self.message_count = 0
+        last_user = ""
+        last_assistant = ""
+        for entry in entries:
+            role = getattr(entry, "role", "")
+            content = str(getattr(entry, "content", "") or "")
+            if not content.strip():
+                continue
+            if role == "user":
+                self._user(content)
+                last_user = content
+            elif role == "assistant":
+                self._write(content, "agent")
+                last_assistant = content
+
+        if last_user:
+            self._last_prompt = last_user
+        if last_assistant:
+            self._last_output = last_assistant
+        return len(entries)
+
     # ------------------------------------------------------------------
     # PERMISSION CONFIRMATION
     # ------------------------------------------------------------------
@@ -4021,10 +4053,7 @@ class DepressionApp(App):
 
         history = getattr(session, "history", None)
         count = len(history.all()) if hasattr(history, "all") else len(history or [])
-        self._clear_transcript()
-        self.message_count = count
-        self._last_output = ""
-        self._last_prompt = ""
+        self._replay_session_history(session)
         self._show_transcript()
         self._system(
             f"resumed session {self._session_title(session)} "

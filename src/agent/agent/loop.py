@@ -154,29 +154,6 @@ _EVIDENCE_COMMAND_RE = re.compile(
     re.I,
 )
 
-_COMPLEXITY_TOKENS = re.compile(
-    r"\b(refactor|migrate|architecture|across|multiple|all files|"
-    r"end-to-end|integration|performance|benchmark|parallel|concurren|"
-    r"database|schema|api|frontend|backend|deploy|release)\b",
-    re.I,
-)
-
-# [Verification auto] Explicit requests to check the work. Only these turn
-# on a verification round; ordinary edits are confirmed by the tool result.
-_VERIFY_REQUEST_RE = re.compile(
-    r"\b("
-    r"tests?|testing|pytest|unittest|"
-    r"verify|verification|validate|validation|"
-    r"lint|linting|typecheck|type-check|type check|"
-    r"compile|compiles|coverage|"
-    r"make sure|ensure|"
-    r"run .{0,30}\btests?\b|"
-    r"check (?:that|if|whether|the result)"
-    r")\b",
-    re.I,
-)
-
-
 # ----------------------------------------------------------------------
 # Bash/terminal fallback transforms
 # ----------------------------------------------------------------------
@@ -356,22 +333,6 @@ _DESTRUCTIVE_SHELL_PATTERNS = (
     re.compile(r"wget\b.*\|\s*(?:ba)?sh\b"),
 )
 
-_DEMO_OFFER_PATTERNS = (
-    re.compile(r"\bwould you like me to\b", re.I),
-    re.compile(r"\bwant me to (run|show|launch|demo|open|execute)\b", re.I),
-    re.compile(r"\bshall i (run|show|launch|demo|open|execute)\b", re.I),
-    re.compile(r"\bi can (run|show|launch|demo|open|execute)\b", re.I),
-    re.compile(r"\bready (for me )?to (run|show|launch|demo)\b", re.I),
-)
-
-_USER_DECLINED_PATTERNS = (
-    re.compile(r"\bno\b\s*,?\s*(thanks|thank you|thx)\b", re.I),
-    re.compile(r"\bdon'?t\b.*\b(run|launch|show)\b", re.I),
-    re.compile(r"\bnot?\b.*\b(run|launch|show)\b", re.I),
-    re.compile(r"\bjust\b.*\b(explain|tell me|describe)\b", re.I),
-)
-
-
 def _looks_destructive_call(name: str, args: Dict[str, Any]) -> bool:
     name_l = (name or "").lower()
 
@@ -470,7 +431,6 @@ class LoopContext:
 
     unverified_mutations: List[Dict[str, Any]] = field(default_factory=list)
     verification_nudges: int = 0
-    user_declined_demo: bool = False
     user_asked_to_show: bool = False
 
     # [NEW] Batch-verification bookkeeping. Up to MAX_BATCH_VERIFY_ATTEMPTS
@@ -786,6 +746,16 @@ class AgentLoop:
         logger.error("No schema provider found on tool registry")
         return []
 
+    def _reset_mcp_lazy_tools(self) -> None:
+        """Query-scoped reset for lazy MCP tools activated by a prior turn."""
+        mcp = getattr(self.agent, "mcp_client", None)
+        reset = getattr(mcp, "reset_active_tools", None)
+        if callable(reset):
+            try:
+                reset()
+            except Exception as exc:
+                logger.debug("MCP lazy tool reset failed: %s", exc)
+
     async def _ensure_mcp_health(self) -> None:
         """Re-register MCP tools and recover servers reported unhealthy.
 
@@ -1065,6 +1035,7 @@ class AgentLoop:
         self.verification = self._build_verification_controller()
         self._checkpoint_goal = query
         self._recovered_checkpoint = None
+        self._reset_mcp_lazy_tools()
         await self._ensure_mcp_health()
         try:
             from agent.context.checkpoint import TaskCheckpointStore
@@ -1098,13 +1069,8 @@ class AgentLoop:
         try:
             self.state = LoopState.INITIALIZING
 
-            # Do not route an unambiguous greeting into repository inspection.
-            greeting = bool(re.fullmatch(
-                r"\s*(?:hi|hello|hey|hiya|good morning|good evening|"
-                r"good afternoon|thanks|thank you|ok|okay)[!.\s]*",
-                query or "", re.I,
-            ))
-            self.context.metadata["direct_greeting"] = greeting
+            # The model owns the reply-vs-tool decision. Do not classify or
+            # rewrite the request with keyword/word matching.
             # Avoid extra intent/planning model requests for unambiguous questions.
             # Let the main model determine whether to answer or use tools.
             # No separate intent-classification or planning-decision API calls.
@@ -1113,19 +1079,7 @@ class AgentLoop:
             self.context.metadata.update({
                 "intent_needs_plan": False,
                 "requires_action": False,
-                # [Verification auto] Only run a verification round when the
-                # user explicitly asked for tests/checks.
-                "verification_requested": bool(
-                    _VERIFY_REQUEST_RE.search(query or "")
-                ),
             })
-
-            self.context.user_declined_demo = any(
-                p.search(query) for p in _USER_DECLINED_PATTERNS
-            )
-            if self.context.user_declined_demo:
-                self.context.user_asked_to_show = False
-
 
             if (
                 self.enable_plan_driven
@@ -1877,11 +1831,6 @@ class AgentLoop:
         max_local_turns = self.max_tool_calls_per_iteration * 2
         local_unverified: Dict[str, Dict[str, Any]] = {}
         local_verify_rounds = 0
-        task_actions = 0
-        action_required = bool(re.match(
-            r"^\s*(write|edit|modify|create|build|implement|fix|delete|"
-            r"install|deploy|update|execute|run)\b", task.description, re.I,
-        ))
 
         while local_turns < max_local_turns:
             local_turns += 1
@@ -1920,33 +1869,13 @@ class AgentLoop:
                 upper = content.upper()
                 if upper.startswith("TASK FAILED"):
                     return {"success": False, "retry": True, "error": content}
-                if action_required and not task_actions:
-                    if local_turns < max_local_turns:
-                        messages.append(Message(role="assistant", content=content))
-                        messages.append(Message(
-                            role="user",
-                            content=(
-                                "This task requires an actual action, but no tool "
-                                "has succeeded yet. Execute the required operation "
-                                "with the appropriate tool, or respond "
-                                "'TASK FAILED: <concrete blocker>'."
-                            ),
-                        ))
-                        continue
-                    return {
-                        "success": False, "retry": False,
-                        "error": "No successful tool action executed",
-                    }
-                # Task-local verification. Reads clear only the target they
-                # actually checked; the budget is per task, not global.
+                # Task-local verification runs only in explicit batch mode.
+                # Otherwise the model decides whether verification is needed.
+                needs_verify = self.verification_mode == "batch"
                 verify_budget = (
                     self.max_batch_verify_attempts
-                    if self.verification_mode == "batch"
+                    if needs_verify
                     else max(1, self.max_verification_nudges)
-                )
-                needs_verify = (
-                    self.verification_mode == "batch"
-                    or self.verification.verification_requested
                 )
                 if (
                     self.require_verification
@@ -2048,8 +1977,6 @@ class AgentLoop:
                 tool = x.get("tool", "")
                 if not r.get("success"):
                     continue
-                if not self._is_read_only(tool):
-                    task_actions += 1
                 tool_args = x.get("params") or {}
                 if self._is_read_only(tool):
                     target = _read_target(tool, tool_args)
@@ -2354,7 +2281,7 @@ You are depression.ai, an autonomous, general-purpose AI CLI agent. Understand t
 ## INTENT & EXECUTION
 - Understand the request, conversation history, context, constraints, and user expectations. Handle typos and follow-ups naturally.
 - Follow user intent, not rigid keywords or workflows. Decide whether to answer, investigate, execute, or combine them.
-- **Question:** Answer directly; use tools only when necessary.
+- **Question:** Decide whether the answer is already available or whether tools are needed, then act accordingly.
 - **Analyze/Review:** Inspect relevant information and report findings. Do not modify unless requested.
 - **Fix:** Identify the root cause and implement the necessary solution.
 - **Build/Edit:** Implement what the user requests without unnecessary additions.
@@ -2363,6 +2290,14 @@ You are depression.ai, an autonomous, general-purpose AI CLI agent. Understand t
 - Respect explicit restrictions, negations, and mixed requests.
 - When given creative freedom, explore innovative approaches and make independent decisions aligned with the user's goals.
 - Ask only when essential information or authorization is missing. Otherwise, use sensible defaults and proceed.
+
+## RESPONSE DECISION
+- Before responding, analyze the request and the conversation.
+- Decide for yourself whether to answer directly, ask a clarifying question, or use one or more tools.
+- No fixed rule forces a tool, and no fixed rule forces a direct answer. Choose what best serves the request.
+- A social message or a question already answerable from what you know can be answered directly.
+- A request that depends on files, commands, current state, or an action usually needs the appropriate tool.
+- You own this decision. Use your judgment, then respond naturally.
 
 ## REASONING & TOOLS
 - Reason independently, creatively, and logically. Adapt your strategy to the task.
@@ -2527,26 +2462,12 @@ Understand → State intent → Plan when useful → Act → Observe → Verify 
     # PLANNING
     # ==================================================================
 
-    def _is_simple_task(self, q: str, intent: str = "unknown") -> bool:
-        """Skip planning overhead for short read-only asks."""
-        text = (q or "").strip()
-        if not text:
-            return True
-        if intent not in ("question", "chat"):
-            return False
-        if _COMPLEXITY_TOKENS.search(text):
-            return False
-        words = re.findall(r"[A-Za-z0-9_]+", text)
-        return len(words) <= 10
-
     async def _should_plan(self, q: str, intent: str = "unknown") -> bool:
-        """Use model judgment, not keyword and word-count heuristics."""
+        """Let the model decide whether a separate plan is useful."""
         value = self.context.metadata.get("intent_needs_plan")
         if isinstance(value, bool):
             return value
         if not (q or "").strip():
-            return False
-        if self._is_simple_task(q, intent):
             return False
         try:
             self.context.llm_calls += 1
@@ -3065,10 +2986,8 @@ Understand → State intent → Plan when useful → Act → Observe → Verify 
     # ==================================================================
 
     def _get_available_tools(self) -> List[Dict[str, Any]]:
-        # Obvious greetings need no tool schemas or tool-selection opportunities.
-        # Keep all tools available for real tasks, including investigative ones.
-        if self.context.metadata.get("direct_greeting"):
-            return []
+        # Advertise the full tool set and let the model decide whether the
+        # request needs a tool or a direct answer.
         return self._registry_get_schemas()
 
     async def _get_state_context(self) -> Dict[str, Any]:
@@ -3805,14 +3724,9 @@ Understand → State intent → Plan when useful → Act → Observe → Verify 
         return m.start() < _UNVERIFIED_MAX_POS
 
     def _pending_verification_entries(self) -> List[Dict[str, Any]]:
-        if self.verification_mode == "off":
+        if self.verification_mode != "batch":
             return []
-        if (
-            self.verification_mode == "auto"
-            and not self.verification.verification_requested
-        ):
-            return []
-        if self.reuse_test_evidence and self.verification_mode != "batch":
+        if self.reuse_test_evidence:
             self.verification.refresh_from_evidence()
         return self.verification.pending
 
@@ -4061,11 +3975,6 @@ Understand → State intent → Plan when useful → Act → Observe → Verify 
             return True
         if self.context.intent == "question":
             return True
-        if self.context.user_declined_demo:
-            return True
-        for pat in _DEMO_OFFER_PATTERNS:
-            if pat.search(text):
-                return True
         return False
 
     async def _ensure_demo_offer(self, text: str) -> str:

@@ -89,17 +89,6 @@ class VerificationController:
         return self.mode != "off"
 
     @property
-    def verification_requested(self) -> bool:
-        """True when the user explicitly asked for tests/checks.
-
-        In ``auto`` mode the harness never spends an extra model turn unless
-        this is set. Tool success plus a changed-file note is the default
-        evidence for a small edit.
-        """
-        metadata = getattr(self.context, "metadata", {}) or {}
-        return bool(metadata.get("verification_requested"))
-
-    @property
     def pending(self) -> List[Dict[str, Any]]:
         if not self.enabled:
             return []
@@ -252,11 +241,9 @@ class VerificationController:
             return False
         if not self.enabled:
             return False
-        # Auto mode is demand-driven: no verification turn unless the user
-        # explicitly asked for tests/checks. Batch keeps the old behavior.
-        if self.mode == "auto" and not self.verification_requested:
-            return False
-        if self.mode not in ("auto", "batch"):
+        # Only explicit batch mode forces a verification turn. In auto mode
+        # the model decides whether to run checks.
+        if self.mode != "batch":
             return False
         self.refresh_from_evidence()
         if not self.pending:
@@ -293,17 +280,17 @@ class VerificationController:
         if self.mode == "off" or not pending:
             return text, False
 
-        # Auto mode without an explicit request: do not fail the task and do
-        # not force another turn. Tell the user plainly that no checks ran.
-        if self.mode == "auto" and not self.verification_requested:
+        # Auto mode never forces another turn. Tell the user plainly that no
+        # checks ran so unverified changes are never implied to be tested.
+        if self.mode == "auto":
             if (getattr(self.context, "metadata", {}) or {}).get(
                 "verification_note_emitted"
             ):
                 return text, False
             self.context.metadata["verification_note_emitted"] = True
             note = (
-                "\n\nVerification: no tests or checks were run because none "
-                "were requested. The file changes were saved successfully."
+                "\n\nVerification: no tests or checks were run for these "
+                "changes. The file changes were saved successfully."
             )
             if not text.strip():
                 return note.lstrip("\n"), False

@@ -198,14 +198,13 @@ class Agent:
                 await self.tool_registry.register_tool(tool)
 
             if self.mcp_client is not None:
-                for tool_def in self.mcp_client.list_tools():
-                    fn = tool_def["function"]
-                    self.tool_registry.register_external(
-                        name=fn["name"],
-                        description=fn["description"],
-                        parameters=fn["parameters"],
-                        handler=lambda name=fn["name"], **kw: self.mcp_client.call_tool(name, kw),
-                    )
+                self.mcp_client.register_tools_into(self.tool_registry)
+                # Lazy mode needs the meta-tool even when the allowlist is explicit.
+                if (
+                    "mcp" not in self.tool_registry.tools
+                    and "mcp" not in disabled
+                ):
+                    await self.tool_registry.register_tool(MCPTool(self.mcp_client))
 
             from agent.agent.planner import Planner
             self.planner = Planner(

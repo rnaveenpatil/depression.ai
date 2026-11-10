@@ -22,7 +22,6 @@ from __future__ import annotations
 import inspect
 import asyncio
 import json
-import re
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -301,25 +300,13 @@ class BaseAgent:
             await self.tool_registry.register_tool(tool)
 
         if self.role == AgentRole.BUILD and self.mcp_client is not None:
-            for tool_def in self.mcp_client.list_tools():
-                fn = tool_def["function"]
-                name = fn["name"]
-                is_aws = name.startswith("mcp__aws__")
-                self.tool_registry.register_external(
-                    name=name,
-                    description=fn["description"],
-                    parameters=fn["parameters"],
-                    handler=lambda name=name, **kw: self.mcp_client.call_tool(name, kw),
-                    read_only=(
-                        self.role == AgentRole.PLAN
-                        or "list" in name or "get" in name or "describe" in name
-                    ),
-                    mutating=(
-                        "create" in name or "put" in name or "delete" in name
-                        or "update" in name or "modify" in name
-                    ),
-                    category="cloud" if is_aws else "misc",
-                )
+            self.mcp_client.register_tools_into(self.tool_registry)
+            # Lazy mode needs the meta-tool even when the allowlist is explicit.
+            if (
+                "mcp" not in self.tool_registry.tools
+                and "mcp" not in disabled
+            ):
+                await self.tool_registry.register_tool(MCPTool(self.mcp_client))
             # Notifications and automatic reconnection must update the same
             # Build registry that the LLM actually uses, not an orphan copy.
             self.mcp_client._tool_registry = self.tool_registry
@@ -1008,37 +995,6 @@ class AgentCoordinator:
         except Exception as exc:
             logger.debug("Plan event emit failed: %s", exc)
 
-    @staticmethod
-    def _is_multi_step(query: str) -> bool:
-        """Conservative check for whether a planning call is worth it.
-
-        Simple one-shot asks stay on the fast free-form path. Only clearly
-        coordinated work spends a planning model call in Auto mode.
-        """
-        text = (query or "").strip()
-        if not text:
-            return False
-        if re.search(
-            r"\b(refactor|migrate|across|multiple|all files|end-to-end|"
-            r"integration|rewrite|redesign|architecture)\b",
-            text,
-            re.I,
-        ):
-            return True
-        action = (
-            r"(?:add|create|implement|fix|update|change|remove|delete|"
-            r"move|rename|refactor|test|verify|run|build|install|document)"
-        )
-        actions = re.findall(rf"\b{action}\b", text, re.I)
-        connector = re.search(
-            r"\b(and|then|also|after|finally|plus|followed by)\b", text, re.I
-        )
-        if len(actions) >= 2 and connector:
-            return True
-        if len(text.split()) >= 25 and len(actions) >= 2:
-            return True
-        return False
-
     async def _plan_only(
         self, query: str, context: Optional[Dict[str, Any]]
     ) -> Optional[Dict[str, Any]]:
@@ -1143,7 +1099,7 @@ class AgentCoordinator:
 
         plan = None
         plan_text = ""
-        if planner is not None and self._is_multi_step(query):
+        if planner is not None:
             try:
                 plan = await planner.create_plan(
                     goal=query, context=current_context,

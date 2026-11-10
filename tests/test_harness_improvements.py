@@ -186,12 +186,6 @@ def test_checkpoint_records_actions_discoveries_and_decisions():
     assert checkpoint["decisions"] == ["Use the existing helper"]
 
 
-def test_simple_read_only_tasks_skip_planning_llm():
-    loop, _agent = make_loop([text_response("done")])
-    assert loop._is_simple_task("what does a.py do?", "question") is True
-    assert loop._is_simple_task("refactor all modules", "refactor") is False
-
-
 @pytest.mark.asyncio
 async def test_state_context_recommends_search_before_edit():
     loop, _agent = make_loop([text_response("done")])

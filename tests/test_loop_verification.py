@@ -410,7 +410,7 @@ async def test_simple_write_does_not_spend_an_extra_verification_turn():
 
 
 @pytest.mark.asyncio
-async def test_explicit_verification_request_still_runs_a_check_turn():
+async def test_verification_keywords_do_not_force_a_check_turn():
     loop, agent, llm = make_loop(
         [
             tool_response(
@@ -421,13 +421,6 @@ async def test_explicit_verification_request_still_runs_a_check_turn():
                 )
             ),
             text_response("Created hello.txt."),
-            tool_response(
-                ToolCall(
-                    id="r1", name="read",
-                    arguments={"filePath": "hello.txt"},
-                )
-            ),
-            text_response("Read it back: hi"),
         ],
         verification_mode="auto",
     )
@@ -435,9 +428,10 @@ async def test_explicit_verification_request_still_runs_a_check_turn():
     result = await loop.run("create hello.txt and verify it")
 
     assert result["success"] is True, result
-    assert llm.calls == 4
-    assert loop.context.batch_verify_attempts == 1
-    assert ("read", {"filePath": "hello.txt"}) in agent.executed
+    assert llm.calls == 2
+    assert loop.context.batch_verify_attempts == 0
+    assert [name for name, _args in agent.executed] == ["write"]
+    assert "no tests or checks were run" in result["response"]
 
 
 @pytest.mark.asyncio
@@ -509,20 +503,18 @@ async def test_repeated_reads_stop_without_indefinite_loop():
 
 
 @pytest.mark.asyncio
-async def test_greeting_does_not_expose_tools_or_invoke_file_reads():
+async def test_greeting_keeps_tools_available_and_answers_without_using_them():
     loop, agent, _llm = make_loop([text_response("Hello!")])
     result = await loop.run("hello")
     assert result["success"] is True
     assert agent.executed == []
-    assert loop.context.metadata["direct_greeting"] is True
-    assert loop._get_available_tools() == []
+    assert loop._get_available_tools()
 
 
 @pytest.mark.asyncio
 async def test_coding_request_keeps_all_tools_available():
     loop, _agent, _llm = make_loop([text_response("ready")])
     await loop.run("fix the parser bug")
-    assert loop.context.metadata["direct_greeting"] is False
     assert loop._get_available_tools()
 
 

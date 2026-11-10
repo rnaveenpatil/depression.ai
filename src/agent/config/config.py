@@ -578,6 +578,12 @@ class MCPConfig:
     enabled: bool = False
     servers: List[Dict[str, Any]] = field(default_factory=list)
     timeout: float = 99999.0
+    # "auto" exposes small catalogs directly and lazy-loads large ones;
+    # "lazy" always hides tools behind the `mcp` meta-tool; "all" is legacy.
+    tool_mode: str = "auto"
+    max_direct_tools: int = 12
+    max_direct_schema_chars: int = 24_000
+    max_active_tools: int = 12
 
 
 @dataclass

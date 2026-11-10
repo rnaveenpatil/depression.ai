@@ -299,3 +299,47 @@ def test_default_turn_timeout_is_one_hour(monkeypatch):
     monkeypatch.delenv("TUI_TURN_TIMEOUT", raising=False)
     app = DepressionApp(coordinator=None)
     assert app.turn_timeout == 3600.0
+
+
+@pytest.mark.asyncio
+async def test_resume_session_replays_saved_transcript():
+    from types import SimpleNamespace
+
+    from agent.session.session import Session
+
+    session = Session(name="previous")
+    session.add_user_message("previous question")
+    session.add_assistant_message("previous answer")
+
+    class _FakeSessionManager:
+        async def load_session(self, session_id):
+            return session if session_id == session.id else None
+
+    class _FakeContext:
+        async def load_from_session(self, loaded):
+            return len(loaded.history.all())
+
+    context = _FakeContext()
+    coordinator = SimpleNamespace(
+        plan_agent=SimpleNamespace(session=None, context_manager=context),
+        build_agent=SimpleNamespace(session=None, context_manager=context),
+    )
+    app = DepressionApp(
+        coordinator=coordinator,
+        session_manager=_FakeSessionManager(),
+        skip_onboarding=True,
+    )
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await app._resume_session(session.id)
+        await pilot.pause()
+        rendered = " ".join(
+            str(node.render()) for node in app.query_one("#transcript").children
+        )
+
+    assert "previous question" in rendered
+    assert "previous answer" in rendered
+    assert app.message_count == 1
+    assert app._last_prompt == "previous question"
+    assert app._last_output == "previous answer"

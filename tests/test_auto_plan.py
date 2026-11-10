@@ -80,7 +80,7 @@ async def test_auto_mode_plans_once_then_runs_a_single_build_loop():
 
 
 @pytest.mark.asyncio
-async def test_auto_mode_skips_planning_for_a_simple_question():
+async def test_auto_mode_always_plans_without_keyword_classification():
     planner_calls = []
     build_calls = []
 
@@ -95,9 +95,9 @@ async def test_auto_mode_skips_planning_for_a_simple_question():
         "What is Python?", mode="auto", auto_execute=True,
     )
 
-    assert planner_calls == []
-    assert build_calls[0]["initial_plan"] is None
-    assert result["plan"] is None
+    assert planner_calls == ["What is Python?"]
+    assert build_calls[0]["initial_plan"] is not None
+    assert result["plan"] is not None
     assert result["success"] is True
 
 
