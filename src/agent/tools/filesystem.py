@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from agent.tools.registry import BaseTool
+from agent.utils.file_walk import WalkStats, glob_match, walk_paths
 from agent.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -51,6 +52,14 @@ def _err(error: str, *, recoverable: bool = True,
 
 def _sha256_bytes(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 class FileSystemTool(BaseTool):
@@ -82,6 +91,10 @@ class FileSystemTool(BaseTool):
             "start_line": {"type": "integer", "minimum": 1, "description": "Optional 1-based first line to read; use with end_line."},
             "end_line": {"type": "integer", "minimum": 1, "description": "Optional inclusive last line; defaults to start_line + 99."},
             "max_files": {"type": "integer", "default": 500},
+            "max_seconds": {
+                "type": "number", "default": 5.0,
+                "description": "Wall-clock limit for recursive listing.",
+            },
             "include_diff": {
                 "type": "boolean",
                 "default": True,
@@ -412,6 +425,7 @@ class FileSystemTool(BaseTool):
         include_diff = bool(params.get("include_diff", True))
         before = ""
         existed = target.exists()
+        before_size: Optional[int] = None
 
         if existed and target.is_dir():
             return _err(f"Cannot write: {target} is a directory",
@@ -420,7 +434,16 @@ class FileSystemTool(BaseTool):
         if existed and not target.is_file():
             return _err(f"Cannot write: {target} is not a regular file")
 
-        if include_diff and existed and target.is_file():
+        if existed and target.is_file():
+            try:
+                before_size = target.stat().st_size
+            except OSError:
+                before_size = None
+
+        # Only read the old side when it can actually fit in the diff payload.
+        if (include_diff and existed and target.is_file()
+                and before_size is not None
+                and before_size <= DIFF_SIZE_CAP):
             try:
                 before = target.read_text(encoding="utf-8", errors="replace")
             except Exception:
@@ -447,9 +470,16 @@ class FileSystemTool(BaseTool):
         except Exception as e:
             return _err(f"Failed to write {target}: {e}")
 
-        after_sha = _sha256_bytes(data) if mode == "w" else _sha256_bytes(
-            (before.encode("utf-8") if before else b"") + data
-        )
+        if mode == "w":
+            after_sha = _sha256_bytes(data)
+        else:
+            # Hash the final file on disk.  This is streaming and remains
+            # correct even when diff capture is disabled or the old file is
+            # larger than the diff cap.
+            try:
+                after_sha = await asyncio.to_thread(_sha256_file, target)
+            except Exception:
+                after_sha = None
 
         result: Dict[str, Any] = {
             "success": True,
@@ -460,11 +490,18 @@ class FileSystemTool(BaseTool):
             "after_sha256": after_sha,
         }
         if include_diff:
-            try:
-                after = target.read_text(encoding="utf-8", errors="replace")
-            except Exception:
-                after = ""
-            if len(before.encode("utf-8")) <= DIFF_SIZE_CAP and len(after.encode("utf-8")) <= DIFF_SIZE_CAP:
+            after_size = (
+                len(data) if mode == "w"
+                else (before_size or 0) + len(data)
+            )
+            if (
+                (before_size is None or before_size <= DIFF_SIZE_CAP)
+                and after_size <= DIFF_SIZE_CAP
+            ):
+                try:
+                    after = target.read_text(encoding="utf-8", errors="replace")
+                except Exception:
+                    after = ""
                 result["before"] = before
                 result["after"] = after
             else:
@@ -486,6 +523,8 @@ class FileSystemTool(BaseTool):
                         suggestion="Pass {'action':'edit','path':...,'old':...,'new':...}.")
         if not isinstance(old, str) or not isinstance(new, str):
             return _err("'old' and 'new' must be strings")
+        if old == "":
+            return _err("'old' must not be empty")
 
         if not target.exists():
             return _err(f"File not found: {target}",
@@ -576,30 +615,58 @@ class FileSystemTool(BaseTool):
                     "count": 1}
 
         recursive = bool(params.get("recursive", False))
-        pattern = params.get("pattern", "*")
-        max_files = int(params.get("max_files", 500))
-
-        iterator = target.rglob(pattern) if recursive else target.glob(pattern)
-        entries: List[Dict[str, Any]] = []
+        pattern = params.get("pattern") or "*"
         try:
-            for p in iterator:
-                try:
-                    st = p.stat()
-                    entries.append({
-                        "path": str(p.relative_to(target)),
-                        "type": "dir" if p.is_dir() else "file",
-                        "size": st.st_size if p.is_file() else None,
-                    })
-                    if len(entries) >= max_files:
-                        break
-                except Exception:
-                    continue
+            max_files = max(1, int(params.get("max_files", 500)))
+            max_seconds = max(0.05, float(params.get("max_seconds", 5.0)))
+        except (TypeError, ValueError):
+            return _err("max_files and max_seconds must be numbers")
+
+        def _collect() -> tuple[List[Dict[str, Any]], WalkStats]:
+            stats = WalkStats()
+
+            def accept(rel: str, name: str, is_dir: bool) -> bool:
+                # Path.rglob() applies the pattern to each basename, while
+                # path-form patterns (e.g. src/*.py) also need a full match.
+                return glob_match(name, pattern) or glob_match(rel, pattern)
+
+            if recursive or "**" in pattern:
+                max_depth = None
+            else:
+                max_depth = pattern.count("/")
+
+            entries: List[Dict[str, Any]] = []
+            for item in walk_paths(
+                target,
+                recursive=True,
+                max_results=max_files,
+                max_seconds=max_seconds,
+                max_depth=max_depth,
+                accept=accept,
+                stats=stats,
+            ):
+                entries.append({
+                    "path": item.relative,
+                    "type": "dir" if item.is_dir else "file",
+                    "size": item.size,
+                })
+            return entries, stats
+
+        try:
+            entries, stats = await asyncio.to_thread(_collect)
         except PermissionError:
             return _err(f"Permission denied listing {target}", recoverable=False)
+        except OSError as exc:
+            return _err(f"Failed to list {target}: {exc}")
 
-        return {"success": True, "path": str(target),
-                "entries": entries, "count": len(entries),
-                "truncated": len(entries) >= max_files}
+        return {
+            "success": True,
+            "path": str(target),
+            "entries": entries,
+            "count": len(entries),
+            "truncated": stats.truncated,
+            "truncated_reason": stats.reason or None,
+        }
 
     # ------------------------------------------------------------------
     # STAT

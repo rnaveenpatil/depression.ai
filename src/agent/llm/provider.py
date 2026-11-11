@@ -429,7 +429,6 @@ class LLMProvider(ABC):
         messages: Sequence[Message],
         *,
         model: Optional[str] = None,
-        temperature: float = 0.1,
         max_tokens: int = 4096,
         tools: Optional[Sequence[ToolSpec]] = None,
         tool_choice: Optional[str] = None,

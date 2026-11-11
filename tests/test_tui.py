@@ -343,3 +343,52 @@ async def test_resume_session_replays_saved_transcript():
     assert app.message_count == 1
     assert app._last_prompt == "previous question"
     assert app._last_output == "previous answer"
+
+
+@pytest.mark.asyncio
+async def test_loop_progress_warning_surfaces_in_thinking_bar():
+    from agent.tui.events import AgentEvent
+
+    app = DepressionApp(coordinator=None)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app._set_busy_visual(True)
+        await app._on_loop_progress(AgentEvent("on_loop_progress", {
+            "progress": False,
+            "warning": True,
+            "stopping": False,
+            "streak": 3,
+            "cap": 6,
+            "message": "no progress 3/6",
+        }))
+        thinking = app.query_one("#thinking-bar")
+        assert thinking._detail == "no progress 3/6"
+        assert thinking._alert is True
+
+        await app._on_loop_progress(AgentEvent("on_loop_progress", {
+            "progress": True,
+            "warning": False,
+            "stopping": False,
+            "message": "",
+        }))
+        assert thinking._detail == ""
+        assert thinking._alert is False
+        app._set_busy_visual(False)
+
+
+@pytest.mark.asyncio
+async def test_todo_panel_shows_progress_header():
+    app = DepressionApp(coordinator=None)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        panel = app.query_one("#panel-todo")
+        panel.set_entries([
+            {"content": "one", "status": "completed"},
+            {"content": "two", "status": "pending", "priority": 1},
+        ])
+        await pilot.pause()
+        header = str(app.query_one("#todo-header").render())
+        body = str(app.query_one("#todo-body").render())
+        assert "1/2" in header and "50%" in header
+        assert "P1" in body
+        assert "1/2 done" not in body

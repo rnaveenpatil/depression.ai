@@ -364,7 +364,6 @@ class Compactor:
                         ),
                     ),
                 ],
-                temperature=0.1,
                 max_tokens=self.max_summary_tokens,
             )
             text = getattr(result, "content", None) or str(result)

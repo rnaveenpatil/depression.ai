@@ -7,7 +7,7 @@ with the same interface as native tools.
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 from agent.tools.registry import BaseTool
 from agent.utils.logging import get_logger
@@ -34,7 +34,11 @@ class MCPTool(BaseTool):
                 "description": "Keywords for search (e.g. 'jira issue create')",
             },
             "tool": {"type": "string", "description": "Tool name for call/info"},
-            "arguments": {"type": "object", "description": "Arguments for call"},
+            "arguments": {
+                "type": "object",
+                "description": "Arguments for call",
+                "additionalProperties": True,
+            },
             "server": {"type": "string", "description": "Filter by server"},
             "limit": {
                 "type": "integer",
@@ -58,8 +62,11 @@ class MCPTool(BaseTool):
 
         action = params.get("action", "search")
         server = params.get("server")
-        limit = params.get("limit", 10)
-        query = params.get("query", "")
+        try:
+            limit = max(1, min(int(params.get("limit", 10)), 50))
+        except (TypeError, ValueError):
+            return {"success": False, "error": "limit must be an integer"}
+        query = str(params.get("query", ""))
         total = len(getattr(self.mcp_client, "tools", {}) or {})
 
         if action in ("search", "list"):
@@ -105,6 +112,8 @@ class MCPTool(BaseTool):
             args = params.get("arguments", {})
             if not name:
                 return {"success": False, "error": "call requires 'tool'"}
+            if not isinstance(args, dict):
+                return {"success": False, "error": "arguments must be an object"}
             resolved = self.mcp_client.activate_tool(name)
             if not resolved:
                 return {"success": False, "error": f"Unknown MCP tool: {name}"}

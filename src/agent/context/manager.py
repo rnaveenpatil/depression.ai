@@ -913,7 +913,6 @@ class ContextManager:
                     Message(role="system", content=prompt),
                     Message(role="user", content="Summarise."),
                 ],
-                temperature=0.2,
                 max_tokens=500,
             )
             text = (getattr(response, "content", "") or "").strip()

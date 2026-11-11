@@ -11,13 +11,14 @@ TUI can render an inline diff without the caller having to opt in.
 
 from __future__ import annotations
 
-import glob as _glob
+import asyncio
 import os
-import re
+import tempfile
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 from agent.tools.registry import BaseTool
+from agent.utils.file_walk import WalkStats, glob_match, walk_paths
 from agent.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -37,6 +38,11 @@ class BashTool(BaseTool):
             "cwd": {"type": "string", "description": "Working directory (alias)"},
             "timeout": {"type": "number", "default": 60},
             "description": {"type": "string", "description": "Human-readable description"},
+            "include_aws_credentials": {
+                "type": "boolean",
+                "default": False,
+                "description": "Opt in to injecting saved AWS credentials",
+            },
         },
         "required": ["command"],
     }
@@ -64,6 +70,8 @@ class BashTool(BaseTool):
             p["shell"] = params["shell"]
         if "env" in params:
             p["env"] = params["env"]
+        if params.get("include_aws_credentials"):
+            p["include_aws_credentials"] = True
         return await self._inner.execute(p)
 
 
@@ -97,23 +105,41 @@ class ReadTool(BaseTool):
         path = params.get("filePath") or params.get("path") or ""
         if not path:
             return {"success": False, "error": "read requires filePath"}
-        limit = params.get("limit")
-        offset = params.get("offset", 0)
-        res = await self._inner.execute({"action": "read", "path": path})
-        if not res.get("success"):
-            return res
-        content = res.get("content", "")
-        if limit is not None or offset:
-            lines = content.splitlines()
-            try:
-                off = int(offset or 0)
-                lim = int(limit) if limit is not None else None
-                sliced = lines[off: off + lim if lim is not None else None]
-                content = "\n".join(sliced)
-            except Exception:
-                pass
-            res["content"] = content
-        return res
+
+        try:
+            offset = max(0, int(params.get("offset", 0) or 0))
+            limit = (
+                int(params["limit"]) if params.get("limit") is not None else None
+            )
+        except (TypeError, ValueError):
+            return {"success": False, "error": "offset and limit must be integers"}
+        if limit is not None and limit < 0:
+            return {"success": False, "error": "limit must be >= 0"}
+
+        inner: Dict[str, Any] = {"action": "read", "path": path}
+        if limit == 0:
+            checked = await self._inner.execute({"action": "stat", "path": path})
+            if not checked.get("success"):
+                return checked
+            return {
+                "success": True,
+                "path": checked.get("path", path),
+                "type": checked.get("type"),
+                "content": "",
+                "truncated": False,
+            }
+        if limit is not None:
+            # offset is 0-indexed; filesystem line ranges are 1-indexed.
+            inner["start_line"] = offset + 1
+            inner["end_line"] = offset + limit
+        elif offset:
+            # Preserve the "read from offset to end" behavior while letting
+            # FileSystemTool stream from the requested line instead of loading
+            # the first 32 KB and slicing it in memory.
+            inner["start_line"] = offset + 1
+            inner["end_line"] = 2**31 - 1
+
+        return await self._inner.execute(inner)
 
 
 class WriteTool(BaseTool):
@@ -193,8 +219,8 @@ class EditTool(BaseTool):
         replace_all = bool(params.get("replaceAll", False))
         if not path:
             return {"success": False, "error": "edit requires filePath"}
-        if old == "" and new == "":
-            return {"success": False, "error": "edit requires oldString/newString"}
+        if old == "":
+            return {"success": False, "error": "edit requires a non-empty oldString"}
         p: Dict[str, Any] = {
             "action": "edit",
             "path": path,
@@ -254,6 +280,61 @@ class ApplyPatchTool(BaseTool):
 
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _write_bytes_atomic(
+        target: Path, data: bytes, mode: Optional[int] = None
+    ) -> None:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp_name = tempfile.mkstemp(prefix=".patch-", dir=str(target.parent))
+        tmp = Path(tmp_name)
+        try:
+            with os.fdopen(fd, "wb") as fh:
+                fh.write(data)
+                fh.flush()
+                os.fsync(fh.fileno())
+            if mode is not None:
+                os.chmod(tmp, mode)
+            os.replace(tmp, target)
+        except Exception:
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+            raise
+
+    @staticmethod
+    def _snapshot_path(
+        snapshots: Dict[Path, Dict[str, Any]], path: Path
+    ) -> None:
+        if path in snapshots:
+            return
+        if path.is_file():
+            stat = path.stat()
+            snapshots[path] = {
+                "kind": "file",
+                "data": path.read_bytes(),
+                "mode": stat.st_mode & 0o7777,
+            }
+        elif path.is_dir():
+            snapshots[path] = {"kind": "dir"}
+        elif path.exists():
+            snapshots[path] = {"kind": "other"}
+        else:
+            snapshots[path] = {"kind": "missing"}
+
+    def _rollback(self, snapshots: Dict[Path, Dict[str, Any]]) -> List[str]:
+        errors: List[str] = []
+        for path, snap in reversed(list(snapshots.items())):
+            try:
+                if snap["kind"] == "missing":
+                    if path.is_file() or path.is_symlink():
+                        path.unlink()
+                elif snap["kind"] == "file":
+                    self._write_bytes_atomic(path, snap["data"], snap["mode"])
+            except Exception as exc:
+                errors.append(f"{path}: {exc}")
+        return errors
+
     async def _apply_marker_patch(
         self, patch_text: str, include_diff: bool = True
     ) -> Dict[str, Any]:
@@ -262,14 +343,35 @@ class ApplyPatchTool(BaseTool):
             return {"success": False, "error": "No file sections found in patch"}
 
         results: List[Dict[str, Any]] = []
+        snapshots: Dict[Path, Dict[str, Any]] = {}
+        applied: List[Dict[str, Any]] = []
         for section in sections:
             try:
+                paths = [self._inner._resolve(section["path"])]  # type: ignore[attr-defined]
+                if section.get("move_to"):
+                    paths.append(self._inner._resolve(section["move_to"]))  # type: ignore[attr-defined]
+                for path in paths:
+                    self._snapshot_path(snapshots, path)
                 result = await self._apply_section(section, include_diff=include_diff)
             except Exception as e:
                 result = {"success": False, "path": section["path"], "error": str(e)}
             results.append(result)
+            if result.get("success"):
+                applied.append(result)
+                continue
 
-        ok = all(r.get("success") for r in results)
+            rollback_errors = self._rollback(snapshots)
+            for previous in applied:
+                previous["success"] = False
+                previous["rolled_back"] = True
+                previous.setdefault(
+                    "error", "rolled back because a later file section failed"
+                )
+            if rollback_errors:
+                result["rollback_errors"] = rollback_errors
+            break
+
+        ok = bool(results) and all(r.get("success") for r in results)
         return {"success": ok, "results": results}
 
     def _split_sections(self, patch_text: str) -> List[Dict[str, Any]]:
@@ -322,76 +424,75 @@ class ApplyPatchTool(BaseTool):
         target = self._inner._resolve(path)  # type: ignore[attr-defined]
 
         if action == "add":
+            if target.exists():
+                return {
+                    "success": False,
+                    "path": str(target),
+                    "error": "Add File target already exists",
+                }
             content = self._decode_add_lines(section["lines"])
-            target.parent.mkdir(parents=True, exist_ok=True)
-            before = ""
-            existed = target.exists()
-            if include_diff and existed and target.is_file():
-                try:
-                    before = target.read_text(encoding="utf-8", errors="replace")
-                except Exception:
-                    before = ""
-            target.write_text(content, encoding="utf-8")
+            self._inner._write_atomic(target, content)  # type: ignore[attr-defined]
             entry: Dict[str, Any] = {
                 "success": True,
                 "path": str(target),
                 "action": "add",
                 "bytes_written": len(content.encode("utf-8")),
+                "created": True,
             }
-            if include_diff and len(before) <= 50 * 1024 and len(content) <= 50 * 1024:
-                entry["before"] = before
-                entry["after"] = content
-                entry["created"] = not existed
+            if include_diff:
+                self._inner._capture(entry, target, "", content)  # type: ignore[attr-defined]
             return entry
 
         if action == "delete":
             if not target.exists():
                 return {"success": False, "path": str(target), "error": "not found"}
+            if target.is_dir():
+                return {
+                    "success": False,
+                    "path": str(target),
+                    "error": "refusing to delete a directory; remove files explicitly",
+                }
             before = ""
-            if include_diff and target.is_file():
+            if include_diff:
                 try:
-                    before = target.read_text(encoding="utf-8", errors="replace")
+                    before = self._inner._read_text(target)  # type: ignore[attr-defined]
                 except Exception:
                     before = ""
-            if target.is_dir():
-                import shutil
-                shutil.rmtree(target)
-            else:
-                target.unlink()
+            target.unlink()
             entry: Dict[str, Any] = {"success": True, "path": str(target), "action": "delete"}
-            if include_diff and len(before) <= 50 * 1024:
-                entry["before"] = before
-                entry["after"] = ""
+            if include_diff:
+                self._inner._capture(entry, target, before, "")  # type: ignore[attr-defined]
             return entry
 
         if action == "update":
-            if not target.exists():
+            if not target.exists() or not target.is_file():
                 return {"success": False, "path": str(target), "error": "not found"}
-            original = target.read_text(encoding="utf-8", errors="replace")
+            original = self._inner._read_text(target)  # type: ignore[attr-defined]
             updated = self._apply_update_hunks(original, section["lines"])
 
             final_path = target
             if section.get("move_to"):
                 final_path = self._inner._resolve(section["move_to"])  # type: ignore[attr-defined]
-                final_path.parent.mkdir(parents=True, exist_ok=True)
+                if final_path != target and final_path.exists():
+                    return {
+                        "success": False,
+                        "path": str(final_path),
+                        "error": "Move to target already exists",
+                    }
 
-            final_path.write_text(updated, encoding="utf-8")
+            self._inner._write_atomic(final_path, updated)  # type: ignore[attr-defined]
             if final_path != target and target.exists():
-                try:
-                    target.unlink()
-                except Exception:
-                    pass
+                target.unlink()
 
             entry: Dict[str, Any] = {
                 "success": True,
                 "path": str(final_path),
                 "action": "update",
-                "bytes_before": len(original),
-                "bytes_after": len(updated),
+                "bytes_before": len(original.encode("utf-8")),
+                "bytes_after": len(updated.encode("utf-8")),
             }
-            if include_diff and len(original) <= 50 * 1024 and len(updated) <= 50 * 1024:
-                entry["before"] = original
-                entry["after"] = updated
+            if include_diff:
+                self._inner._capture(entry, final_path, original, updated)  # type: ignore[attr-defined]
             return entry
 
         return {"success": False, "path": path, "error": f"Unknown action: {action}"}
@@ -489,12 +590,16 @@ class GrepTool(BaseTool):
             return {"success": False, "error": "grep requires pattern"}
         glob_pat = params.get("include") or params.get("glob") or "*"
         root = params.get("path") or (str(self.workspace.get_project_dir()) if self.workspace else ".")
+        try:
+            max_results = max(1, min(int(params.get("max_results", 100)), 1000))
+        except (TypeError, ValueError):
+            return {"success": False, "error": "max_results must be an integer"}
         return await self._inner.execute({
             "query": pattern,
             "path": root,
             "glob": glob_pat,
             "regex": True,
-            "max_results": int(params.get("max_results", 100)),
+            "max_results": max_results,
         })
 
 
@@ -506,6 +611,8 @@ class GlobTool(BaseTool):
         "properties": {
             "pattern": {"type": "string"},
             "path": {"type": "string", "default": "."},
+            "max_results": {"type": "integer", "default": 500},
+            "max_seconds": {"type": "number", "default": 5.0},
         },
         "required": ["pattern"],
     }
@@ -518,28 +625,98 @@ class GlobTool(BaseTool):
     def __init__(self, workspace: Any = None):
         self.workspace = workspace
 
+    @staticmethod
+    def _split_absolute(pattern: str) -> tuple[Path, str]:
+        parts = Path(pattern).parts
+        wildcard = next(
+            (i for i, part in enumerate(parts)
+             if any(ch in part for ch in "*?[")),
+            len(parts),
+        )
+        if wildcard >= len(parts):
+            return Path(pattern).parent, Path(pattern).name
+        root = Path(*parts[:wildcard]) if wildcard else Path(os.sep)
+        return root, "/".join(parts[wildcard:])
+
     async def execute(self, params: Dict[str, Any]) -> Dict[str, Any]:
         pattern = params.get("pattern") or ""
         if not pattern:
             return {"success": False, "error": "glob requires pattern"}
-        root = params.get("path") or (str(self.workspace.get_project_dir()) if self.workspace else ".")
-        pattern_full = os.path.join(root, pattern)
-        matches = _glob.glob(pattern_full, recursive=True)
-        root_resolved = Path(root).resolve()
-        entries: List[Tuple[str, float]] = []
-        for m in matches:
-            try:
-                resolved = Path(m).resolve()
-                rel = str(resolved.relative_to(root_resolved))
-            except Exception:
-                rel = m
-            try:
-                mtime = os.path.getmtime(m)
-            except OSError:
-                mtime = 0.0
-            entries.append((rel, mtime))
-        entries.sort(key=lambda t: t[1], reverse=True)
-        return {"success": True, "pattern": pattern, "matches": [e[0] for e in entries], "count": len(entries)}
+        try:
+            max_results = max(1, min(int(params.get("max_results", 500)), 5000))
+            max_seconds = max(0.05, min(float(params.get("max_seconds", 5.0)), 30.0))
+        except (TypeError, ValueError):
+            return {
+                "success": False,
+                "error": "max_results and max_seconds must be numbers",
+            }
+
+        root_value = params.get("path") or (
+            str(self.workspace.get_project_dir()) if self.workspace else "."
+        )
+        if os.path.isabs(pattern):
+            root_path, pattern = self._split_absolute(pattern)
+        else:
+            root_path = Path(root_value).expanduser()
+            pattern = pattern.replace("\\", "/")
+            if pattern.startswith("./"):
+                pattern = pattern[2:]
+
+        from agent.tools.search import _is_secret_file, resolve_search_root
+
+        try:
+            root_path = resolve_search_root(self.workspace, str(root_path))
+        except Exception as e:
+            return {"success": False, "error": f"Invalid glob root: {e}"}
+
+        # A non-recursive glob pattern only needs to scan to its fixed depth.
+        max_depth = None if "**" in pattern else pattern.count("/")
+
+        def _search() -> tuple[List[tuple[str, float]], WalkStats]:
+            stats = WalkStats()
+
+            def accept(relative: str, name: str, is_dir: bool) -> bool:
+                return glob_match(relative, pattern)
+
+            found: List[tuple[str, float]] = []
+            for item in walk_paths(
+                root_path,
+                recursive=True,
+                max_results=max_results,
+                max_seconds=max_seconds,
+                max_depth=max_depth,
+                accept=accept,
+                stats=stats,
+            ):
+                if not _is_secret_file(item.path):
+                    found.append((item.relative, item.mtime))
+            return found, stats
+
+        try:
+            found, stats = await asyncio.to_thread(_search)
+        except FileNotFoundError:
+            return {
+                "success": True,
+                "pattern": pattern,
+                "matches": [],
+                "count": 0,
+                "truncated": False,
+                "truncated_reason": None,
+            }
+        except PermissionError:
+            return {"success": False, "error": f"Permission denied: {root_path}"}
+        except OSError as exc:
+            return {"success": False, "error": f"glob failed: {exc}"}
+
+        found.sort(key=lambda item: item[1], reverse=True)
+        return {
+            "success": True,
+            "pattern": pattern,
+            "matches": [item[0] for item in found],
+            "count": len(found),
+            "truncated": stats.truncated,
+            "truncated_reason": stats.reason or None,
+        }
 
 
 # ----------------------------------------------------------------------
@@ -553,7 +730,8 @@ class WebFetchTool(BaseTool):
         "properties": {
             "url": {"type": "string"},
             "maxChars": {"type": "integer", "default": 500000},
-            "extractMode": {"type": "string"},
+            "maxBytes": {"type": "integer"},
+            "extractMode": {"type": "string", "enum": ["text", "markdown", "html"], "default": "text"},
         },
         "required": ["url"],
     }
@@ -571,8 +749,20 @@ class WebFetchTool(BaseTool):
         url = params.get("url") or ""
         if not url:
             return {"success": False, "error": "webfetch requires url"}
-        max_bytes = int(params.get("maxChars", 500000))
-        return await self._inner.execute({"action": "fetch", "url": url, "max_bytes": max_bytes})
+        try:
+            max_bytes = int(params.get("maxBytes") or params.get("maxChars", 500000))
+        except (TypeError, ValueError):
+            return {"success": False, "error": "maxChars/maxBytes must be an integer"}
+        max_bytes = max(1024, min(max_bytes, 2_000_000))
+        mode = str(params.get("extractMode", "text")).lower()
+        if mode not in {"text", "markdown", "html"}:
+            return {"success": False, "error": "extractMode must be text, markdown, or html"}
+        return await self._inner.execute({
+            "action": "fetch",
+            "url": url,
+            "max_bytes": max_bytes,
+            "text_only": mode != "html",
+        })
 
 
 class WebSearchTool(BaseTool):
@@ -600,7 +790,11 @@ class WebSearchTool(BaseTool):
         query = params.get("query") or ""
         if not query:
             return {"success": False, "error": "websearch requires query"}
-        return await self._inner.execute({"action": "search", "query": query, "limit": int(params.get("count", 10))})
+        try:
+            limit = max(1, min(int(params.get("count", 10)), 20))
+        except (TypeError, ValueError):
+            return {"success": False, "error": "count must be an integer"}
+        return await self._inner.execute({"action": "search", "query": query, "limit": limit})
 
 
 # ----------------------------------------------------------------------
@@ -631,7 +825,7 @@ class TodoWriteTool(BaseTool):
     timeout = 10.0
 
     read_only = False
-    mutating = False
+    mutating = True
     category = "plan"
 
     def __init__(self, session: Any = None):
@@ -760,41 +954,86 @@ class SkillTool(BaseTool):
         default_dirs = [".agent/skills", ".skills", os.path.join(Path.home(), ".config", "agent", "skills")]
         self.skill_dirs: List[str] = cfg.get("skill_dirs") or default_dirs
 
-    def _candidate_paths(self, base: Path, skill_name: str) -> List[Path]:
-        out: List[Path] = []
+    def _skill_roots(self, base: Path) -> List[Path]:
+        roots: List[Path] = []
         for d in self.skill_dirs:
-            root = (base / d) if not os.path.isabs(d) else Path(d)
-            out.append(root / f"{skill_name}.md")
-            out.append(root / skill_name / "SKILL.md")
+            try:
+                root = (base / d) if not os.path.isabs(d) else Path(d)
+                roots.append(root.expanduser().resolve())
+            except (OSError, ValueError):
+                continue
+        return roots
+
+    def _safe_skill_name(self, skill_name: str) -> Optional[str]:
+        name = (skill_name or "").strip()
+        if not name or "\x00" in name:
+            return None
+        if os.path.isabs(name) or "/" in name or "\\" in name:
+            return None
+        if name in (".", "..") or ".." in Path(name).parts:
+            return None
+        return name
+
+    def _candidate_paths(self, roots: List[Path], skill_name: str) -> List[Path]:
+        out: List[Path] = []
+        for root in roots:
+            for candidate in (root / f"{skill_name}.md", root / skill_name / "SKILL.md"):
+                try:
+                    resolved = candidate.resolve()
+                    if resolved.is_relative_to(root):
+                        out.append(resolved)
+                except (OSError, ValueError):
+                    continue
         return out
 
     async def execute(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        skill_name = params.get("name") or params.get("skill") or ""
-        candidates: List[Path] = []
+        raw_name = params.get("name") or params.get("skill") or ""
+        skill_name = self._safe_skill_name(str(raw_name))
+        if skill_name is None:
+            return {
+                "success": False,
+                "error": "invalid skill name; use a simple name without path separators",
+            }
+
         if self.workspace:
-            base = Path(str(self.workspace.get_project_dir()))
-            candidates.extend(self._candidate_paths(base, skill_name))
+            try:
+                base = Path(str(self.workspace.get_project_dir()))
+            except Exception:
+                base = Path.cwd()
         else:
-            candidates.extend(self._candidate_paths(Path.cwd(), skill_name))
-        if skill_name and os.path.sep in skill_name:
-            candidates.append(Path(skill_name))
+            base = Path.cwd()
+
+        roots = self._skill_roots(base)
+        candidates = self._candidate_paths(roots, skill_name)
+
+        from agent.permissions.manager import _path_is_secret
+
         for p in candidates:
             try:
-                if p.exists() and p.is_file():
-                    content = p.read_text(encoding="utf-8", errors="replace")
-                    return {"success": True, "skill": skill_name, "content": content, "path": str(p)}
+                if not p.exists() or not p.is_file() or _path_is_secret(str(p)):
+                    continue
+                if p.stat().st_size > 512 * 1024:
+                    return {
+                        "success": False,
+                        "error": f"skill '{skill_name}' exceeds 512 KB",
+                    }
+                content = p.read_text(encoding="utf-8", errors="replace")
+                return {"success": True, "skill": skill_name, "content": content, "path": str(p)}
             except Exception:
                 continue
+
         available: List[str] = []
-        for d in self.skill_dirs:
+        for root in roots:
             try:
-                root = (Path.cwd() / d) if not os.path.isabs(d) else Path(d)
-                if root.exists():
-                    available.extend([x.stem for x in root.glob("*.md")])
+                if root.is_dir():
+                    available.extend(x.stem for x in root.glob("*.md") if x.is_file())
             except Exception:
                 pass
-        return {"success": False, "error": f"Skill '{skill_name}' not found", "available": sorted(set(available))}
-
+        return {
+            "success": False,
+            "error": f"Skill '{skill_name}' not found",
+            "available": sorted(set(available)),
+        }
 
 # ----------------------------------------------------------------------
 # question

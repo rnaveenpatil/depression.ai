@@ -20,6 +20,21 @@ _WRITE_ACTIONS = {
     "branch_delete", "tag_delete", "clean", "rebase", "merge", "cherry_pick",
 }
 
+# Git options that can execute helpers, redirect output, or escape the repo.
+_UNSAFE_GIT_FLAGS = {
+    "-c", "--config-env", "--exec-path", "--git-dir", "--work-tree",
+    "--namespace", "--super-prefix", "--upload-pack", "--receive-pack",
+    "--output", "--ext-diff", "--textconv", "--open-files-in-pager",
+}
+
+_SAFE_ACTION_ARGS = {
+    "add": set(),
+    "pull": {"--ff-only", "--rebase", "--no-rebase", "--autostash", "--prune", "--tags", "--no-tags"},
+    "push": {"--force-with-lease", "--force", "--tags", "--all", "-u", "--set-upstream", "--dry-run"},
+    "stash": {"--include-untracked", "--all", "--keep-index"},
+    "reset": {"--soft", "--mixed", "--hard", "--keep", "--merge"},
+}
+
 
 class GitTool(BaseTool):
     name = "git"
@@ -58,11 +73,58 @@ class GitTool(BaseTool):
         self.read_only = bool(read_only)
         self.cwd = str(workspace.get_project_dir()) if workspace else os.getcwd()
 
+    @staticmethod
+    def _check_path(value: Any) -> Optional[str]:
+        if value is None:
+            return None
+        path = str(value)
+        if not path or "\x00" in path or "\n" in path or "\r" in path:
+            raise ValueError("invalid path")
+        if path.startswith("-"):
+            raise ValueError(f"path must not start with '-': {path!r}")
+        try:
+            from agent.permissions.manager import _path_is_secret
+            candidates = [path]
+            if ":" in path:
+                candidates.append(path.split(":", 1)[1])
+            if any(_path_is_secret(c) for c in candidates):
+                raise ValueError("secret files are not accessible through git")
+        except ValueError:
+            raise
+        except Exception:
+            pass
+        return path
+
+    def _safe_extra_args(self, action: str, raw: Any) -> List[str]:
+        if raw is None:
+            return []
+        if not isinstance(raw, list):
+            raise ValueError("args must be an array of strings")
+        allowed = _SAFE_ACTION_ARGS.get(action, set())
+        out: List[str] = []
+        for item in raw:
+            arg = str(item)
+            if not arg or "\x00" in arg or "\n" in arg or "\r" in arg:
+                raise ValueError("invalid git argument")
+            if arg in _UNSAFE_GIT_FLAGS or arg.startswith(tuple(f + "=" for f in _UNSAFE_GIT_FLAGS)):
+                raise ValueError(f"unsafe git option: {arg!r}")
+            if arg.startswith("-") and arg not in allowed:
+                raise ValueError(f"git option not allowed for {action}: {arg!r}")
+            out.append(arg)
+        return out
+
     async def _git(self, *args: str, timeout: float = 30.0) -> Dict[str, Any]:
+        env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+        env.update({
+            "GIT_TERMINAL_PROMPT": "0",
+            "GIT_PAGER": "cat",
+            "PAGER": "cat",
+        })
         try:
             proc = await asyncio.create_subprocess_exec(
                 "git", *args,
                 cwd=self.cwd,
+                env=env,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
@@ -99,46 +161,67 @@ class GitTool(BaseTool):
 
         args: List[str] = []
 
+        try:
+            path = self._check_path(params.get("path"))
+            ref = self._check_path(params.get("ref"))
+            extra = self._safe_extra_args(action, params.get("args"))
+        except ValueError as e:
+            return {"success": False, "error": str(e), "action": action}
+
         if action == "status":
             args = ["status", "--short", "--branch"]
         elif action == "diff":
             args = ["diff"]
             if params.get("staged"):
                 args.append("--staged")
-            if params.get("path"):
-                args.extend(["--", params["path"]])
+            if path:
+                args.extend(["--", path])
         elif action == "log":
-            args = ["log", f"--max-count={int(params.get('limit', 20))}", "--oneline"]
-            if params.get("path"):
-                args.extend(["--", params["path"]])
+            try:
+                limit = max(1, min(int(params.get("limit", 20)), 1000))
+            except (TypeError, ValueError):
+                return {"success": False, "error": "limit must be an integer"}
+            args = ["log", f"--max-count={limit}", "--oneline"]
+            if path:
+                args.extend(["--", path])
         elif action == "show":
-            args = ["show", params.get("ref", "HEAD")]
+            args = ["show", "--no-ext-diff", "--no-textconv", ref or "HEAD"]
         elif action == "branch":
             args = ["branch", "-a"]
         elif action == "add":
-            args = ["add"] + (params.get("args") or ["."])
+            add_args = extra or ["."]
+            try:
+                for item in add_args:
+                    self._check_path(item)
+            except ValueError as e:
+                return {"success": False, "error": str(e), "action": action}
+            args = ["add", "--", *add_args]
         elif action == "commit":
             msg = params.get("message", "")
             if not msg:
                 return {"success": False, "error": "commit requires 'message'"}
             args = ["commit", "-m", msg]
         elif action == "checkout":
-            ref = params.get("ref") or (params.get("args") or [None])[0]
-            if not ref:
+            checkout_ref = ref or (extra[0] if extra else None)
+            if not checkout_ref:
                 return {"success": False, "error": "checkout requires 'ref'"}
-            args = ["checkout", ref]
+            try:
+                self._check_path(checkout_ref)
+            except ValueError as e:
+                return {"success": False, "error": str(e), "action": action}
+            args = ["checkout", checkout_ref]
         elif action == "pull":
-            args = ["pull"] + (params.get("args") or [])
+            args = ["pull", *extra]
         elif action == "push":
-            args = ["push"] + (params.get("args") or [])
+            args = ["push", *extra]
         elif action == "stash":
-            args = ["stash"] + (params.get("args") or [])
+            args = ["stash", *extra]
         elif action == "reset":
-            args = ["reset"] + (params.get("args") or [])
+            args = ["reset", *extra]
         elif action == "blame":
-            if not params.get("path"):
+            if not path:
                 return {"success": False, "error": "blame requires 'path'"}
-            args = ["blame", params["path"]]
+            args = ["blame", "--", path]
         elif action == "remote":
             args = ["remote", "-v"]
         else:

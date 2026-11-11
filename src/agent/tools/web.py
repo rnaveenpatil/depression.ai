@@ -167,10 +167,24 @@ class WebTool(BaseTool):
             url = "https://" + url
 
         headers = {"User-Agent": self.user_agent}
-        headers.update(params.get("headers") or {})
+        user_headers = params.get("headers") or {}
+        if not isinstance(user_headers, dict):
+            return {"success": False, "error": "headers must be an object"}
+        blocked_headers = {"host", "connection", "content-length", "transfer-encoding"}
+        headers.update({
+            str(k): str(v) for k, v in user_headers.items()
+            if str(k).lower() not in blocked_headers
+        })
         method = str(params.get("method", "GET")).upper()
+        if method not in {"GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"}:
+            return {"success": False, "error": f"method not allowed: {method}"}
         body = params.get("body")
-        max_bytes = max(1024, min(int(params.get("max_bytes", 500_000)), 2_000_000))
+        if body is not None and len(str(body).encode("utf-8")) > 1_000_000:
+            return {"success": False, "error": "request body exceeds 1 MB"}
+        try:
+            max_bytes = max(1024, min(int(params.get("max_bytes", 500_000)), 2_000_000))
+        except (TypeError, ValueError):
+            return {"success": False, "error": "max_bytes must be an integer"}
         text_only = params.get("text_only", True)
         browser_fallback = bool(params.get("browser_fallback", self.browser_enabled))
         wait_until = params.get("wait_until", "domcontentloaded")
@@ -224,39 +238,77 @@ class WebTool(BaseTool):
         text_only: bool,
     ) -> Dict[str, Any]:
         current = url
+        req_method = method
+        req_body = body.encode("utf-8") if body else None
         try:
             async with httpx.AsyncClient(
                 timeout=httpx.Timeout(25.0), follow_redirects=False
             ) as client:
                 response = None
-                for _ in range(3):
+                raw = b""
+                truncated = False
+                total_size = 0
+                hops = 0
+                attempts = 0
+
+                while True:
                     self._check_url(current)
                     try:
-                        response = await client.request(
-                            method,
+                        async with client.stream(
+                            req_method,
                             current,
                             headers=headers,
-                            content=body.encode("utf-8") if body else None,
-                        )
-                        break
+                            content=req_body,
+                        ) as resp:
+                            if resp.is_redirect:
+                                if hops >= self.max_redirects:
+                                    return {
+                                        "success": False,
+                                        "url": current,
+                                        "error": f"too many redirects (max {self.max_redirects})",
+                                    }
+                                location = resp.headers.get("location")
+                                if not location:
+                                    response = resp
+                                    break
+                                next_url = urllib.parse.urljoin(str(resp.url), location)
+                                self._check_url(next_url)
+                                current = next_url
+                                hops += 1
+                                if resp.status_code in (301, 302, 303) and req_method not in ("GET", "HEAD"):
+                                    req_method = "GET"
+                                    req_body = None
+                                    headers = {
+                                        k: v for k, v in headers.items()
+                                        if k.lower() not in ("content-type", "content-length")
+                                    }
+                                continue
+
+                            response = resp
+                            async for chunk in resp.aiter_bytes():
+                                total_size += len(chunk)
+                                if len(raw) + len(chunk) <= max_bytes:
+                                    raw += chunk
+                                else:
+                                    remain = max_bytes - len(raw)
+                                    if remain > 0:
+                                        raw += chunk[:remain]
+                                    truncated = True
+                                    break
+                            if truncated:
+                                break
                     except BlockedRequestError:
                         raise
                     except Exception:
+                        attempts += 1
+                        if hops > 0 or response is not None or attempts >= 3:
+                            raise
                         await asyncio.sleep(0.35)
+                        continue
+
                 if response is None:
                     return {"success": False, "url": current, "error": "HTTP request failed"}
 
-                hops = 0
-                while response.is_redirect and hops < self.max_redirects:
-                    location = response.headers.get("location")
-                    if not location:
-                        break
-                    current = urllib.parse.urljoin(str(response.url), location)
-                    self._check_url(current)
-                    response = await client.request(method, current, headers=headers)
-                    hops += 1
-
-            raw = response.content[:max_bytes]
             charset = response.encoding or "utf-8"
             decoded = raw.decode(charset, errors="replace")
             content_type = response.headers.get("content-type", "")
@@ -265,8 +317,8 @@ class WebTool(BaseTool):
                 "url": str(response.url),
                 "status": response.status_code,
                 "content_type": content_type,
-                "size": len(response.content),
-                "truncated": len(response.content) > max_bytes,
+                "size": total_size,
+                "truncated": truncated,
                 "fetch_method": "http",
             }
             if response.status_code >= 400:
@@ -377,7 +429,10 @@ class WebTool(BaseTool):
         query = params.get("query")
         if not query:
             return {"success": False, "error": "search requires 'query'"}
-        limit = max(1, min(int(params.get("limit", 10)), 20))
+        try:
+            limit = max(1, min(int(params.get("limit", 10)), 20))
+        except (TypeError, ValueError):
+            return {"success": False, "error": "limit must be an integer"}
         headers = {
             "User-Agent": self.user_agent,
             "Accept-Language": "en,en-US;q=0.9,*;q=0.5",

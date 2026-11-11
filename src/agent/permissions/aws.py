@@ -36,6 +36,16 @@ LOW_AWS_PREFIXES = ("create-", "put-", "copy-", "start-", "enable-", "run-")
 MEDIUM_AWS_PREFIXES = ("update-", "modify-", "tag-", "attach-", "detach-", "associate-")
 HIGH_AWS_PREFIXES = ("delete-", "stop-", "terminate-", "remove-", "revoke-", "disassociate-")
 
+_AWS_GLOBAL_VALUE_FLAGS = {
+    "--profile", "--region", "--output", "--query", "--endpoint-url",
+    "--cli-connect-timeout", "--cli-read-timeout", "--cli-binary-format",
+    "--ca-bundle", "--color",
+}
+_AWS_GLOBAL_BOOL_FLAGS = {
+    "--debug", "--no-verify-ssl", "--no-paginate", "--no-sign-request",
+    "--no-cli-pager", "--version",
+}
+
 CRITICAL_AWS_PATTERNS = [
     r"--force\b",
     r"--recursive\b.*\bs3\s+rm\b",
@@ -62,6 +72,7 @@ class AWSPolicy(Policy):
         self.require_confirm_delete: bool = cfg.get("aws_confirm_delete", True)
         self.allowed_profiles: List[str] = list(cfg.get("aws_allowed_profiles", []))
         self.allowed_regions: List[str] = list(cfg.get("aws_allowed_regions", []))
+        self.allowed_endpoints: List[str] = list(cfg.get("aws_allowed_endpoints", []))
         self.denied_services: List[str] = list(cfg.get("aws_denied_services", []))
 
         self._critical_res = [re.compile(p) for p in CRITICAL_AWS_PATTERNS]
@@ -85,13 +96,28 @@ class AWSPolicy(Policy):
                 policy=self.name,
             )
 
-        profile = self._extract_flag(args, "--profile")
+        profile = (
+            self._extract_flag(args, "--profile")
+            or str(request.params.get("profile") or "")
+        )
         if profile and self.allowed_profiles and profile not in self.allowed_profiles:
             return PermissionVerdict.deny(
                 f"AWS profile '{profile}' not in allowlist",
                 risk=RiskLevel.HIGH,
                 policy=self.name,
             )
+
+        endpoint = (
+            self._extract_flag(args, "--endpoint-url")
+            or self._extract_flag(args, "--endpoint")
+        )
+        if endpoint:
+            if not self.allowed_endpoints or endpoint not in self.allowed_endpoints:
+                return PermissionVerdict.deny(
+                    f"AWS endpoint override not allowed: {endpoint}",
+                    risk=RiskLevel.CRITICAL,
+                    policy=self.name,
+                )
 
         region = self._extract_flag(args, "--region")
         if region and self.allowed_regions and region not in self.allowed_regions:
@@ -240,7 +266,13 @@ class AWSPolicy(Policy):
         while idx < len(rest):
             tok = rest[idx]
             if tok.startswith("--"):
-                idx += 2
+                flag = tok.split("=", 1)[0]
+                if "=" in tok or flag in _AWS_GLOBAL_BOOL_FLAGS:
+                    idx += 1
+                elif flag in _AWS_GLOBAL_VALUE_FLAGS:
+                    idx += 2
+                else:
+                    idx += 1
                 continue
             service = tok
             idx += 1
@@ -249,8 +281,22 @@ class AWSPolicy(Policy):
         if not service:
             return None
 
+        while idx < len(rest):
+            tok = rest[idx]
+            if not tok.startswith("--"):
+                break
+            flag = tok.split("=", 1)[0]
+            if "=" in tok or flag in _AWS_GLOBAL_BOOL_FLAGS:
+                idx += 1
+            elif flag in _AWS_GLOBAL_VALUE_FLAGS:
+                idx += 2
+            else:
+                break
+
         action = rest[idx] if idx < len(rest) else "unknown"
-        return service.lower(), action.lower(), rest[idx + 1:]
+        # Keep the full tail (including global flags before the service) so
+        # endpoint/profile/region checks cannot be bypassed by flag order.
+        return service.lower(), action.lower(), rest
 
     def _extract_flag(self, args: List[str], flag: str) -> Optional[str]:
         for i, a in enumerate(args):

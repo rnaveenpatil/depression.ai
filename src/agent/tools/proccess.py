@@ -26,6 +26,7 @@ Shutdown:
 from __future__ import annotations
 
 import asyncio
+import codecs
 import os
 import time
 import uuid
@@ -44,6 +45,14 @@ logger = get_logger(__name__)
 
 # Maximum number of stdout/stderr lines retained per process.
 _MAX_BUFFER_LINES = 5000
+
+# Hard cap for a single emitted line. A child that writes one huge line must
+# not kill the pump or consume unbounded memory.
+_MAX_LINE_BYTES = 16 * 1024
+
+# Read size for pipes. Chunked reads avoid StreamReader.readline()'s 64 KiB
+# limit, which raises LimitOverrunError and leaves the pipe undrained.
+_READ_CHUNK = 64 * 1024
 
 # Byte cap for what the logs action returns in a single call.
 _MAX_LOG_BYTES = 32 * 1024
@@ -138,6 +147,11 @@ class ProcessTool(BaseTool):
                 "type": "object",
                 "description": "Extra env vars for the child process",
             },
+            "include_aws_credentials": {
+                "type": "boolean",
+                "default": False,
+                "description": "Opt in to injecting saved AWS credentials into the child",
+            },
             "process_id": {
                 "type": "string",
                 "description": "Tool-managed process id returned by 'start' (not the OS pid).",
@@ -170,12 +184,24 @@ class ProcessTool(BaseTool):
     # ENV
     # ------------------------------------------------------------------
 
-    def _build_env(self, extra: Optional[Dict[str, Any]]) -> Dict[str, str]:
-        env = {k: str(v) for k, v in os.environ.items()}
-        try:
-            env.update(EnvManager.get().get_aws_env())
-        except Exception:
-            pass
+    def _build_env(
+        self,
+        extra: Optional[Dict[str, Any]],
+        include_aws: bool = False,
+    ) -> Dict[str, str]:
+        secret_keys = {
+            "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY",
+            "AWS_SESSION_TOKEN", "AWS_SECURITY_TOKEN",
+        }
+        env = {
+            k: str(v) for k, v in os.environ.items()
+            if not (k in secret_keys and not include_aws)
+        }
+        if include_aws:
+            try:
+                env.update(EnvManager.get().get_aws_env())
+            except Exception:
+                pass
         if extra:
             env.update({str(k): str(v) for k, v in extra.items()})
         return env
@@ -224,7 +250,10 @@ class ProcessTool(BaseTool):
             return {"success": False, "error": f"cwd does not exist: {cwd}",
                     "recoverable": False}
 
-        env = self._build_env(params.get("env"))
+        env = self._build_env(
+            params.get("env"),
+            include_aws=bool(params.get("include_aws_credentials", False)),
+        )
 
         try:
             proc = await asyncio.create_subprocess_shell(
@@ -254,12 +283,39 @@ class ProcessTool(BaseTool):
         self.processes[pid] = mp
 
         async def pump(stream: Any, buf: Deque[str], tag: str) -> None:
+            decoder = codecs.getincrementaldecoder("utf-8")("replace")
+            pending = ""
+            discarding = False
             try:
                 while True:
-                    line = await stream.readline()
-                    if not line:
+                    raw = await stream.read(_READ_CHUNK)
+                    if not raw:
                         break
-                    buf.append(line.decode(errors="replace").rstrip())
+                    pending += decoder.decode(raw)
+                    while "\n" in pending:
+                        line, pending = pending.split("\n", 1)
+                        if discarding:
+                            discarding = False
+                            continue
+                        data = line.encode("utf-8", errors="replace")
+                        if len(data) > _MAX_LINE_BYTES:
+                            line = data[:_MAX_LINE_BYTES].decode("utf-8", errors="replace")
+                            line += " …[line truncated]"
+                        buf.append(line.rstrip("\r"))
+                    if len(pending.encode("utf-8", errors="replace")) > _MAX_LINE_BYTES:
+                        data = pending.encode("utf-8", errors="replace")[:_MAX_LINE_BYTES]
+                        buf.append(data.decode("utf-8", errors="replace") + " …[line truncated]")
+                        pending = ""
+                        discarding = True
+                pending += decoder.decode(b"", final=True)
+                if pending and not discarding:
+                    data = pending.encode("utf-8", errors="replace")
+                    if len(data) > _MAX_LINE_BYTES:
+                        data = data[:_MAX_LINE_BYTES]
+                        suffix = " …[line truncated]"
+                    else:
+                        suffix = ""
+                    buf.append(data.decode("utf-8", errors="replace") + suffix)
             except asyncio.CancelledError:
                 raise
             except Exception as e:
@@ -387,19 +443,14 @@ class ProcessTool(BaseTool):
 
         # Cancel pumps and watcher. Pumps may already be done naturally if
         # the process exited on its own and closed its pipes.
-        for t in list(mp._pumps):
+        pumps = list(mp._pumps)
+        for t in pumps:
             t.cancel()
-        for t in list(mp._pumps):
-            try:
-                await t
-            except (asyncio.CancelledError, Exception):
-                pass
+        if pumps:
+            await asyncio.gather(*pumps, return_exceptions=True)
         if mp._watcher is not None:
             mp._watcher.cancel()
-            try:
-                await mp._watcher
-            except (asyncio.CancelledError, Exception):
-                pass
+            await asyncio.gather(mp._watcher, return_exceptions=True)
 
         # Remove from the live registry.
         self.processes.pop(mp.id, None)
@@ -437,7 +488,10 @@ class ProcessTool(BaseTool):
                 "recoverable": True,
             }
         mp.refresh()
-        n = int(params.get("lines", 100))
+        try:
+            n = int(params.get("lines", 100))
+        except (TypeError, ValueError):
+            return {"success": False, "error": "lines must be an integer"}
         n = max(1, min(n, _MAX_BUFFER_LINES))
 
         stdout_text = self._cap_lines(list(mp.stdout)[-n:], _MAX_LOG_BYTES)
@@ -467,7 +521,10 @@ class ProcessTool(BaseTool):
                 "error": f"Process {params.get('process_id')!r} not found",
                 "recoverable": True,
             }
-        timeout = float(params.get("timeout", 30))
+        try:
+            timeout = max(0.1, min(float(params.get("timeout", 30)), 3600.0))
+        except (TypeError, ValueError):
+            return {"success": False, "error": "timeout must be a number"}
         try:
             code = await asyncio.wait_for(mp.proc.wait(), timeout=timeout)
             mp.refresh()

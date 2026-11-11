@@ -20,6 +20,25 @@ from typing import Iterable, Optional
 # matching the escape hatch in agent.tools.filesystem.
 DEFAULT_ABS_ROOTS: tuple[str, ...] = ("/tmp", "/var/tmp")
 
+_SENSITIVE_DIRS = {".git", ".ssh", ".aws", ".gnupg"}
+_SENSITIVE_NAMES = {
+    ".bashrc", ".bash_profile", ".zshrc", ".zprofile", ".profile",
+    ".gitconfig", ".git-credentials", ".npmrc", ".pypirc", ".netrc",
+    "authorized_keys", "known_hosts", "config", "credentials",
+}
+
+
+def _is_sensitive_destination(path: Path) -> bool:
+    parts = set(path.parts)
+    if parts & _SENSITIVE_DIRS:
+        return True
+    name = path.name.lower()
+    if name in _SENSITIVE_NAMES:
+        return True
+    if name == ".env" or name.startswith(".env.") or name.endswith(".env"):
+        return True
+    return False
+
 
 class OutputPathError(ValueError):
     """Raised when a caller-supplied output path escapes the sandbox."""
@@ -51,6 +70,8 @@ def resolve_output_path(
 
     # strict=False so we can validate destinations that do not exist yet.
     resolved = candidate.resolve(strict=False)
+    if _is_sensitive_destination(resolved):
+        raise OutputPathError(f"refusing to overwrite sensitive path: {resolved}")
 
     try:
         resolved.relative_to(base)

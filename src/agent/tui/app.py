@@ -1061,11 +1061,11 @@ class TodoPanel(Vertical):
         self._entries_from_store = False
 
     def compose(self) -> ComposeResult:
-        yield Static(f"[bold {GREEN}]▌ TODO[/]", markup=True)
+        yield Static(f"[bold {GREEN}]▌ TODO[/]", id="todo-header", markup=True)
         yield Static(f"[{MUTED}]— no active plan —[/]",
                      id="todo-body", markup=True)
         yield Static("updates as the agent works",
-                     classes="hint")
+                     id="todo-hint", classes="hint")
 
     def on_mount(self) -> None:
         self.refresh_from_store(force=True)
@@ -1131,23 +1131,93 @@ class TodoPanel(Vertical):
             "content": str(getattr(item, "title", "") or ""),
             "status": status,
             "priority": getattr(item, "priority", 3),
+            "notes": str(getattr(item, "notes", "") or ""),
         }
 
     def _paint_entries(self) -> None:
         try:
+            self._paint_header()
             if not self._entries:
                 self.query_one("#todo-body", Static).update(
                     f"[{MUTED}]— no active plan —[/]"
+                )
+                self.query_one("#todo-hint", Static).update(
+                    "updates as the agent works"
                 )
                 return
             self.query_one("#todo-body", Static).update(
                 self._format_entries(self._entries)
             )
+            active = sum(
+                1 for e in self._entries
+                if str(e.get("status") or "").lower() == "in_progress"
+            )
+            blocked = sum(
+                1 for e in self._entries
+                if str(e.get("status") or "").lower() in ("blocked", "failed")
+            )
+            hint = "agent working" if active else "updates as the agent works"
+            if blocked:
+                hint = f"{blocked} blocked · {hint}"
+            self.query_one("#todo-hint", Static).update(hint)
         except Exception:
             pass
 
+    def _paint_header(self) -> None:
+        done = sum(
+            1 for e in self._entries
+            if str(e.get("status") or "").lower() == "completed"
+        )
+        total = len(self._entries)
+        if not total:
+            self.query_one("#todo-header", Static).update(
+                f"[bold {GREEN}]▌ TODO[/]"
+            )
+            return
+        pct = int(round(done * 100 / total))
+        width = 8
+        filled = min(width, int(round(done * width / total)))
+        bar = (
+            f"[{GREEN}]{'━' * filled}[/]"
+            f"[{DIM}]{'─' * (width - filled)}[/]"
+        )
+        self.query_one("#todo-header", Static).update(
+            f"[bold {GREEN}]▌ TODO[/] [{MUTED}]{done}/{total}[/] "
+            f"{bar} [{TEXT}]{pct}%[/]"
+        )
+
     @staticmethod
-    def _format_entries(entries: list[dict]) -> str:
+    def _entry_status(entry: dict) -> str:
+        return str(entry.get("status") or "pending").lower()
+
+    @staticmethod
+    def _entry_priority(entry: dict) -> int:
+        try:
+            return int(entry.get("priority") or 3)
+        except (TypeError, ValueError):
+            return 3
+
+    @classmethod
+    def _sort_entries(cls, entries: list[dict]) -> list[dict]:
+        rank = {
+            "in_progress": 0,
+            "blocked": 1,
+            "failed": 1,
+            "pending": 2,
+            "completed": 3,
+            "cancelled": 4,
+            "skipped": 4,
+        }
+        return sorted(
+            entries,
+            key=lambda e: (
+                rank.get(cls._entry_status(e), 5),
+                cls._entry_priority(e),
+            ),
+        )
+
+    @classmethod
+    def _format_entries(cls, entries: list[dict]) -> str:
         icons = {
             "completed": f"[{GREEN}]✓[/]",
             "in_progress": f"[{AMBER}]▸[/]",
@@ -1158,21 +1228,37 @@ class TodoPanel(Vertical):
             "skipped": f"[{DIM}]—[/]",
         }
         out = []
-        for e in entries:
+        for e in cls._sort_entries(entries):
             content = str(e.get("content") or e.get("description") or "")
             content = _esc(content)
-            status = str(e.get("status") or "pending").lower()
+            status = cls._entry_status(e)
             icon = icons.get(status, f"[{DIM}]○[/]")
+            priority = cls._entry_priority(e)
+            badge = ""
+            if priority <= 1:
+                badge = f" [{ERROR}]P1[/]"
+            elif priority == 2:
+                badge = f" [{AMBER}]P2[/]"
+
             if status == "completed":
-                out.append(f"  {icon} [{MUTED}]{content}[/]")
+                out.append(f"  {icon} [{MUTED}][strike]{content}[/strike][/]")
             elif status == "in_progress":
-                out.append(f"  {icon} [bold {TEXT}]{content}[/]")
+                out.append(f"  {icon} [bold {TEXT}]{content}[/]{badge}")
             elif status in ("failed", "blocked"):
-                out.append(f"  {icon} [{ERROR}]{content}[/]")
+                out.append(f"  {icon} [{ERROR}]{content}[/]{badge}")
             elif status == "cancelled":
                 out.append(f"  {icon} [{DIM}]{content}[/]")
+            elif status == "skipped":
+                out.append(f"  {icon} [{DIM}]{content}[/]")
             else:
-                out.append(f"  {icon} [{TEXT}]{content}[/]")
+                out.append(f"  {icon} [{TEXT}]{content}[/]{badge}")
+
+            notes = str(e.get("notes") or "").strip()
+            if notes:
+                notes = _esc(notes)
+                if len(notes) > 44:
+                    notes = notes[:41] + "…"
+                out.append(f"      [{MUTED}]{notes}[/]")
         return "\n".join(out)
 
 
@@ -2393,6 +2479,7 @@ class DepressionApp(App):
             # [Streaming] Live model output.
             self._events.subscribe("on_token", self._on_token)
             self._events.subscribe("on_token_end", self._on_token_end)
+            self._events.subscribe("on_loop_progress", self._on_loop_progress)
             self._event_handlers_registered = True
         except Exception as exc:
             self._error(f"event wiring failed: {exc}")
@@ -2535,6 +2622,37 @@ class DepressionApp(App):
     # ------------------------------------------------------------------
     # AGENT EVENTS
     # ------------------------------------------------------------------
+
+    async def _on_loop_progress(self, event: AgentEvent) -> None:
+        """Show stall/stop guidance in the thinking bar before the loop stops."""
+        if self._is_shutting_down:
+            return
+        data = event.payload or {}
+        try:
+            thinking = self.query_one("#thinking-bar", ThinkingIndicator)
+        except Exception:
+            return
+        message = str(data.get("message") or "").strip()
+        stopping = bool(data.get("stopping"))
+        warning = bool(data.get("warning"))
+        if stopping:
+            thinking.set_progress(
+                message or "stopping: no progress",
+                alert=True,
+            )
+        elif warning:
+            streak = int(data.get("streak") or 0)
+            cap = int(data.get("cap") or 0)
+            thinking.set_progress(
+                message or f"no progress {streak}/{cap}",
+                alert=True,
+            )
+        elif data.get("progress"):
+            thinking.set_progress("")
+        elif message:
+            thinking.set_progress(message)
+        else:
+            thinking.set_progress("")
 
     async def _on_tool_event(self, event: AgentEvent) -> None:
         # [UI fix] Do not gate on self.is_running — the first tool event can
@@ -2734,6 +2852,7 @@ class DepressionApp(App):
                 "content": content,
                 "status": status,
                 "priority": e.get("priority"),
+                "notes": e.get("notes") or "",
             })
         return out
 

@@ -269,7 +269,7 @@ class Planner:
         ]
         try:
             response = await self.llm.complete(
-                messages=messages, temperature=0.3, max_tokens=2000,
+                messages=messages, max_tokens=2000,
             )
             content = getattr(response, "content", "") or ""
         except Exception as e:
@@ -525,7 +525,7 @@ class Planner:
         Execute a single task with the LLM.
 
         `turn_executor` is a callable supplied by the loop with the signature:
-            async (messages, tools, temperature) -> LLMResponse
+            async (messages, tools) -> LLMResponse
 
         The loop owns the tool registry and the message plumbing, so the
         planner stays model- and tool-agnostic here.

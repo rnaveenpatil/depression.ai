@@ -4,18 +4,8 @@ Configuration Module - Schema, Defaults, Validation, and Dynamic LLM Resolution
 KEY FEATURES:
 - LLM models are NOT hardcoded — they are pulled dynamically from the
   LLM provider registry (src/agent/llm/runtime.py).
-- Temperature is resolved dynamically based on prompt complexity/task type.
 - Full schema validation, environment variable interpolation, and layered
   merging of config sources.
-
-TEMPERATURE TABLE:
-    Trivial (greetings)     → 0.2
-    Simple (short Q)        → 0.3
-    Moderate                → 0.5
-    Complex (reasoning)     → 0.2
-    Creative                → 0.8
-    Precise (code/math)     → 0.1
-    Explanation             → 0.3
 """
 
 from __future__ import annotations
@@ -63,277 +53,13 @@ class PermissionMode(str, Enum):
     DENY = "deny"
 
 
-class TaskComplexity(str, Enum):
-    """Task complexity tiers used for adaptive temperature"""
-    TRIVIAL = "trivial"
-    SIMPLE = "simple"
-    MODERATE = "moderate"
-    COMPLEX = "complex"
-    CREATIVE = "creative"
-    PRECISE = "precise"
-    EXPLANATION = "explanation"
-
-
-# ======================================================================
-# DYNAMIC TEMPERATURE RESOLVER
-# ======================================================================
-
-class TemperatureResolver:
-    """
-    Adaptive temperature resolver.
-
-    Temperature mapping:
-        Trivial (greetings)     → 0.2
-        Simple (short Q)        → 0.3
-        Moderate                → 0.5
-        Complex (reasoning)     → 0.2
-        Creative                → 0.8
-        Precise (code/math)     → 0.1
-        Explanation             → 0.3
-
-    Returns (temperature, reason) so the caller can log/trace the decision.
-    """
-
-    COMPLEXITY_TEMPS: Dict[str, float] = {
-        TaskComplexity.TRIVIAL.value:      0.2,
-        TaskComplexity.SIMPLE.value:       0.3,
-        TaskComplexity.MODERATE.value:     0.5,
-        TaskComplexity.COMPLEX.value:      0.2,
-        TaskComplexity.CREATIVE.value:     0.8,
-        TaskComplexity.PRECISE.value:      0.1,
-        TaskComplexity.EXPLANATION.value:  0.3,
-    }
-
-    DEFAULT_TEMP = 0.3
-
-    # ------------------------------------------------------------------
-    # Keyword signals
-    # ------------------------------------------------------------------
-
-    TRIVIAL_KEYWORDS = {
-        "hi", "hello", "hey", "thanks", "thank you", "ok", "okay",
-        "yes", "no", "bye", "goodbye", "yo", "sup", "cheers",
-    }
-
-    SIMPLE_KEYWORDS = {
-        "what is", "who is", "when", "where", "list", "show", "print",
-        "how many", "count", "define",
-    }
-
-    EXPLANATION_KEYWORDS = {
-        "explain", "explanation", "teach me", "walk me through",
-        "how does", "how do", "how can", "why does", "why is", "why do",
-        "what is the difference", "what's the difference", "difference between",
-        "describe", "help me understand", "clarify", "elaborate",
-        "tell me about", "give me an overview", "overview of",
-        "in simple terms", "for beginners", "tutorial", "guide me",
-        "concept of", "meaning of", "purpose of", "intuition behind",
-        "breakdown of", "break down", "unpack", "deep dive",
-        "compare and contrast", "pros and cons", "use cases",
-        "when should i use", "when to use", "best practices",
-    }
-    STRONG_EXPLANATION_PHRASES = {
-        "explain", "teach me", "walk me through", "help me understand",
-        "in simple terms", "for beginners", "elaborate", "deep dive",
-    }
-
-    CREATIVE_KEYWORDS = {
-        "write", "story", "poem", "creative", "brainstorm", "imagine",
-        "design", "generate ideas", "suggest names", "marketing", "slogan",
-        "compose", "draft", "narrative", "fiction", "article", "blog",
-        "song", "lyrics", "joke", "riddle", "caption", "tagline",
-    }
-
-    PRECISE_KEYWORDS = {
-        "code", "function", "bug", "fix", "error", "debug", "refactor",
-        "math", "calculate", "compute", "algorithm", "sql", "query",
-        "json", "yaml", "regex", "test", "unit test", "assert",
-        "prove", "derive", "solve", "translate", "summarize",
-        "extract", "parse", "convert", "format",
-    }
-
-    COMPLEX_KEYWORDS = {
-        "analyze", "analyse", "architecture", "plan", "strategy", "compare",
-        "evaluate", "review", "audit", "migrate", "system design",
-        "optimize", "investigate", "diagnose", "research", "assess",
-        "trade-off", "tradeoff", "trade-offs", "design pattern",
-    }
-
-    TERMINAL_KEYWORDS = {
-        "run", "execute", "shell", "bash", "terminal", "command", "cmd",
-        "install", "npm", "pip", "apt", "brew", "git commit", "git push",
-        "mkdir", "rm ", "cp ", "mv ", "ls ", "cat ", "grep", "find ",
-        "chmod", "chown", "docker", "kubectl", "systemctl", "curl",
-        "wget", "ssh", "scp", "rsync", "tar", "zip", "unzip",
-    }
-
-    # Detectors
-    CODE_FENCE_RE = re.compile(r"```")
-    CODE_TOKEN_RE = re.compile(
-        r"\b(def|class|function|const|let|var|import|from|return|"
-        r"async|await|yield|public|private|static)\b"
-    )
-    SHELL_PROMPT_RE = re.compile(r"^\s*[\$>#]\s+", re.MULTILINE)
-    SHELL_CMD_RE = re.compile(
-        r"\b(sudo|apt-get|yum|brew|npm|yarn|pnpm|pip|pip3|cargo|go get|"
-        r"docker|kubectl|make|cmake|gcc|g\+\+|python3?\s|node\s|"
-        r"git\s+(clone|commit|push|pull|checkout|branch|merge))\b"
-    )
-
-    def __init__(self, config: Optional[Dict[str, Any]] = None):
-        cfg = config or {}
-        self.enabled = cfg.get("enabled", True)
-        self.override: Optional[float] = cfg.get("override")
-        self.min_temp = cfg.get("min", 0.0)
-        self.max_temp = cfg.get("max", 1.2)
-        self.tier_temps: Dict[str, float] = {
-            **self.COMPLEXITY_TEMPS,
-            **cfg.get("tier_temps", {}),
-        }
-        self.provider_bias: Dict[str, float] = cfg.get("provider_bias", {})
-        self.model_bias: List[Tuple[str, float]] = cfg.get("model_bias", [
-            (r"o1|o3", -0.05),
-            (r"deepseek-coder", -0.05),
-        ])
-
-    # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
-
-    def classify(
-        self,
-        prompt: str,
-        context: Optional[Dict[str, Any]] = None,
-    ) -> Tuple[str, str]:
-        """
-        Classify the prompt into a TaskComplexity tier.
-        Returns (tier, reason).
-        """
-        if not prompt or not prompt.strip():
-            return TaskComplexity.SIMPLE.value, "empty prompt"
-
-        text = prompt.lower()
-        words = text.split()
-        word_count = len(words)
-
-        has_code_fence = bool(self.CODE_FENCE_RE.search(prompt))
-        has_code_token = bool(self.CODE_TOKEN_RE.search(text))
-        has_shell_prompt = bool(self.SHELL_PROMPT_RE.search(prompt))
-        has_shell_cmd = bool(self.SHELL_CMD_RE.search(text))
-        has_question = "?" in prompt
-        has_multiple_questions = prompt.count("?") >= 2
-        has_bullets = bool(re.search(r"(^|\n)\s*[-*•]\s", prompt))
-        long_prompt = word_count > 80
-
-        # 1. Explicit hint
-        if context:
-            hint = context.get("task_type") or context.get("complexity")
-            if hint:
-                hint = str(hint).lower()
-                if hint in self.tier_temps:
-                    return hint, f"explicit hint: {hint}"
-
-        # 2. Trivial → 0.2
-        if word_count <= 3 and any(w in self.TRIVIAL_KEYWORDS for w in words):
-            return TaskComplexity.TRIVIAL.value, "greeting/short acknowledgment"
-
-        # 3. Explanation → 0.3
-        if any(p in text for p in self.STRONG_EXPLANATION_PHRASES):
-            return TaskComplexity.EXPLANATION.value, "explanation phrase detected"
-        if any(kw in text for kw in self.EXPLANATION_KEYWORDS):
-            if not has_code_fence or has_question:
-                return TaskComplexity.EXPLANATION.value, "explanation keyword detected"
-
-        # 4. Creative → 0.9
-        if any(kw in text for kw in self.CREATIVE_KEYWORDS):
-            return TaskComplexity.CREATIVE.value, "creative keyword detected"
-
-        # 5. Terminal / shell → 0.1 (treated as precise)
-        if has_shell_prompt or has_shell_cmd:
-            return TaskComplexity.PRECISE.value, "shell command detected"
-        if any(kw in text for kw in self.TERMINAL_KEYWORDS):
-            return TaskComplexity.PRECISE.value, "terminal keyword detected"
-
-        # 6. Precise (code/math) → 0.1
-        if has_code_fence or has_code_token:
-            return TaskComplexity.PRECISE.value, "code detected"
-        if any(kw in text for kw in self.PRECISE_KEYWORDS):
-            if long_prompt or has_multiple_questions:
-                return TaskComplexity.COMPLEX.value, "precise + complex"
-            return TaskComplexity.PRECISE.value, "precise keyword detected"
-
-        # 7. Complex reasoning → 0.4
-        if any(kw in text for kw in self.COMPLEX_KEYWORDS):
-            return TaskComplexity.COMPLEX.value, "complex keyword detected"
-        if long_prompt and (has_bullets or has_multiple_questions):
-            return TaskComplexity.COMPLEX.value, "long structured prompt"
-
-        # 8. Simple → 0.3
-        if any(kw in text for kw in self.SIMPLE_KEYWORDS):
-            return TaskComplexity.SIMPLE.value, "simple keyword detected"
-
-        # 9. Moderate (default) → 0.5
-        if word_count <= 10 and has_question:
-            return TaskComplexity.SIMPLE.value, "short question"
-        if word_count <= 30:
-            return TaskComplexity.MODERATE.value, "moderate length"
-
-        return TaskComplexity.MODERATE.value, "default → moderate"
-
-    def resolve(
-        self,
-        prompt: str,
-        provider: Optional[str] = None,
-        model: Optional[str] = None,
-        context: Optional[Dict[str, Any]] = None,
-    ) -> Tuple[float, str]:
-        """Resolve the temperature for a given prompt. Returns (temp, reason)."""
-        if self.override is not None:
-            return self._clamp(self.override), "explicit override"
-
-        if not self.enabled:
-            return self.DEFAULT_TEMP, f"adaptive disabled (default {self.DEFAULT_TEMP})"
-
-        tier, tier_reason = self.classify(prompt, context)
-        base = self.tier_temps.get(tier, self.DEFAULT_TEMP)
-
-        bias = 0.0
-        reasons = [f"tier={tier} ({tier_reason})"]
-
-        if provider:
-            b = self.provider_bias.get(provider.lower(), 0.0)
-            if b:
-                bias += b
-                reasons.append(f"provider_bias={b:+.2f}")
-
-        if model:
-            for pattern, b in self.model_bias:
-                if re.search(pattern, model, re.IGNORECASE):
-                    if b:
-                        bias += b
-                        reasons.append(f"model_bias={b:+.2f}")
-                    break
-
-        final = self._clamp(base + bias)
-        reasons.append(f"base={base:.2f} bias={bias:+.2f} → {final:.2f}")
-        return final, " | ".join(reasons)
-
-    def _clamp(self, temp: float) -> float:
-        return round(max(self.min_temp, min(self.max_temp, temp)), 2)
-
-
 # ======================================================================
 # CONFIG SECTIONS
 # ======================================================================
 
 @dataclass
 class LLMParamsConfig:
-    """
-    Model generation parameters.
-    temperature = None → adaptive (resolved per prompt).
-    temperature = float → fixed override.
-    """
-    temperature: Optional[float] = None   # None = adaptive
+    """Model generation parameters."""
     max_tokens: int = 4096
     top_p: float = 1.0
     top_k: int = 0
@@ -343,40 +69,12 @@ class LLMParamsConfig:
     seed: Optional[int] = None
 
     def validate(self) -> None:
-        if self.temperature is not None:
-            if not 0.0 <= self.temperature <= 2.0:
-                raise ConfigError(
-                    f"temperature must be 0.0–2.0, got {self.temperature}"
-                )
         if self.max_tokens < 1:
             raise ConfigError(f"max_tokens must be >= 1, got {self.max_tokens}")
         if not 0.0 <= self.top_p <= 1.0:
             raise ConfigError(f"top_p must be 0.0–1.0, got {self.top_p}")
         if self.top_k < 0:
             raise ConfigError(f"top_k must be >= 0, got {self.top_k}")
-
-
-@dataclass
-class AdaptiveTemperatureConfig:
-    """Adaptive temperature configuration"""
-    enabled: bool = True
-    override: Optional[float] = None
-    min: float = 0.0
-    max: float = 1.2
-    tier_temps: Dict[str, float] = field(default_factory=dict)
-    provider_bias: Dict[str, float] = field(default_factory=dict)
-    model_bias: List[Tuple[str, float]] = field(default_factory=list)
-
-    def to_resolver(self) -> TemperatureResolver:
-        return TemperatureResolver({
-            "enabled": self.enabled,
-            "override": self.override,
-            "min": self.min,
-            "max": self.max,
-            "tier_temps": self.tier_temps,
-            "provider_bias": self.provider_bias,
-            "model_bias": self.model_bias,
-        })
 
 
 @dataclass
@@ -397,9 +95,6 @@ class LLMConfig:
     max_retries: int = 3
     retry_delay: float = 1.0
     params: LLMParamsConfig = field(default_factory=LLMParamsConfig)
-    adaptive_temperature: AdaptiveTemperatureConfig = field(
-        default_factory=AdaptiveTemperatureConfig
-    )
     extra_headers: Dict[str, str] = field(default_factory=dict)
     api_keys: Dict[str, str] = field(default_factory=dict)
     auto_select_model: bool = True
@@ -513,11 +208,47 @@ class LoopConfig:
     max_iterations: int = 50
     max_tool_calls_per_iteration: int = 5
     max_history_length: int = 20
-    enable_planning: bool = True
     enable_caching: bool = True
     timeout: float = 99999.0
     enable_self_reflection: bool = True
     enable_auto_retry: bool = True
+    enable_plan_driven: bool = True
+    reserve_output_tokens: int = 4000
+    verification_mode: str = "auto"
+    max_batch_verify_attempts: int = 2
+    no_progress_streak_cap: int = 6
+    no_progress_warn_at: Optional[int] = None
+    enable_goal_completion_detection: bool = True
+    enable_parallel_reads: bool = True
+    enable_streaming: bool = True
+    require_root_cause_evidence: bool = True
+    reuse_test_evidence: bool = True
+    enable_qa_verification: bool = False
+
+    def validate(self) -> None:
+        if self.max_iterations < 1:
+            raise ConfigError("max_iterations must be >= 1")
+        if self.max_tool_calls_per_iteration < 1:
+            raise ConfigError("max_tool_calls_per_iteration must be >= 1")
+        if self.max_history_length < 1:
+            raise ConfigError("max_history_length must be >= 1")
+        if self.reserve_output_tokens < 1:
+            raise ConfigError("reserve_output_tokens must be >= 1")
+        if self.verification_mode not in ("auto", "per_step", "batch", "off"):
+            raise ConfigError(
+                "verification_mode must be one of auto, per_step, batch, off"
+            )
+        if self.max_batch_verify_attempts < 1:
+            raise ConfigError("max_batch_verify_attempts must be >= 1")
+        if self.no_progress_streak_cap < 2:
+            raise ConfigError("no_progress_streak_cap must be >= 2")
+        if self.no_progress_warn_at is not None and not (
+            1 <= self.no_progress_warn_at < self.no_progress_streak_cap
+        ):
+            raise ConfigError(
+                "no_progress_warn_at must be >= 1 and less than "
+                "no_progress_streak_cap"
+            )
 
 
 @dataclass
@@ -651,7 +382,6 @@ class Config:
       - `llm.provider` and `llm.model` may be empty.
       - `resolve_llm()` uses the LLM registry to pick a default model if
         empty, or validates the given model against the registry.
-      - `resolve_temperature()` uses TemperatureResolver for adaptive temps.
     """
     version: str = field(default_factory=get_version)
     debug: bool = False
@@ -682,7 +412,7 @@ class Config:
     def validate(self) -> None:
         errors: List[str] = []
 
-        for section_name in ("llm",):
+        for section_name in ("llm", "loop"):
             section = getattr(self, section_name)
             if hasattr(section, "validate"):
                 try:
@@ -898,55 +628,6 @@ class Config:
         return best[0], best[1]
 
     # ------------------------------------------------------------------
-    # DYNAMIC TEMPERATURE
-    # ------------------------------------------------------------------
-
-    def resolve_temperature(
-        self,
-        prompt: str,
-        provider: Optional[str] = None,
-        model: Optional[str] = None,
-        context: Optional[Dict[str, Any]] = None,
-    ) -> float:
-        """
-        Resolve the temperature for a given prompt.
-
-        Priority:
-          1. If `llm.params.temperature` is not None → return it (fixed).
-          2. Otherwise → use TemperatureResolver (adaptive).
-        """
-        if self.llm.params.temperature is not None:
-            return self.llm.params.temperature
-
-        resolver = self.llm.adaptive_temperature.to_resolver()
-        provider = provider or self._resolved_provider or self.llm.provider
-        model = model or self._resolved_model or self.llm.model
-
-        temp, reason = resolver.resolve(
-            prompt=prompt,
-            provider=provider,
-            model=model,
-            context=context,
-        )
-        logger.debug(f"Temperature resolved: {temp} ({reason})")
-        return temp
-
-    def resolve_temperature_with_reason(
-        self,
-        prompt: str,
-        provider: Optional[str] = None,
-        model: Optional[str] = None,
-        context: Optional[Dict[str, Any]] = None,
-    ) -> Tuple[float, str]:
-        """Same as resolve_temperature but returns the reason too."""
-        if self.llm.params.temperature is not None:
-            return self.llm.params.temperature, "fixed config override"
-        resolver = self.llm.adaptive_temperature.to_resolver()
-        provider = provider or self._resolved_provider or self.llm.provider
-        model = model or self._resolved_model or self.llm.model
-        return resolver.resolve(prompt, provider, model, context)
-
-    # ------------------------------------------------------------------
     # SERIALIZATION
     # ------------------------------------------------------------------
 
@@ -1036,8 +717,6 @@ __all__ = [
     "Config",
     "LLMConfig",
     "LLMParamsConfig",
-    "AdaptiveTemperatureConfig",
-    "TemperatureResolver",
     "SessionConfig",
     "ContextConfig",
     "PermissionsConfig",
@@ -1053,7 +732,6 @@ __all__ = [
     "MCPConfig",
     "PluginsConfig",
     "AdvancedConfig",
-    "TaskComplexity",
     "LogLevel",
     "Theme",
     "EditingMode",

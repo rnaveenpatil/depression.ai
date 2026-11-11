@@ -420,7 +420,6 @@ class GeminiProvider(LLMProvider):
     def _build_body(
         self,
         messages: Sequence[Any],
-        temperature: float,
         max_tokens: int,
         tools: Optional[Sequence[Any]],
         tool_choice: Optional[str],
@@ -434,12 +433,11 @@ class GeminiProvider(LLMProvider):
             body["system_instruction"] = system_instruction
 
         generation_config: Dict[str, Any] = {
-            "temperature": temperature,
             "maxOutputTokens": int(max_tokens) if max_tokens and max_tokens > 0 else 4096,
         }
         for key in _GENERATION_CONFIG_KEYS:
             v = kwargs.get(key)
-            if v is not None and key not in ("temperature", "maxOutputTokens"):
+            if v is not None and key != "maxOutputTokens":
                 generation_config[key] = v
         body["generationConfig"] = generation_config
 
@@ -474,7 +472,6 @@ class GeminiProvider(LLMProvider):
         messages: Sequence[Message],
         *,
         model: Optional[str] = None,
-        temperature: float = 0.1,
         max_tokens: int = 4096,
         tools: Optional[Sequence[ToolSpec]] = None,
         tool_choice: Optional[str] = None,
@@ -501,7 +498,7 @@ class GeminiProvider(LLMProvider):
         client = self._require_client()
         body = self._build_body(
             messages=messages,
-            temperature=temperature, max_tokens=max_tokens,
+            max_tokens=max_tokens,
             tools=tools, tool_choice=tool_choice,
             **kwargs,
         )
@@ -519,7 +516,6 @@ class GeminiProvider(LLMProvider):
         messages: Sequence[Message],
         *,
         model: Optional[str] = None,
-        temperature: float = 0.1,
         max_tokens: int = 4096,
         tools: Optional[Sequence[ToolSpec]] = None,
         tool_choice: Optional[str] = None,
@@ -555,7 +551,7 @@ class GeminiProvider(LLMProvider):
         client = self._require_client()
         body = self._build_body(
             messages=messages,
-            temperature=temperature, max_tokens=max_tokens,
+            max_tokens=max_tokens,
             tools=tools, tool_choice=tool_choice,
             **kwargs,
         )

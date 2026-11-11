@@ -55,7 +55,7 @@ def _messages() -> list:
 
 def test_openai_request_keeps_openai_tool_shape():
     provider = OpenAICompatibleProvider({"api_key": "k"})
-    body = provider._build_body(_messages(), "m", 0.1, 100, [SPEC], None, False)
+    body = provider._build_body(_messages(), "m", 100, [SPEC], None, False)
 
     assert body["tools"][0]["type"] == "function"
     fn = body["tools"][0]["function"]
@@ -66,7 +66,7 @@ def test_openai_request_keeps_openai_tool_shape():
 
 def test_anthropic_request_uses_input_schema():
     provider = AnthropicProvider({"api_key": "k"})
-    body = provider._build_body(_messages(), "m", 0.1, 100, [SPEC], None, False)
+    body = provider._build_body(_messages(), "m", 100, [SPEC], None, False)
 
     # Anthropic wants {"name", "description", "input_schema"} — not "parameters".
     assert "parameters" not in body["tools"][0]
@@ -77,7 +77,7 @@ def test_anthropic_request_uses_input_schema():
 
 def test_gemini_request_wraps_function_declarations():
     provider = GeminiProvider({"api_key": "k"})
-    body = provider._build_body(_messages(), 0.1, 100, [SPEC], None)
+    body = provider._build_body(_messages(), 100, [SPEC], None)
 
     decls = body["tools"][0]["function_declarations"]
     assert decls[0]["name"] == "note_tool"
@@ -85,13 +85,13 @@ def test_gemini_request_wraps_function_declarations():
     # tool_choice "auto" is Gemini's default, so no tool_config is sent.
     assert "tool_config" not in body
 
-    body = provider._build_body(_messages(), 0.1, 100, [SPEC], "required")
+    body = provider._build_body(_messages(), 100, [SPEC], "required")
     assert body["tool_config"]["function_calling_config"]["mode"] == "ANY"
 
 
 def test_ollama_request_uses_openai_tool_shape():
     provider = OllamaProvider()
-    body = provider._build_body(_messages(), "m", 0.1, 100, [SPEC], None, False)
+    body = provider._build_body(_messages(), "m", 100, [SPEC], None, False)
 
     assert body["tools"][0]["type"] == "function"
     assert body["tools"][0]["function"]["name"] == "note_tool"

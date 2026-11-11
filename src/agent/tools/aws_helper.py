@@ -17,6 +17,7 @@ import asyncio
 import configparser
 import json
 import os
+import re
 import shutil
 import time
 from pathlib import Path
@@ -37,6 +38,19 @@ _MCP_CALL_CANDIDATES = (
     "mcp__aws__execute",
     "mcp__aws__run",
 )
+
+_AWS_NAME_RE = re.compile(r"^[a-z][a-z0-9-]{0,63}$")
+_PROFILE_RE = re.compile(r"^[A-Za-z0-9_+=,.@-]{1,128}$")
+_MCP_TOOL_RE = re.compile(r"^mcp__aws__[A-Za-z0-9_]+$")
+
+# Global flags change credentials or the network destination. The tool owns
+# profile selection; endpoint overrides are never accepted.
+_BLOCKED_GLOBAL_FLAGS = {
+    "--endpoint-url", "--endpoint", "--profile", "--region", "--output",
+    "--query", "--no-verify-ssl", "--ca-bundle", "--no-sign-request",
+    "--cli-connect-timeout", "--cli-read-timeout", "--cli-binary-format",
+    "--debug", "--no-paginate", "--color", "--no-cli-pager",
+}
 
 
 class AWSHelperTool(BaseTool):
@@ -124,13 +138,19 @@ class AWSHelperTool(BaseTool):
 
     async def _identity(self, params: Dict[str, Any]) -> Dict[str, Any]:
         prefer = params.get("prefer", "auto")
+        if prefer not in ("auto", "mcp", "cli"):
+            return {"success": False, "error": "prefer must be auto, mcp, or cli"}
+        try:
+            profile = self._validate_profile(params.get("profile"))
+        except ValueError as e:
+            return {"success": False, "error": str(e), "recoverable": True}
 
         for tool_name in _MCP_CALL_CANDIDATES:
             mcp_attempt = await self._try_mcp(
                 tool_name=tool_name,
                 arguments={
                     "operation": "sts get-caller-identity",
-                    "profile": params.get("profile"),
+                    "profile": profile,
                 },
                 prefer=prefer,
             )
@@ -144,7 +164,7 @@ class AWSHelperTool(BaseTool):
         return await self._run_cli(
             ["sts", "get-caller-identity"],
             prefer=prefer,
-            profile=params.get("profile"),
+            profile=profile,
         )
 
     def _list_services(self) -> Dict[str, Any]:
@@ -155,25 +175,98 @@ class AWSHelperTool(BaseTool):
         ]
         return {"success": True, "services": services, "count": len(services)}
 
+    def _validate_profile(self, profile: Any) -> Optional[str]:
+        if profile in (None, ""):
+            return None
+        value = str(profile)
+        if not _PROFILE_RE.fullmatch(value):
+            raise ValueError("invalid AWS profile name")
+        return value
+
+    @classmethod
+    def _mcp_args_override_endpoint(cls, value: Any) -> bool:
+        if isinstance(value, dict):
+            for key, item in value.items():
+                normalized = re.sub(r"[-_]", "", str(key)).lower()
+                if normalized in {
+                    "endpoint", "endpointurl", "awsendpointurl",
+                    "endpointoverride",
+                }:
+                    return True
+                if cls._mcp_args_override_endpoint(item):
+                    return True
+            return False
+        if isinstance(value, (list, tuple)):
+            return any(cls._mcp_args_override_endpoint(item) for item in value)
+        if isinstance(value, str):
+            return bool(re.search(r"--endpoint(?:-url)?(?:=|\s|$)", value))
+        return False
+
+    def _validate_cli_args(self, raw: Any) -> List[str]:
+        if raw is None:
+            return []
+        if not isinstance(raw, list):
+            raise ValueError("args must be an array of strings")
+        if len(raw) > 200:
+            raise ValueError("too many AWS arguments")
+        out: List[str] = []
+        for item in raw:
+            arg = str(item)
+            if not arg or len(arg) > 4096 or "\x00" in arg or "\n" in arg or "\r" in arg:
+                raise ValueError("invalid AWS argument")
+            flag = arg.split("=", 1)[0]
+            if flag in _BLOCKED_GLOBAL_FLAGS or flag.startswith("--endpoint"):
+                raise ValueError(f"AWS global option not allowed: {flag!r}")
+            out.append(arg)
+        return out
+
     async def _call(self, params: Dict[str, Any]) -> Dict[str, Any]:
         prefer = params.get("prefer", "auto")
+        if prefer not in ("auto", "mcp", "cli"):
+            return {"success": False, "error": "prefer must be auto, mcp, or cli"}
 
-        # Explicit MCP tool name — caller knows what they want.
+        try:
+            profile = self._validate_profile(params.get("profile"))
+        except ValueError as e:
+            return {"success": False, "error": str(e), "recoverable": True}
+
+        # Explicit MCP tool name — restrict to the AWS server namespace.
         if params.get("mcp_tool"):
+            tool_name = str(params["mcp_tool"])
+            if not _MCP_TOOL_RE.fullmatch(tool_name):
+                return {
+                    "success": False,
+                    "error": "mcp_tool must be an mcp__aws__ tool",
+                    "recoverable": True,
+                }
+            arguments = params.get("mcp_arguments") or {}
+            if not isinstance(arguments, dict):
+                return {"success": False, "error": "mcp_arguments must be an object"}
+            if self._mcp_args_override_endpoint(arguments):
+                return {
+                    "success": False,
+                    "error": "AWS endpoint overrides are not allowed",
+                    "recoverable": True,
+                }
             return await self._try_mcp(
-                tool_name=str(params["mcp_tool"]),
-                arguments=params.get("mcp_arguments") or {},
+                tool_name=tool_name,
+                arguments=arguments,
                 prefer=prefer,
             )
 
-        service = params.get("service")
-        operation = params.get("operation")
-        if not (service and operation):
+        service = str(params.get("service") or "").strip().lower()
+        operation = str(params.get("operation") or "").strip().lower()
+        if not (_AWS_NAME_RE.fullmatch(service) and _AWS_NAME_RE.fullmatch(operation)):
             return {
                 "success": False,
-                "error": "Provide 'service' + 'operation', or 'mcp_tool'",
+                "error": "service and operation must be lowercase AWS names",
                 "recoverable": True,
             }
+
+        try:
+            extra = self._validate_cli_args(params.get("args"))
+        except ValueError as e:
+            return {"success": False, "error": str(e), "recoverable": True}
 
         # Try MCP call tool candidates.
         for tool_name in _MCP_CALL_CANDIDATES:
@@ -181,7 +274,7 @@ class AWSHelperTool(BaseTool):
                 tool_name=tool_name,
                 arguments={
                     "operation": f"{service} {operation}",
-                    "params": list(params.get("args") or []),
+                    "params": extra,
                 },
                 prefer=prefer,
             )
@@ -193,9 +286,9 @@ class AWSHelperTool(BaseTool):
                 return mcp_attempt
 
         return await self._run_cli(
-            [service, operation, *(params.get("args") or [])],
+            [service, operation, *extra],
             prefer=prefer,
-            profile=params.get("profile"),
+            profile=profile,
         )
 
     # ------------------------------------------------------------------
@@ -304,7 +397,13 @@ class AWSHelperTool(BaseTool):
         Returns (env, source) where source is "env_manager" or "aws_file"
         or "none".
         """
-        env = {**os.environ}
+        keep_aws = {
+            "AWS_CONFIG_FILE", "AWS_SHARED_CREDENTIALS_FILE", "AWS_CA_BUNDLE",
+        }
+        env = {
+            k: v for k, v in os.environ.items()
+            if not k.startswith("AWS_") or k in keep_aws
+        }
 
         # 1. Canonical: EnvManager (writes here go to the project .env).
         try:

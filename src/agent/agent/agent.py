@@ -3,7 +3,6 @@ Agent Core - The brain of the CLI Agent.
 
 Orchestrates:
     - LLM provider registry (user-connected model)
-    - Adaptive temperature (per-prompt complexity)
     - Tool registry (native + MCP + plugin tools)
     - Permission manager (safety gates)
     - Context manager (messages, files, project, compaction)
@@ -196,6 +195,18 @@ class Agent:
                 if tool.name in disabled:
                     continue
                 await self.tool_registry.register_tool(tool)
+
+            for alias, primary in {
+                "bash": "terminal",
+                "grep": "search",
+                "webfetch": "web",
+                "websearch": "web",
+                "todowrite": "todo",
+                "todoread": "todo",
+            }.items():
+                if alias in self.tool_registry.tools and primary in self.tool_registry.tools:
+                    self.tool_registry.hide_tool(alias)
+            self.tool_registry.hide_tool("lsp")
 
             if self.mcp_client is not None:
                 self.mcp_client.register_tools_into(self.tool_registry)
@@ -555,19 +566,6 @@ class Agent:
     # HELPERS
     # ------------------------------------------------------------------
 
-    def _resolve_temperature(self, query: str) -> float:
-        cfg_obj = self._get_config_object()
-        try:
-            if cfg_obj and hasattr(cfg_obj, "resolve_temperature"):
-                return cfg_obj.resolve_temperature(
-                    prompt=query,
-                    provider=self.llm.get_current_provider() if self.llm else None,
-                    model=self.llm.get_current_model() if self.llm else None,
-                )
-        except Exception as e:
-            logger.debug("Temperature resolution failed: %s", e)
-        return 0.3
-
     def _infer_action(self, tool: str, params: Dict[str, Any]) -> str:
         t = tool.lower()
         if t.startswith("mcp__aws__") or t == "aws" or t.startswith("aws_"):
@@ -746,6 +744,12 @@ class Agent:
                             await tool.shutdown()
                         except Exception:
                             pass
+
+            try:
+                from agent.tools.todo import TodoTool
+                TodoTool.forget_session(self.session)
+            except Exception:
+                pass
 
             logger.info("Agent shutdown complete")
         except Exception as e:

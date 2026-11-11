@@ -12,6 +12,8 @@ from agent.tools.registry import BaseTool
 from agent.tools.path_guard import OutputPathError, resolve_output_path
 from agent.utils.logging import get_logger
 
+from agent.tools.web import BlockedRequestError, _assert_public_url
+
 logger = get_logger(__name__)
 
 
@@ -34,7 +36,7 @@ class BrowserTool(BaseTool):
         },
         "required": ["action"],
     }
-    timeout = 99999.0
+    timeout = 120.0
 
     read_only = False
     mutating = True
@@ -44,9 +46,48 @@ class BrowserTool(BaseTool):
         cfg = config or {}
         self.headless: bool = cfg.get("headless", True)
         self.allow_network: bool = cfg.get("allow_network", True)
+        self.allow_private: bool = bool(cfg.get("allow_private_network", False))
+        self.allow_eval: bool = bool(cfg.get("allow_eval", False))
+        self.allowlist: List[str] = list(cfg.get("allowlist") or [])
         self.sandbox_root: Optional[str] = cfg.get("sandbox_root")
         self._browser = None
         self._page = None
+        self._pw = None
+
+    def _checked_url(self, raw: str) -> str:
+        url = (raw or "").strip()
+        if not url:
+            raise ValueError("URL is required")
+        if not url.startswith(("http://", "https://")):
+            if url.startswith(("file:", "javascript:", "data:", "about:")):
+                raise ValueError("URL scheme not allowed")
+            url = "https://" + url
+        if self.allow_private:
+            import urllib.parse
+            parsed = urllib.parse.urlsplit(url)
+            if parsed.scheme not in ("http", "https") or not parsed.hostname:
+                raise ValueError("only HTTP(S) URLs with a hostname are allowed")
+            if self.allowlist and parsed.hostname.lower() not in {
+                h.strip().lower() for h in self.allowlist
+            }:
+                raise ValueError(f"host not in allowlist: {parsed.hostname}")
+        else:
+            _assert_public_url(url, self.allowlist or None)
+        return url
+
+    async def _guard_route(self, route: Any) -> None:
+        try:
+            request_url = route.request.url
+            if request_url.startswith(("data:", "blob:", "about:")):
+                await route.continue_()
+                return
+            if self.allow_private:
+                await route.continue_()
+                return
+            self._checked_url(request_url)
+            await route.continue_()
+        except Exception:
+            await route.abort()
 
     async def _ensure_browser(self) -> Optional[str]:
         if self._browser is not None:
@@ -58,26 +99,32 @@ class BrowserTool(BaseTool):
         try:
             self._pw = await async_playwright().start()
             self._browser = await self._pw.chromium.launch(headless=self.headless)
-            self._page = await self._browser.new_page()
+            context = await self._browser.new_context()
+            await context.route("**/*", self._guard_route)
+            self._page = await context.new_page()
             return None
         except Exception as e:
+            await self.shutdown()
             return f"Failed to launch browser: {e}"
 
     async def execute(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        if not self.allow_network:
+        action = params.get("action", "")
+        network_actions = {"navigate", "eval"}
+        if not self.allow_network and action in network_actions:
             return {"success": False, "error": "Network access disabled"}
 
         err = await self._ensure_browser()
         if err:
             return {"success": False, "error": err}
 
-        action = params.get("action", "")
         try:
             if action == "navigate":
-                url = params.get("url", "")
-                if not url.startswith("http"):
-                    url = "https://" + url
-                await self._page.goto(url, timeout=int(params.get("timeout_ms", 15000)))
+                try:
+                    url = self._checked_url(params.get("url", ""))
+                except (ValueError, BlockedRequestError) as e:
+                    return {"success": False, "error": str(e)}
+                timeout = max(1000, min(int(params.get("timeout_ms", 15000)), 120000))
+                await self._page.goto(url, timeout=timeout)
                 return {"success": True, "url": self._page.url, "title": await self._page.title()}
             if action == "click":
                 await self._page.click(params["selector"])
@@ -103,10 +150,12 @@ class BrowserTool(BaseTool):
                 await self._page.screenshot(path=str(path))
                 return {"success": True, "path": str(path)}
             if action == "eval":
+                if not self.allow_eval:
+                    return {"success": False, "error": "eval is disabled by browser config"}
                 result = await self._page.evaluate(params.get("script", ""))
                 return {"success": True, "result": result}
             if action == "wait":
-                ms = int(params.get("timeout_ms", 1000))
+                ms = max(0, min(int(params.get("timeout_ms", 1000)), 120000))
                 await self._page.wait_for_timeout(ms)
                 return {"success": True}
             return {"success": False, "error": f"Unknown action: {action}"}
@@ -117,7 +166,13 @@ class BrowserTool(BaseTool):
         try:
             if self._browser:
                 await self._browser.close()
-            if getattr(self, "_pw", None):
+        except Exception:
+            pass
+        try:
+            if self._pw:
                 await self._pw.stop()
         except Exception:
             pass
+        self._browser = None
+        self._page = None
+        self._pw = None

@@ -80,3 +80,23 @@ def test_pushed_checklist_survives_until_store_changes():
     assert panel._entries[0]["content"] == "stored"
     assert panel._entries[0]["status"] == "completed"
     TodoTool.forget_session(session)
+
+
+def test_todo_format_prioritizes_active_work_and_shows_context():
+    entries = [
+        {"content": "finished", "status": "completed", "priority": 3},
+        {"content": "urgent fix", "status": "pending", "priority": 1},
+        {"content": "currently editing", "status": "in_progress",
+         "priority": 2, "notes": "parser.py:42"},
+        {"content": "waiting on API", "status": "blocked", "priority": 2},
+    ]
+
+    markup = TodoPanel._format_entries(entries)
+
+    assert markup.index("currently editing") < markup.index("waiting on API")
+    assert markup.index("waiting on API") < markup.index("urgent fix")
+    assert markup.index("urgent fix") < markup.index("finished")
+    assert "P1" in markup
+    assert "P2" in markup
+    assert "parser.py:42" in markup
+    assert "[strike]finished[/strike]" in markup

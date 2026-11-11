@@ -187,7 +187,7 @@ class CommandProcessor:
                 "/model info <model_id>",
                 "/model current",
                 "/model test",
-                "/model params temperature=0.7",
+                "/model params max_tokens=4096",
                 "/model compare <model_a> <model_b>",
             ],
         ))
@@ -212,16 +212,6 @@ class CommandProcessor:
         ))
 
         self._add_command(Command(
-            name="temperature",
-            description="Set model temperature (0.0 - 2.0)",
-            usage="/temperature <value>",
-            aliases=["temp"],
-            category=CommandCategory.MODEL,
-            handler=self.cmd_temperature,
-            examples=["/temperature 0.7", "/temperature 1.0"],
-        ))
-
-        self._add_command(Command(
             name="maxtokens",
             description="Set maximum output tokens",
             usage="/maxtokens <number>",
@@ -240,7 +230,7 @@ class CommandProcessor:
             handler=self.cmd_model_params,
             examples=[
                 "/modelparams",
-                "/modelparams temperature=0.5 max_tokens=4096 top_p=0.9",
+                "/modelparams max_tokens=4096 top_p=0.9",
             ],
         ))
 
@@ -955,7 +945,6 @@ class CommandProcessor:
             # Use the agent's LLM provider
             result = await self.agent.llm.complete(
                 messages=[{"role": "user", "content": prompt}],
-                temperature=0.0,
                 max_tokens=50,
             )
             elapsed = time.time() - start
@@ -1054,25 +1043,6 @@ class CommandProcessor:
 
         self.config.setdefault("llm", {})["provider"] = provider_name
         self.ui.print_success(f"✅ Provider switched to: {provider_name}")
-
-    async def cmd_temperature(self, args: List[str]) -> None:
-        if not args:
-            current = self.config.get("llm", {}).get("params", {}).get("temperature", "not set")
-            self.ui.print_info(f"Current temperature: {current}")
-            return
-
-        try:
-            value = float(args[0])
-        except ValueError:
-            self.ui.print_error("Temperature must be a number")
-            return
-
-        if not 0.0 <= value <= 2.0:
-            self.ui.print_error("Temperature must be between 0.0 and 2.0")
-            return
-
-        self.config.setdefault("llm", {}).setdefault("params", {})["temperature"] = value
-        self.ui.print_success(f"Temperature set to {value}")
 
     async def cmd_max_tokens(self, args: List[str]) -> None:
         if not args:

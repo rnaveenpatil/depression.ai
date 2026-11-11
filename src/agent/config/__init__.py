@@ -4,7 +4,6 @@ Config Module - Schema, Defaults, Validation, and Dynamic LLM Resolution
 KEY FEATURES:
 - LLM models are NOT hardcoded — they are pulled dynamically from the
   LLM provider registry (src/agent/llm/runtime.py).
-- Temperature is resolved dynamically based on prompt complexity/task type.
 - Full schema validation, environment variable interpolation, and layered
   merging of config sources.
 
@@ -12,9 +11,6 @@ Exports:
     Config                      — Root configuration object
     LLMConfig                   — LLM provider and model settings
     LLMParamsConfig             — Generation parameters
-    AdaptiveTemperatureConfig   — Adaptive temperature settings
-    TemperatureResolver         — Adaptive temperature resolver
-    TaskComplexity              — Task complexity enum
     SessionConfig               — Session settings
     ContextConfig               — Context settings
     PermissionsConfig           — Permission settings
@@ -38,15 +34,12 @@ Exports:
     get_loader                  — Get config loader instance
     reset_config                — Reset global config
     resolve_llm_from_config     — Resolve provider/model dynamically
-    resolve_temperature_from_config — Resolve adaptive temperature
 """
 
 from agent.config.config import (
     Config,
     LLMConfig,
     LLMParamsConfig,
-    AdaptiveTemperatureConfig,
-    TemperatureResolver,
     SessionConfig,
     ContextConfig,
     PermissionsConfig,
@@ -62,7 +55,6 @@ from agent.config.config import (
     MCPConfig,
     PluginsConfig,
     AdvancedConfig,
-    TaskComplexity,
     LogLevel,
     Theme,
     EditingMode,
@@ -80,8 +72,6 @@ from agent.config.loader import (
     load_file,
     interpolate_env,
     resolve_llm_from_config,
-    resolve_temperature_from_config,
-    resolve_temperature_with_reason_from_config,
     USER_CONFIG_PATH,
     USER_CONFIG_DIR,
 )
@@ -91,8 +81,6 @@ __all__ = [
     "Config",
     "LLMConfig",
     "LLMParamsConfig",
-    "AdaptiveTemperatureConfig",
-    "TemperatureResolver",
     "SessionConfig",
     "ContextConfig",
     "PermissionsConfig",
@@ -109,7 +97,6 @@ __all__ = [
     "PluginsConfig",
     "AdvancedConfig",
     # Enums
-    "TaskComplexity",
     "LogLevel",
     "Theme",
     "EditingMode",
@@ -125,8 +112,6 @@ __all__ = [
     "load_file",
     "interpolate_env",
     "resolve_llm_from_config",
-    "resolve_temperature_from_config",
-    "resolve_temperature_with_reason_from_config",
     # Paths
     "USER_CONFIG_PATH",
     "USER_CONFIG_DIR",

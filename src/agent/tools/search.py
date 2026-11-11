@@ -9,7 +9,6 @@ Backends:
 from __future__ import annotations
 
 import asyncio
-import fnmatch
 import os
 import re
 import shutil
@@ -17,9 +16,61 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from agent.tools.registry import BaseTool
+from agent.utils.file_walk import WalkStats, glob_match, walk_paths
 from agent.utils.logging import get_logger
 
 logger = get_logger(__name__)
+
+
+RG_IGNORE_GLOBS = (
+    "!.git/**", "!**/.git/**",
+    "!**/.env", "!**/.env.*", "!**/*.env",
+    "!**/.aws/**", "!**/.ssh/**", "!**/.npmrc", "!**/.pypirc",
+    "!**/.netrc", "!**/.git-credentials", "!**/id_rsa*",
+    "!**/id_ed25519*", "!**/*.pem", "!**/*.key",
+    "!**/node_modules/**", "!**/bower_components/**",
+    "!**/__pycache__/**", "!**/.pytest_cache/**",
+    "!**/.venv/**", "!**/venv/**", "!**/env/**",
+    "!**/.tox/**", "!**/.nox/**",
+    "!**/dist/**", "!**/build/**", "!**/target/**",
+    "!**/coverage/**", "!**/htmlcov/**",
+    "!**/site-packages/**", "!**/lib/python*/**",
+)
+
+
+_SECRET_BASENAMES = {
+    ".env", ".npmrc", ".pypirc", ".netrc", ".git-credentials",
+    "id_rsa", "id_dsa", "id_ecdsa", "id_ed25519", "credentials",
+}
+
+
+def resolve_search_root(workspace: Any, raw: str) -> Path:
+    """Resolve and constrain a caller-supplied search root."""
+    candidate = Path(str(raw)).expanduser()
+    if workspace is not None:
+        base = Path(str(workspace.get_project_dir())).expanduser().resolve()
+        if not candidate.is_absolute():
+            candidate = base / candidate
+        resolved = candidate.resolve()
+        if resolved != base and not resolved.is_relative_to(base):
+            raise ValueError("search root must stay inside the workspace")
+        return resolved
+    return candidate.resolve()
+
+
+def _is_secret_file(path: Path) -> bool:
+    name = path.name.lower()
+    if name in _SECRET_BASENAMES:
+        return True
+    if name.startswith(".env.") or name.endswith(".env"):
+        return True
+    if name.endswith((".pem", ".key")) and name not in {"public.pem"}:
+        return True
+    try:
+        from agent.permissions.manager import _path_is_secret
+        return _path_is_secret(str(path))
+    except Exception:
+        return False
 
 
 class SearchTool(BaseTool):
@@ -38,6 +89,7 @@ class SearchTool(BaseTool):
             "case_sensitive": {"type": "boolean", "default": False},
             "name_only": {"type": "boolean", "default": False, "description": "Search file names only"},
             "max_results": {"type": "integer", "default": 100},
+            "max_seconds": {"type": "number", "default": 10.0},
         },
         "required": ["query"],
     }
@@ -55,9 +107,13 @@ class SearchTool(BaseTool):
         if not query:
             return {"success": False, "error": "Missing query"}
 
-        root = params.get("path") or (
+        raw_root = params.get("path") or (
             str(self.workspace.get_project_dir()) if self.workspace else os.getcwd()
         )
+        try:
+            root = str(resolve_search_root(self.workspace, str(raw_root)))
+        except Exception as e:
+            return {"success": False, "error": f"Invalid search root: {e}"}
 
         # name_only relies on Python filtering even when rg is present, because
         # `rg --files` ignores the query entirely.
@@ -73,10 +129,18 @@ class SearchTool(BaseTool):
     async def _ripgrep(
         self, query: str, root: str, params: Dict[str, Any]
     ) -> Optional[Dict[str, Any]]:
+        try:
+            max_results = max(1, min(int(params.get("max_results", 100)), 1000))
+            max_seconds = max(0.1, min(float(params.get("max_seconds", 10.0)), 60.0))
+        except (TypeError, ValueError):
+            return None
+
         args = [
             "rg", "--line-number", "--no-heading", "--color=never",
-            "--hidden", "--glob", "!.git",
+            "--hidden",
         ]
+        for ignored in RG_IGNORE_GLOBS:
+            args.extend(["--glob", ignored])
         if not params.get("case_sensitive"):
             args.append("-i")
         if not params.get("regex"):
@@ -84,60 +148,83 @@ class SearchTool(BaseTool):
         glob = params.get("glob")
         if glob and glob != "*":
             args.extend(["--glob", glob])
-        max_results = int(params.get("max_results", 100))
+        # Per-file cap only; the global cap is enforced by the reader below.
         args.extend(["--max-count", str(max_results)])
-        args.extend([query, root])
+        args.extend(["--", query, root])
 
         try:
             proc = await asyncio.create_subprocess_exec(
                 *args,
                 stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
             )
-            try:
-                stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=30)
-            except asyncio.TimeoutError:
-                try:
-                    proc.kill()
-                    await asyncio.wait_for(proc.wait(), timeout=2)
-                except Exception:
-                    pass
-                return None
         except FileNotFoundError:
             return None
         except Exception as e:
             logger.debug("ripgrep failed (%s); falling back to Python", e)
             return None
 
-        # rg: 0 = matches found, 1 = no matches, 2+ = real error.
-        if proc.returncode not in (0, 1):
+        matches: List[Dict[str, Any]] = []
+
+        async def _consume() -> None:
+            assert proc.stdout is not None
+            while len(matches) < max_results:
+                raw = await proc.stdout.readline()
+                if not raw:
+                    break
+                line = raw.decode(errors="replace").rstrip("\n")
+                parts = line.split(":", 2)
+                if len(parts) == 3:
+                    matches.append(
+                        {
+                            "path": parts[0],
+                            "line": int(parts[1]) if parts[1].isdigit() else None,
+                            "text": parts[2],
+                        }
+                    )
+            if len(matches) >= max_results:
+                try:
+                    proc.kill()
+                except ProcessLookupError:
+                    pass
+            await proc.wait()
+
+        try:
+            await asyncio.wait_for(_consume(), timeout=max_seconds)
+        except asyncio.TimeoutError:
+            try:
+                proc.kill()
+                await asyncio.wait_for(proc.wait(), timeout=2)
+            except Exception:
+                pass
+            return None
+        except Exception as e:
+            logger.debug("ripgrep reader failed (%s); falling back to Python", e)
             return None
 
-        matches: List[Dict[str, Any]] = []
-        for line in stdout.decode(errors="replace").splitlines():
-            if len(matches) >= max_results:
-                break
-            parts = line.split(":", 2)
-            if len(parts) == 3:
-                matches.append(
-                    {
-                        "path": parts[0],
-                        "line": int(parts[1]) if parts[1].isdigit() else None,
-                        "text": parts[2],
-                    }
-                )
+        # rg: 0 = matches found, 1 = no matches, -9 = intentionally capped.
+        if proc.returncode not in (0, 1, -9) and not matches:
+            return None
 
         return {
             "success": True,
             "matches": matches,
             "count": len(matches),
             "backend": "ripgrep",
+            "truncated": len(matches) >= max_results,
         }
 
     async def _python_search(
         self, query: str, root: str, params: Dict[str, Any]
     ) -> Dict[str, Any]:
-        max_results = int(params.get("max_results", 100))
+        try:
+            max_results = max(1, min(int(params.get("max_results", 100)), 1000))
+            max_seconds = max(0.05, min(float(params.get("max_seconds", 10.0)), 60.0))
+        except (TypeError, ValueError):
+            return {
+                "success": False,
+                "error": "max_results and max_seconds must be numbers",
+            }
         glob = params.get("glob") or "*"
         case_sensitive = bool(params.get("case_sensitive"))
         is_regex = bool(params.get("regex"))
@@ -153,19 +240,37 @@ class SearchTool(BaseTool):
 
         matches: List[Dict[str, Any]] = []
         root_path = Path(root)
+        if not root_path.exists():
+            return {
+                "success": True,
+                "matches": [],
+                "count": 0,
+                "backend": "python",
+                "truncated": False,
+            }
+
+        scan_state = {"truncated": False, "reason": ""}
 
         def _scan() -> None:
-            for dirpath, dirnames, filenames in os.walk(root_path):
-                dirnames[:] = [
-                    d for d in dirnames
-                    if d not in (".git", "node_modules", "__pycache__", ".venv", "venv")
-                ]
-                for fn in filenames:
-                    if not fnmatch.fnmatch(fn, glob):
+            stats = WalkStats()
+
+            def accept(relative: str, name: str, is_dir: bool) -> bool:
+                return not is_dir and glob_match(name, glob)
+
+            try:
+                for item in walk_paths(
+                    root_path,
+                    recursive=True,
+                    max_results=None,
+                    max_seconds=max_seconds,
+                    accept=accept,
+                    stats=stats,
+                ):
+                    p = item.path
+                    if _is_secret_file(p):
                         continue
-                    p = Path(dirpath) / fn
                     if name_only:
-                        if pattern.search(fn):
+                        if pattern.search(item.name):
                             matches.append({"path": str(p)})
                             if len(matches) >= max_results:
                                 return
@@ -185,11 +290,20 @@ class SearchTool(BaseTool):
                                         return
                     except Exception:
                         continue
+            finally:
+                scan_state["truncated"] = stats.truncated
+                scan_state["reason"] = stats.reason
 
         await asyncio.to_thread(_scan)
+        truncated = len(matches) >= max_results or scan_state["truncated"]
         return {
             "success": True,
             "matches": matches,
             "count": len(matches),
             "backend": "python",
+            "truncated": truncated,
+            "truncated_reason": (
+                "max_results" if len(matches) >= max_results
+                else (scan_state["reason"] or None)
+            ),
         }

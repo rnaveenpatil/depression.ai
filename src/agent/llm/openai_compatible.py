@@ -396,7 +396,6 @@ class OpenAICompatibleProvider(LLMProvider):
         self,
         messages: Sequence[Any],
         model: str,
-        temperature: float,
         max_tokens: int,
         tools: Optional[Sequence[Any]],
         tool_choice: Optional[str],
@@ -406,7 +405,6 @@ class OpenAICompatibleProvider(LLMProvider):
         body: Dict[str, Any] = {
             "model": model,
             "messages": [self._normalize_message(m) for m in messages],
-            "temperature": temperature,
             "max_tokens": max_tokens,
         }
         if stream:
@@ -435,7 +433,6 @@ class OpenAICompatibleProvider(LLMProvider):
         messages: Sequence[Message],
         *,
         model: Optional[str] = None,
-        temperature: float = 0.1,
         max_tokens: int = 4096,
         tools: Optional[Sequence[ToolSpec]] = None,
         tool_choice: Optional[str] = None,
@@ -462,7 +459,7 @@ class OpenAICompatibleProvider(LLMProvider):
         client = self._require_client()
         body = self._build_body(
             messages=messages, model=model,
-            temperature=temperature, max_tokens=max_tokens,
+            max_tokens=max_tokens,
             tools=tools, tool_choice=tool_choice, stream=False,
             stop=stop, **kwargs,
         )
@@ -511,7 +508,6 @@ class OpenAICompatibleProvider(LLMProvider):
         messages: Sequence[Message],
         *,
         model: Optional[str] = None,
-        temperature: float = 0.1,
         max_tokens: int = 4096,
         tools: Optional[Sequence[ToolSpec]] = None,
         tool_choice: Optional[str] = None,
@@ -543,7 +539,7 @@ class OpenAICompatibleProvider(LLMProvider):
         client = self._require_client()
         body = self._build_body(
             messages=messages, model=model,
-            temperature=temperature, max_tokens=max_tokens,
+            max_tokens=max_tokens,
             tools=tools, tool_choice=tool_choice, stream=True,
             stop=stop, **kwargs,
         )

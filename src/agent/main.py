@@ -167,7 +167,6 @@ Examples:
             "--provider",
             help="Override the provider (openai, anthropic, groq, nvidia, xai, local, ...)",
         )
-        parser.add_argument("--temperature", type=float, help="Fixed temperature (disables adaptive)")
 
         # Behavior
         parser.add_argument("--non-interactive", action="store_true", help="Run one query and exit")
@@ -494,8 +493,6 @@ Examples:
                 cfg["llm"]["provider"] = provider_prefix
         if args.provider and (not args.model or "/" not in args.model):
             cfg["llm"]["provider"] = args.provider
-        if args.temperature is not None:
-            cfg["llm"].setdefault("params", {})["temperature"] = args.temperature
         if args.no_permissions or args.yolo:
             cfg.setdefault("permissions", {})["auto_approve"] = True
             cfg["permissions"]["mode"] = "auto"

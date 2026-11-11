@@ -128,7 +128,7 @@ def test_tool_result_message_keeps_pairing_fields():
 
 def test_openai_body_carries_tool_calls_and_tool_results():
     body = OpenAICompatibleProvider({"api_key": "k"})._build_body(
-        _tool_history(), "m", 0.1, 100, [SPEC], None, False
+        _tool_history(), "m", 100, [SPEC], None, False
     )
     msgs = body["messages"]
 
@@ -152,7 +152,7 @@ def test_openai_body_carries_tool_calls_and_tool_results():
 
 def test_anthropic_body_uses_tool_use_and_tool_result_blocks():
     body = AnthropicProvider({"api_key": "k"})._build_body(
-        _tool_history(), "m", 0.1, 100, [SPEC], None, False
+        _tool_history(), "m", 100, [SPEC], None, False
     )
 
     # System turns are hoisted out of `messages`.
@@ -172,7 +172,7 @@ def test_anthropic_body_uses_tool_use_and_tool_result_blocks():
 
 def test_gemini_body_uses_function_call_and_function_response():
     body = GeminiProvider({"api_key": "k"})._build_body(
-        _tool_history(), 0.1, 100, [SPEC], None
+        _tool_history(), 100, [SPEC], None
     )
 
     assert body["system_instruction"]["parts"][0]["text"] == "be terse"
@@ -191,7 +191,7 @@ def test_gemini_body_uses_function_call_and_function_response():
 
 def test_ollama_body_keeps_dict_arguments_and_flat_tool_role():
     body = OllamaProvider()._build_body(
-        _tool_history(), "m", 0.1, 100, [SPEC], None, False
+        _tool_history(), "m", 100, [SPEC], None, False
     )
     msgs = body["messages"]
 
@@ -245,17 +245,17 @@ async def test_context_tool_history_builds_a_body_in_every_adapter():
 
     # The full history builds a body in each adapter without raising.
     openai_body = OpenAICompatibleProvider({"api_key": "k"})._build_body(
-        messages, "m", 0.1, 100, [SPEC], None, False
+        messages, "m", 100, [SPEC], None, False
     )
     assert openai_body["messages"][-1]["role"] == "tool"
 
     anthropic_body = AnthropicProvider({"api_key": "k"})._build_body(
-        messages, "m", 0.1, 100, [SPEC], None, False
+        messages, "m", 100, [SPEC], None, False
     )
     assert anthropic_body["messages"][-1]["content"][0]["type"] == "tool_result"
 
     gemini_body = GeminiProvider({"api_key": "k"})._build_body(
-        messages, 0.1, 100, [SPEC], None
+        messages, 100, [SPEC], None
     )
     assert any(
         "functionCall" in part
@@ -264,6 +264,6 @@ async def test_context_tool_history_builds_a_body_in_every_adapter():
     )
 
     ollama_body = OllamaProvider()._build_body(
-        messages, "m", 0.1, 100, [SPEC], None, False
+        messages, "m", 100, [SPEC], None, False
     )
     assert ollama_body["messages"][-1]["role"] == "tool"

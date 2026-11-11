@@ -1039,17 +1039,9 @@ class AgentCoordinator:
         )
         # A plan already exists. Don't spend another model call planning
         # the coordinator's execution prompt inside the Build agent.
-        build_loop = getattr(self.build_agent, "loop", None)
-        original_planning = getattr(build_loop, "enable_planning", False)
-        try:
-            if build_loop is not None:
-                build_loop.enable_planning = False
-            build_result = await self.build_agent.process_query(
-                query=build_prompt, context=context, record_user=False,
-            )
-        finally:
-            if build_loop is not None:
-                build_loop.enable_planning = original_planning
+        build_result = await self.build_agent.process_query(
+            query=build_prompt, context=context, record_user=False,
+        )
         result = {
             "success": build_result.get("success", True),
             "plan": plan,
@@ -1164,20 +1156,6 @@ class AgentCoordinator:
         if not result["success"] and build_result.get("error"):
             result["error"] = str(build_result.get("error"))
         return result
-
-    def _is_plan_complete(self, execution: str, plan: str) -> bool:
-        execution_lower = (execution or "").lower()
-        completion_indicators = [
-            "completed", "finished", "done", "successfully",
-            "all tasks", "complete", "✓", "✅",
-        ]
-        failure_indicators = [
-            "failed", "error", "blocked", "cannot", "unable",
-            "timeout", "permission denied", "not found",
-        ]
-        has_completion = any(ind in execution_lower for ind in completion_indicators)
-        has_failure = any(ind in execution_lower for ind in failure_indicators)
-        return has_completion and not has_failure
 
     async def execute_plan(
         self, plan: str, context: Optional[Dict[str, Any]] = None

@@ -11,6 +11,7 @@ from textual.widgets import Static
 
 AMBER = "#ffcc44"
 GREEN = "#00ff66"
+ERROR = "#ff4466"
 MUTED = "#3d8c5c"
 DIM = "#1a5c33"
 
@@ -53,6 +54,8 @@ class ThinkingIndicator(Static):
         super().__init__("", **kwargs)
         self._i = 0
         self._active = False
+        self._detail = ""
+        self._alert = False
 
     def on_mount(self) -> None:
         self.display = False
@@ -62,11 +65,20 @@ class ThinkingIndicator(Static):
         self._active = True
         self.display = True
         self._i = 0
+        self._detail = ""
+        self._alert = False
         self._tick()
 
     def stop(self) -> None:
         self._active = False
         self.display = False
+
+    def set_progress(self, detail: str = "", alert: bool = False) -> None:
+        """Show a short progress/alert suffix without hiding the phase."""
+        self._detail = str(detail or "").strip()
+        self._alert = bool(alert and self._detail)
+        if self._active:
+            self._tick()
 
     def _tick(self) -> None:
         if not self._active:
@@ -76,4 +88,6 @@ class ThinkingIndicator(Static):
         phase = _PHASES[(self._i // 12) % len(_PHASES)]
         # Slow trailing ellipsis so it reads as "still going", not "stuck".
         dots = "." * ((self._i // 6) % 4)
-        self.update(f"[{MUTED}]{trail}[/]  [{AMBER}]{phase}{dots}[/]")
+        color = ERROR if self._alert else AMBER
+        detail = f"  [{color}]{self._detail}[/]" if self._detail else ""
+        self.update(f"[{MUTED}]{trail}[/]  [{color}]{phase}{dots}[/]{detail}")

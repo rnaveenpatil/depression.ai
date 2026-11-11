@@ -364,7 +364,6 @@ class AnthropicProvider(LLMProvider):
         self,
         messages: Sequence[Any],
         model: str,
-        temperature: float,
         max_tokens: int,
         tools: Optional[Sequence[Any]],
         tool_choice: Optional[str],
@@ -379,7 +378,6 @@ class AnthropicProvider(LLMProvider):
             # Anthropic requires max_tokens; never send 0/None.
             "max_tokens": int(max_tokens) if max_tokens and max_tokens > 0
                           else self.default_max_tokens,
-            "temperature": temperature,
         }
         if system:
             body["system"] = system
@@ -419,7 +417,6 @@ class AnthropicProvider(LLMProvider):
         messages: Sequence[Message],
         *,
         model: Optional[str] = None,
-        temperature: float = 0.1,
         max_tokens: int = 4096,
         tools: Optional[Sequence[ToolSpec]] = None,
         tool_choice: Optional[str] = None,
@@ -447,7 +444,7 @@ class AnthropicProvider(LLMProvider):
 
         body = self._build_body(
             messages=messages, model=model,
-            temperature=temperature, max_tokens=max_tokens,
+            max_tokens=max_tokens,
             tools=tools, tool_choice=tool_choice, stream=False,
             **kwargs,
         )
@@ -464,7 +461,6 @@ class AnthropicProvider(LLMProvider):
         messages: Sequence[Message],
         *,
         model: Optional[str] = None,
-        temperature: float = 0.1,
         max_tokens: int = 4096,
         tools: Optional[Sequence[ToolSpec]] = None,
         tool_choice: Optional[str] = None,
@@ -504,7 +500,7 @@ class AnthropicProvider(LLMProvider):
 
         body = self._build_body(
             messages=messages, model=model,
-            temperature=temperature, max_tokens=max_tokens,
+            max_tokens=max_tokens,
             tools=tools, tool_choice=tool_choice, stream=True,
             **kwargs,
         )

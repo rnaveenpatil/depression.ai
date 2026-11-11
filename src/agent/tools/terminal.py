@@ -59,6 +59,11 @@ class TerminalTool(BaseTool):
             "timeout": {"type": "number", "description": "Timeout seconds (default 60)", "default": 60},
             "shell": {"type": "boolean", "description": "Run via shell (default true)", "default": True},
             "env": {"type": "object", "description": "Extra env vars"},
+            "include_aws_credentials": {
+                "type": "boolean",
+                "default": False,
+                "description": "Opt in to injecting saved AWS credentials into the child",
+            },
         },
         "required": ["command"],
     }
@@ -88,29 +93,30 @@ class TerminalTool(BaseTool):
     # PATH RESOLUTION
     # ------------------------------------------------------------------
 
-    def _is_allowed_extra(self, path: str) -> bool:
-        return any(
-            path == root or path.startswith(root.rstrip("/") + "/")
-            for root in self.allowed_extra_dirs
-        )
+    @staticmethod
+    def _inside(path: Path, root: Path) -> bool:
+        return path == root or path.is_relative_to(root)
 
-    def _is_system_temp(self, path: str) -> bool:
-        return any(
-            path == root or path.startswith(root.rstrip("/") + "/")
-            for root in self._system_temp_roots
-        )
+    def _is_allowed_extra(self, path: Path) -> bool:
+        return any(self._inside(path, Path(root).resolve()) for root in self.allowed_extra_dirs)
+
+    def _is_system_temp(self, path: Path) -> bool:
+        return any(self._inside(path, Path(root).resolve()) for root in self._system_temp_roots)
 
     def _resolve_cwd(self, cwd: str) -> Optional[str]:
         try:
+            candidate = Path(cwd).expanduser()
+            if self.workspace and not candidate.is_absolute():
+                candidate = Path(str(self.workspace.get_project_dir())) / candidate
+            p = candidate.resolve()
+
             if self.workspace:
-                if self._is_system_temp(cwd) or self._is_allowed_extra(cwd):
-                    p = Path(cwd).expanduser().resolve()
+                if self._is_system_temp(p) or self._is_allowed_extra(p):
                     if not p.exists():
                         p.mkdir(parents=True, exist_ok=True)
                     return str(p)
-                return str(self.workspace.assert_inside_workspace(cwd))
+                return str(self.workspace.assert_inside_workspace(str(p)))
 
-            p = Path(cwd).expanduser().resolve()
             if not p.exists():
                 p.mkdir(parents=True, exist_ok=True)
             return str(p)
@@ -122,12 +128,20 @@ class TerminalTool(BaseTool):
     # ENV
     # ------------------------------------------------------------------
 
-    def _build_env(self, extra: Dict[str, Any]) -> Dict[str, str]:
-        env = {k: str(v) for k, v in os.environ.items()}
-        try:
-            env.update(EnvManager.get().get_aws_env())
-        except Exception:
-            pass
+    def _build_env(self, extra: Dict[str, Any], include_aws: bool = False) -> Dict[str, str]:
+        secret_keys = {
+            "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY",
+            "AWS_SESSION_TOKEN", "AWS_SECURITY_TOKEN",
+        }
+        env = {
+            k: str(v) for k, v in os.environ.items()
+            if not (k in secret_keys and not include_aws)
+        }
+        if include_aws:
+            try:
+                env.update(EnvManager.get().get_aws_env())
+            except Exception:
+                pass
         if extra:
             env.update({str(k): str(v) for k, v in extra.items()})
         return env
@@ -174,9 +188,16 @@ class TerminalTool(BaseTool):
                 "command": command,
             }
 
-        timeout = float(params.get("timeout", 60))
+        try:
+            timeout = max(0.1, min(float(params.get("timeout", 60)), 3600.0))
+        except (TypeError, ValueError):
+            return {"success": False, "error": "timeout must be a number",
+                    "recoverable": True, "command": command}
         use_shell = bool(params.get("shell", True))
-        env = self._build_env(params.get("env") or {})
+        env = self._build_env(
+            params.get("env") or {},
+            include_aws=bool(params.get("include_aws_credentials", False)),
+        )
 
         try:
             result = await run_command(

@@ -15,7 +15,6 @@ Supports:
 - Schema validation
 - Hot reload with file watching
 - Dynamic LLM resolution (no hardcoded models)
-- Adaptive temperature hooks
 """
 
 from __future__ import annotations
@@ -723,43 +722,6 @@ def resolve_llm_from_config(
     return cfg.resolve_llm(registry=registry, prefer_quality=prefer_quality)
 
 
-def resolve_temperature_from_config(
-    prompt: str,
-    config: Optional[Config] = None,
-    provider: Optional[str] = None,
-    model: Optional[str] = None,
-    context: Optional[Dict[str, Any]] = None,
-) -> float:
-    """
-    Convenience wrapper to resolve an adaptive temperature for a prompt.
-    """
-    cfg = config or get_config()
-    if cfg is None:
-        return 0.7
-    return cfg.resolve_temperature(
-        prompt=prompt,
-        provider=provider,
-        model=model,
-        context=context,
-    )
-
-
-def resolve_temperature_with_reason_from_config(
-    prompt: str,
-    config: Optional[Config] = None,
-    provider: Optional[str] = None,
-    model: Optional[str] = None,
-    context: Optional[Dict[str, Any]] = None,
-) -> Tuple[float, str]:
-    """Same as above, but returns (temperature, reason)"""
-    cfg = config or get_config()
-    if cfg is None:
-        return 0.7, "no config"
-    return cfg.resolve_temperature_with_reason(
-        prompt=prompt, provider=provider, model=model, context=context,
-    )
-
-
 __all__ = [
     "ConfigLoader",
     "load_config",
@@ -771,8 +733,6 @@ __all__ = [
     "load_file",
     "interpolate_env",
     "resolve_llm_from_config",
-    "resolve_temperature_from_config",
-    "resolve_temperature_with_reason_from_config",
     "USER_CONFIG_PATH",
     "USER_CONFIG_DIR",
 ]

@@ -105,7 +105,6 @@ _PASSTHROUGH_OPTION_KEYS = (
     "typical_p",
     "repeat_penalty",
     "repeat_last_n",
-    "temperature",
     "seed",
     "stop",
     "num_ctx",
@@ -330,7 +329,6 @@ class OllamaProvider(LLMProvider):
         self,
         messages: Sequence[Any],
         model: str,
-        temperature: float,
         max_tokens: int,
         tools: Optional[Sequence[Any]],
         tool_choice: Optional[str],
@@ -338,13 +336,12 @@ class OllamaProvider(LLMProvider):
         **kwargs: Any,
     ) -> Dict[str, Any]:
         options: Dict[str, Any] = {
-            "temperature": temperature,
             # Ollama calls max_tokens "num_predict".
             "num_predict": int(max_tokens) if max_tokens and max_tokens > 0 else 4096,
         }
         for key in _PASSTHROUGH_OPTION_KEYS:
             v = kwargs.get(key)
-            if v is not None and key != "temperature":
+            if v is not None:
                 options[key] = v
 
         body: Dict[str, Any] = {
@@ -390,7 +387,6 @@ class OllamaProvider(LLMProvider):
         messages: Sequence[Message],
         *,
         model: Optional[str] = None,
-        temperature: float = 0.1,
         max_tokens: int = 4096,
         tools: Optional[Sequence[ToolSpec]] = None,
         tool_choice: Optional[str] = None,
@@ -412,7 +408,7 @@ class OllamaProvider(LLMProvider):
         client = self._require_client()
         body = self._build_body(
             messages=messages, model=model,
-            temperature=temperature, max_tokens=max_tokens,
+            max_tokens=max_tokens,
             tools=tools, tool_choice=tool_choice, stream=False,
             **kwargs,
         )
@@ -429,7 +425,6 @@ class OllamaProvider(LLMProvider):
         messages: Sequence[Message],
         *,
         model: Optional[str] = None,
-        temperature: float = 0.1,
         max_tokens: int = 4096,
         tools: Optional[Sequence[ToolSpec]] = None,
         tool_choice: Optional[str] = None,
@@ -461,7 +456,7 @@ class OllamaProvider(LLMProvider):
         client = self._require_client()
         body = self._build_body(
             messages=messages, model=model,
-            temperature=temperature, max_tokens=max_tokens,
+            max_tokens=max_tokens,
             tools=tools, tool_choice=tool_choice, stream=True,
             **kwargs,
         )

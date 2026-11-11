@@ -50,7 +50,6 @@ class SessionState:
     # Model
     provider: str = ""
     model: str = ""
-    last_temperature: float = 0.1
 
     # Current work
     current_plan_id: Optional[str] = None

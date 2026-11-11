@@ -112,6 +112,8 @@ async def _pump(
     pending = ""
     used = 0
     truncated = False
+    discarding = False
+    max_line = 1024 * 1024
 
     def emit(line: str) -> None:
         nonlocal used, truncated
@@ -137,9 +139,16 @@ async def _pump(
         pending += decoder.decode(raw)
         while "\n" in pending:
             line, pending = pending.split("\n", 1)
+            if discarding:
+                discarding = False
+                continue
             emit(line)
+        if len(pending) > max_line:
+            emit(pending[:max_line] + " …[line truncated]")
+            pending = ""
+            discarding = True
     pending += decoder.decode(b"", final=True)
-    if pending:
+    if pending and not discarding:
         emit(pending)
     return truncated
 

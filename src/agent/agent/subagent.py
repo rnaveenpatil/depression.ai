@@ -49,7 +49,6 @@ class SubAgentConfig:
     name: str
     description: str
     model: str = ""
-    temperature: float = 0.1
     allowed_tools: List[str] = field(default_factory=list)
     prompt_file: str = ""
 
@@ -60,7 +59,6 @@ BUILTIN_SUBAGENTS: Dict[SubAgentRole, SubAgentConfig] = {
         name="general",
         description="General-purpose multi-step task agent. Full access minus todowrite.",
         model="nvidia/nemotron-3.5-lightning-30b-a3b",
-        temperature=0.3,
         allowed_tools=[
             "terminal", "filesystem", "search", "git", "patch", "process",
             "web", "browser", "diagnostics", "mcp",
@@ -74,7 +72,6 @@ BUILTIN_SUBAGENTS: Dict[SubAgentRole, SubAgentConfig] = {
             "webfetch, websearch, read-only git allowed."
         ),
         model="nvidia/nemotron-3.5-lightning-30b-a3b",
-        temperature=0.1,
         allowed_tools=["search", "git", "web"],
     ),
     SubAgentRole.SCOUT: SubAgentConfig(
@@ -82,7 +79,6 @@ BUILTIN_SUBAGENTS: Dict[SubAgentRole, SubAgentConfig] = {
         name="scout",
         description="Experimental docs and dependency-source research agent.",
         model="nvidia/nemotron-3.5-lightning-30b-a3b",
-        temperature=0.1,
         allowed_tools=["search", "web"],
     ),
 }
@@ -125,12 +121,9 @@ class SubAgentManager:
             user_cfg = config.get(role.value) or {}
             if "model" in user_cfg:
                 cfg.model = user_cfg["model"]
-            if "temperature" in user_cfg:
-                cfg.temperature = user_cfg["temperature"]
             if "allowed_tools" in user_cfg:
                 cfg.allowed_tools = list(user_cfg["allowed_tools"])
 
-        self._model_lock = asyncio.Lock()
         self.llm_registry: Optional[LLMProviderRegistry] = None
 
         logger.info("SubAgentManager initialized with roles: %s", list(self.subagent_configs.keys()))
@@ -205,68 +198,44 @@ class SubAgentManager:
             context=context or {},
         )
 
-        async with self._model_lock:
-            prev_model = None
-            prev_provider = None
-            model_switched = False
+        try:
+            if self.llm_registry is None:
+                await self.initialize()
+            subagent.llm = self.llm_registry
+            subagent.tool_registry = await self._create_subagent_tools(cfg, subagent)
+            self.subagents[subagent_id] = subagent
+            subagent.status = "working"
+
             try:
-                if self.llm_registry is None:
-                    await self.initialize()
-                subagent.llm = self.llm_registry
-
-                prev_model = subagent.llm.get_current_model()
-                prev_provider = subagent.llm.get_current_provider()
-
-                if cfg.model and cfg.model != prev_model:
-                    result = subagent.llm.set_model(cfg.model)
-                    if isinstance(result, dict) and not result.get("success", False):
-                        logger.warning(
-                            "Subagent %s could not set model %s: %s",
-                            cfg.name,
-                            cfg.model,
-                            result.get("error"),
-                        )
-                    else:
-                        model_switched = True
-
-                subagent.tool_registry = await self._create_subagent_tools(cfg, subagent)
-                self.subagents[subagent_id] = subagent
-                subagent.status = "working"
-
-                try:
-                    system_prompt = self._build_subagent_system_prompt(cfg, context)
-                    messages = [
-                        Message(role="system", content=system_prompt),
-                        Message(role="user", content=query),
-                    ]
-                    result_text = await self._run_subagent_loop(
-                        subagent, messages, cfg.temperature
-                    )
-                    subagent.status = "completed"
-                    return {
-                        "success": True,
-                        "subagent": cfg.name,
-                        "result": result_text,
-                        "subagent_id": subagent_id,
-                    }
-                except Exception as e:
-                    subagent.status = "failed"
-                    logger.error("Subagent %s failed: %s", subagent_id, e, exc_info=True)
-                    return {
-                        "success": False,
-                        "subagent": cfg.name,
-                        "error": str(e),
-                        "subagent_id": subagent_id,
-                    }
-            finally:
-                if model_switched and prev_model:
-                    try:
-                        subagent.llm.set_model(prev_model)
-                        if prev_provider:
-                            subagent.llm.set_provider(prev_provider)
-                    except Exception as exc:
-                        logger.debug("Failed to restore model '%s': %s", prev_model, exc)
-                self.subagents.pop(subagent_id, None)
+                system_prompt = self._build_subagent_system_prompt(cfg, context)
+                messages = [
+                    Message(role="system", content=system_prompt),
+                    Message(role="user", content=query),
+                ]
+                result_text = await self._run_subagent_loop(
+                    subagent, messages, model=cfg.model or None
+                )
+                subagent.status = "completed"
+                return {
+                    "success": True,
+                    "subagent": cfg.name,
+                    "result": result_text,
+                    "subagent_id": subagent_id,
+                }
+            except asyncio.CancelledError:
+                subagent.status = "cancelled"
+                raise
+            except Exception as e:
+                subagent.status = "failed"
+                logger.error("Subagent %s failed: %s", subagent_id, e, exc_info=True)
+                return {
+                    "success": False,
+                    "subagent": cfg.name,
+                    "error": str(e),
+                    "subagent_id": subagent_id,
+                }
+        finally:
+            self.subagents.pop(subagent_id, None)
 
     async def _create_subagent_tools(
         self, cfg: SubAgentConfig, subagent: SubAgent
@@ -330,6 +299,15 @@ class SubAgentManager:
                 if name in _WRITE_TOOL_NAMES:
                     registry.tools.pop(name, None)
 
+        for alias, primary in {
+            "bash": "terminal",
+            "grep": "search",
+            "webfetch": "web",
+            "websearch": "web",
+        }.items():
+            if alias in registry.tools and primary in registry.tools:
+                registry.hide_tool(alias)
+
         return registry
 
     def _build_subagent_system_prompt(
@@ -368,7 +346,7 @@ class SubAgentManager:
         self,
         subagent: SubAgent,
         messages: List[Message],
-        temperature: float,
+        model: Optional[str] = None,
     ) -> str:
         max_turns = int(self.config.get("max_turns", 10))
         final_response = ""
@@ -379,7 +357,7 @@ class SubAgentManager:
             response = await subagent.llm.complete_with_tools(
                 messages=messages,
                 tools=schemas,
-                temperature=temperature,
+                model=model,
                 max_tokens=4000,
             )
 

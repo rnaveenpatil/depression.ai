@@ -103,33 +103,3 @@ def test_query_duration_only_runs_while_active_or_frozen():
     assert _query_elapsed(False, 100.0, 0.0, now=200.0) == 0.0
     assert _query_elapsed(True, 100.0, 0.0, now=102.5) == 2.5
     assert _query_elapsed(False, 100.0, 2.5, now=200.0) == 2.5
-
-
-def test_intent_classification_usage_is_recorded():
-    import asyncio
-
-    from agent.agent.loop import AgentLoop, LoopContext
-
-    class FakeLLM:
-        def get_current_model(self):
-            return "test-model"
-
-        async def complete(self, **kwargs):
-            return NS(
-                content="question",
-                usage={"prompt_tokens": 4, "completion_tokens": 1,
-                       "total_tokens": 5},
-            )
-
-    loop = object.__new__(AgentLoop)
-    loop.context = LoopContext()
-    loop.enable_intent_classification = True
-    loop.llm = FakeLLM()
-
-    intent = asyncio.run(loop._classify_intent("compose a poem about rivers"))
-
-    assert intent == "question"
-    assert loop.context.llm_calls == 1
-    assert loop.context.input_tokens == 4
-    assert loop.context.output_tokens == 1
-    assert loop.context.tokens_used == 5

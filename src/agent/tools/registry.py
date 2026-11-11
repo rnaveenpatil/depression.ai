@@ -19,14 +19,15 @@ from __future__ import annotations
 
 import asyncio
 import json
+import threading
 import time
 from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from difflib import get_close_matches
-from typing import Any, Awaitable, Callable, Dict, List, Optional, Set
+from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 from agent.utils.logging import get_logger
-from agent.utils.errors import ToolError, ToolNotFoundError
+from agent.utils.errors import ToolError
 from agent.utils.redact import redact
 
 logger = get_logger(__name__)
@@ -140,6 +141,24 @@ def _validate_schema(value: Any, schema: Dict[str, Any], path: str = "") -> List
     if enum and value not in enum:
         errors.append(f"{path or 'arguments'} must be one of {enum}")
 
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        minimum = schema.get("minimum")
+        maximum = schema.get("maximum")
+        if minimum is not None and value < minimum:
+            errors.append(f"{path or 'arguments'} must be >= {minimum}")
+        if maximum is not None and value > maximum:
+            errors.append(f"{path or 'arguments'} must be <= {maximum}")
+    if isinstance(value, str):
+        if schema.get("minLength") is not None and len(value) < schema["minLength"]:
+            errors.append(f"{path or 'arguments'} is too short")
+        if schema.get("maxLength") is not None and len(value) > schema["maxLength"]:
+            errors.append(f"{path or 'arguments'} is too long")
+    if isinstance(value, list):
+        if schema.get("minItems") is not None and len(value) < schema["minItems"]:
+            errors.append(f"{path or 'arguments'} needs at least {schema['minItems']} items")
+        if schema.get("maxItems") is not None and len(value) > schema["maxItems"]:
+            errors.append(f"{path or 'arguments'} allows at most {schema['maxItems']} items")
+
     return errors
 
 
@@ -147,20 +166,36 @@ def _validate_schema(value: Any, schema: Dict[str, Any], path: str = "") -> List
 # TASK ROUTING
 # ======================================================================
 
-# Which categories each intent cares about. Order matters only for logging.
-INTENT_CATEGORIES: Dict[str, Set[str]] = {
-    "feature":   {"inspect", "edit", "run", "proc", "vcs", "cloud", "net"},
-    "bugfix":    {"inspect", "edit", "run", "proc", "vcs", "cloud", "net"},
-    "refactor":  {"inspect", "edit", "run", "proc", "vcs", "cloud", "net"},
-    "analysis":  {"inspect", "run", "proc", "vcs", "cloud", "net"},
-    "question":  {"inspect", "net", "cloud"},
-    "unknown":   {"inspect", "edit", "run", "proc", "vcs", "cloud", "net", "plan", "ui", "misc"},
-}
+# ======================================================================
+# OUTPUT CAP
+# ======================================================================
 
-# Fallback: these categories are always advertised. `misc` is included
-# deliberately: third-party / MCP tools default to it, and hiding an
-# unclassified tool is worse than sending one extra schema.
-ALWAYS_VISIBLE_CATEGORIES: Set[str] = {"plan", "ui", "misc"}
+MAX_TOOL_OUTPUT_BYTES = 256_000
+_TOOL_PREVIEW_BYTES = 96_000
+
+
+def _cap_tool_output(result: Dict[str, Any]) -> Dict[str, Any]:
+    """Bound the payload returned to the model/context.
+
+    Small results are untouched. Huge results are replaced by a compact
+    preview with success/error metadata preserved.
+    """
+    try:
+        blob = json.dumps(result, default=str)
+    except Exception:
+        return result
+    if len(blob.encode("utf-8")) <= MAX_TOOL_OUTPUT_BYTES:
+        return result
+
+    small: Dict[str, Any] = {}
+    for key in ("success", "error", "path", "tool", "exit_code", "status",
+                "truncated", "truncated_reason", "count", "size"):
+        if key in result:
+            small[key] = result[key]
+    small["truncated"] = True
+    small["truncated_reason"] = "tool output exceeded limit"
+    small["output_preview"] = blob[:_TOOL_PREVIEW_BYTES]
+    return small
 
 
 # ======================================================================
@@ -175,7 +210,8 @@ class ToolRegistry:
         self.tools: Dict[str, BaseTool] = {}
         self._external: Dict[str, Dict[str, Any]] = {}
         self.stats: Dict[str, ToolStats] = {}
-        self._lock = asyncio.Lock()
+        self._hidden_tools: set[str] = set()
+        self._lock = threading.RLock()
 
         # Monotonic counter, incremented on every successful mutating call.
         # Consumers (loop) use this to decide when to drop caches.
@@ -188,16 +224,31 @@ class ToolRegistry:
     async def register_tool(self, tool: BaseTool) -> None:
         if not getattr(tool, "name", None):
             raise ToolError("Tool must have a name")
-        self.tools[tool.name] = tool
-        self.stats.setdefault(tool.name, ToolStats())
+        with self._lock:
+            self.tools[tool.name] = tool
+            self.stats.setdefault(tool.name, ToolStats())
         logger.debug("Registered tool: %s", tool.name)
 
     def unregister_tool(self, name: str) -> bool:
-        removed = self.tools.pop(name, None) is not None
-        removed = self._external.pop(name, None) is not None or removed
-        if removed:
-            self.stats.pop(name, None)
+        with self._lock:
+            removed = self.tools.pop(name, None) is not None
+            removed = self._external.pop(name, None) is not None or removed
+            if removed:
+                self.stats.pop(name, None)
+            self._hidden_tools.discard(name)
         return removed
+
+    def hide_tool(self, name: str) -> bool:
+        """Hide a registered alias from model-facing schemas.
+
+        The tool remains executable for backward compatibility, but duplicate
+        aliases no longer consume prompt tokens or confuse tool selection.
+        """
+        with self._lock:
+            if name not in self.tools and name not in self._external:
+                return False
+            self._hidden_tools.add(name)
+            return True
 
     def register_external(
         self,
@@ -210,23 +261,27 @@ class ToolRegistry:
         mutating: bool = False,
         category: str = "misc",
     ) -> None:
-        self._external[name] = {
-            "handler": handler,
-            "description": description,
-            "parameters": parameters or {"type": "object", "properties": {}},
-            "read_only": bool(read_only),
-            "mutating": bool(mutating),
-            "category": category or "misc",
-        }
-        self.stats.setdefault(name, ToolStats())
+        with self._lock:
+            self._external[name] = {
+                "handler": handler,
+                "description": description,
+                "parameters": parameters or {"type": "object", "properties": {}},
+                "read_only": bool(read_only),
+                "mutating": bool(mutating),
+                "category": category or "misc",
+            }
+            self.stats.setdefault(name, ToolStats())
         logger.debug("Registered external tool: %s", name)
 
     def list_tools(self, include_disabled: bool = False) -> List[str]:
-        names = list(self.tools.keys()) + list(self._external.keys())
+        with self._lock:
+            tools = dict(self.tools)
+            external = dict(self._external)
+        names = list(tools.keys()) + list(external.keys())
         if not include_disabled:
             names = [
                 n for n in names
-                if n in self._external or getattr(self.tools[n], "enabled", True)
+                if n in external or getattr(tools[n], "enabled", True)
             ]
         return sorted(names)
 
@@ -235,22 +290,25 @@ class ToolRegistry:
     # ------------------------------------------------------------------
 
     def is_read_only(self, name: str) -> bool:
-        if name in self._external:
-            return bool(self._external[name].get("read_only"))
         t = self.tools.get(name)
-        return bool(getattr(t, "read_only", False))
+        if t is not None:
+            return bool(getattr(t, "read_only", False))
+        ext = self._external.get(name)
+        return bool(ext.get("read_only")) if ext else False
 
     def is_mutating(self, name: str) -> bool:
-        if name in self._external:
-            return bool(self._external[name].get("mutating"))
         t = self.tools.get(name)
-        return bool(getattr(t, "mutating", False))
+        if t is not None:
+            return bool(getattr(t, "mutating", False))
+        ext = self._external.get(name)
+        return bool(ext.get("mutating")) if ext else False
 
     def get_category(self, name: str) -> str:
-        if name in self._external:
-            return str(self._external[name].get("category") or "misc")
         t = self.tools.get(name)
-        return str(getattr(t, "category", "misc"))
+        if t is not None:
+            return str(getattr(t, "category", "misc"))
+        ext = self._external.get(name)
+        return str(ext.get("category") or "misc") if ext else "misc"
 
     # ------------------------------------------------------------------
     # SCHEMAS — single source of truth
@@ -260,17 +318,20 @@ class ToolRegistry:
         """Merged, deduped list of every callable tool schema."""
         out: List[Dict[str, Any]] = []
         seen = set()
+        with self._lock:
+            tools = dict(self.tools)
+            external = dict(self._external)
 
-        for name, tool in self.tools.items():
-            if not getattr(tool, "enabled", True):
+        for name, tool in tools.items():
+            if name in self._hidden_tools or not getattr(tool, "enabled", True):
                 continue
             if name in seen:
                 continue
             seen.add(name)
             out.append(tool.to_schema())
 
-        for name, info in self._external.items():
-            if name in seen:
+        for name, info in external.items():
+            if name in self._hidden_tools or name in seen:
                 continue
             seen.add(name)
             out.append({
@@ -346,18 +407,18 @@ class ToolRegistry:
         if not isinstance(args, dict):
             return f"arguments must be an object, got {type(args).__name__}"
 
-        if name in self._external:
+        tool = self.tools.get(name)
+        if tool is not None:
+            schema = tool.parameters or {}
+        elif name in self._external:
             schema = self._external[name].get("parameters") or {}
         else:
-            tool = self.tools.get(name)
-            if tool is None:
-                matches = get_close_matches(name, self.list_tools(), n=1)
-                hint = f" Did you mean '{matches[0]}'?" if matches else ""
-                return (
-                    f"Unknown tool '{name}'.{hint} "
-                    f"Available: {', '.join(self.list_tools())}"
-                )
-            schema = tool.parameters or {}
+            matches = get_close_matches(name, self.list_tools(), n=1)
+            hint = f" Did you mean '{matches[0]}'?" if matches else ""
+            return (
+                f"Unknown tool '{name}'.{hint} "
+                f"Available: {', '.join(self.list_tools())}"
+            )
 
         errors = _validate_schema(args, schema)
         if errors:
@@ -367,6 +428,15 @@ class ToolRegistry:
     # ------------------------------------------------------------------
     # EXECUTION
     # ------------------------------------------------------------------
+
+    async def execute(
+        self,
+        name: str,
+        params: Optional[Dict[str, Any]] = None,
+        timeout: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """Compatibility entry point used by the main agent and subagents."""
+        return await self.execute_safe(name, params, timeout=timeout)
 
     async def execute_safe(
         self,
@@ -389,10 +459,15 @@ class ToolRegistry:
                 ),
             }
 
-        if name in self._external:
-            return await self._execute_external(name, params, timeout)
-
-        tool = self.tools[name]
+        tool = self.tools.get(name)
+        if tool is None:
+            if name in self._external:
+                return await self._execute_external(name, params, timeout)
+            return {
+                "success": False,
+                "error": f"Unknown tool '{name}'",
+                "recoverable": True,
+            }
         if not getattr(tool, "enabled", True):
             return {
                 "success": False,
@@ -417,11 +492,12 @@ class ToolRegistry:
                 "suggestion": "Reduce the scope of the request or raise the timeout.",
             }
         except Exception as e:
-            self._bump(name, success=False, elapsed=time.time() - t0, error=str(e))
+            message = str(redact({"error": str(e)}).get("error", str(e)))
+            self._bump(name, success=False, elapsed=time.time() - t0, error=message)
             logger.error("Tool '%s' raised: %s", name, e, exc_info=True)
             return {
                 "success": False,
-                "error": f"{type(e).__name__}: {e}",
+                "error": f"{type(e).__name__}: {message}",
                 "recoverable": True,
                 "suggestion": "Inspect the error and retry with corrected arguments.",
             }
@@ -434,6 +510,7 @@ class ToolRegistry:
             result = redact(result)
         except Exception:
             pass
+        result = _cap_tool_output(result)
 
         success = bool(result.get("success"))
         self._bump(
@@ -461,17 +538,19 @@ class ToolRegistry:
             return {"success": False, "error": f"Tool '{name}' timed out",
                     "recoverable": True}
         except TypeError as e:
-            self._bump(name, False, time.time() - t0, str(e))
+            message = str(redact({"error": str(e)}).get("error", str(e)))
+            self._bump(name, False, time.time() - t0, message)
             return {
                 "success": False,
-                "error": f"Invalid arguments for '{name}': {e}",
+                "error": f"Invalid arguments for '{name}': {message}",
                 "recoverable": True,
                 "invalid_arguments": True,
                 "suggestion": "Check parameter names match the tool schema.",
             }
         except Exception as e:
-            self._bump(name, False, time.time() - t0, str(e))
-            return {"success": False, "error": f"{type(e).__name__}: {e}",
+            message = str(redact({"error": str(e)}).get("error", str(e)))
+            self._bump(name, False, time.time() - t0, message)
+            return {"success": False, "error": f"{type(e).__name__}: {message}",
                     "recoverable": True}
 
         if not isinstance(result, dict):
@@ -482,6 +561,7 @@ class ToolRegistry:
             result = redact(result)
         except Exception:
             pass
+        result = _cap_tool_output(result)
 
         success = bool(result.get("success"))
         self._bump(name, success=success, elapsed=time.time() - t0,
@@ -504,10 +584,36 @@ class ToolRegistry:
             async with sem:
                 name = c.get("name") or c.get("tool")
                 params = c.get("params") or c.get("arguments") or {}
-                res = await self.execute_safe(name, params, timeout=timeout)
-                return {"tool": name, **res}
+                try:
+                    res = await self.execute_safe(name, params, timeout=timeout)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    res = {
+                        "success": False,
+                        "error": f"{type(exc).__name__}: {exc}",
+                        "recoverable": True,
+                    }
+                if not isinstance(res, dict):
+                    res = {"success": True, "result": res}
+                return {**res, "tool": name}
 
-        return await asyncio.gather(*[_run(c) for c in calls])
+        results = await asyncio.gather(
+            *[_run(c) for c in calls], return_exceptions=True
+        )
+        normalized: List[Dict[str, Any]] = []
+        for index, result in enumerate(results):
+            if isinstance(result, BaseException):
+                name = calls[index].get("name") or calls[index].get("tool")
+                normalized.append({
+                    "success": False,
+                    "tool": name,
+                    "error": f"{type(result).__name__}: {result}",
+                    "recoverable": True,
+                })
+            else:
+                normalized.append(result)
+        return normalized
 
     # ------------------------------------------------------------------
     # STATS
@@ -537,4 +643,4 @@ class ToolRegistry:
         }
 
 
-__all__ = ["BaseTool", "ToolRegistry", "ToolStats", "INTENT_CATEGORIES"]
+__all__ = ["BaseTool", "ToolRegistry", "ToolStats"]

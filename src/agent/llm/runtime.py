@@ -467,7 +467,6 @@ class LLMProviderRegistry:
         self,
         messages: Sequence[Any],
         model: Optional[str] = None,
-        temperature: float = 0.1,
         max_tokens: int = 4096,
         tools: Optional[Sequence[Any]] = None,
         tool_choice: Optional[str] = None,
@@ -496,7 +495,6 @@ class LLMProviderRegistry:
                 candidates.append(fallback)
 
         request: Dict[str, Any] = {
-            "temperature": temperature,
             "max_tokens": max_tokens,
             "tools": tools,
             "tool_choice": tool_choice,
@@ -550,7 +548,6 @@ class LLMProviderRegistry:
         messages: Sequence[Any],
         tools: Sequence[Any],
         model: Optional[str] = None,
-        temperature: float = 0.1,
         **kwargs: Any,
     ) -> NormalizedResponse:
         """
@@ -563,7 +560,6 @@ class LLMProviderRegistry:
         return await self.complete(
             messages=messages,
             model=model,
-            temperature=temperature,
             tools=tools,
             **kwargs,
         )
@@ -577,7 +573,6 @@ class LLMProviderRegistry:
         messages: Sequence[Any],
         tools: Optional[Sequence[Any]] = None,
         model: Optional[str] = None,
-        temperature: float = 0.1,
         max_tokens: int = 4096,
         **kwargs: Any,
     ) -> AsyncIterator[NormalizedResponse]:
@@ -617,7 +612,6 @@ class LLMProviderRegistry:
 
         stream_fn = getattr(provider, "stream", None)
         request: Dict[str, Any] = {
-            "temperature": temperature,
             "max_tokens": max_tokens,
         }
         if tools is not None:
@@ -670,7 +664,6 @@ class LLMProviderRegistry:
         self,
         messages: Sequence[Any],
         model: Optional[str] = None,
-        temperature: float = 0.1,
         max_tokens: int = 4096,
         **kwargs: Any,
     ) -> AsyncIterator[NormalizedResponse]:
@@ -682,7 +675,6 @@ class LLMProviderRegistry:
             messages=messages,
             tools=None,
             model=model,
-            temperature=temperature,
             max_tokens=max_tokens,
             **kwargs,
         ):

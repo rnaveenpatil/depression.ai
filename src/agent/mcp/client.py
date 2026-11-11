@@ -125,6 +125,7 @@ class MCPTool:
     name: str
     description: str
     input_schema: Dict[str, Any] = field(default_factory=dict)
+    annotations: Dict[str, Any] = field(default_factory=dict)
 
     @property
     def full_name(self) -> str:
@@ -1518,11 +1519,15 @@ class MCPClient:
         try:
             result = await transport.request("tools/list")
             for t in result.get("tools", []):
+                annotations = t.get("annotations")
+                if not isinstance(annotations, dict):
+                    annotations = {}
                 tool = MCPTool(
                     server=name,
                     name=t["name"],
                     description=t.get("description", ""),
                     input_schema=t.get("inputSchema", {}),
+                    annotations=annotations,
                 )
                 self.tools[tool.full_name] = tool
             logger.debug(f"'{name}' exposed {len(result.get('tools', []))} tools")
@@ -1978,6 +1983,7 @@ class MCPClient:
             async def _handler(_name: str = full_name, **kwargs):
                 return await self.call_tool(_name, kwargs)
 
+            read_only = bool(tool.annotations.get("readOnlyHint", False))
             try:
                 tool_registry.register_external(
                     name=full_name,
@@ -1986,8 +1992,8 @@ class MCPClient:
                     parameters=tool.input_schema or {
                         "type": "object", "properties": {},
                     },
-                    read_only=False,
-                    mutating=True,
+                    read_only=read_only,
+                    mutating=not read_only,
                     category="cloud" if full_name.startswith("mcp__aws__") else "misc",
                 )
                 count += 1

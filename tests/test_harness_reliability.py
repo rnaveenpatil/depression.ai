@@ -145,39 +145,36 @@ async def test_reconnect_retries_servers_missing_from_live_transports(monkeypatc
 
 
 @pytest.mark.asyncio
-async def test_simple_question_does_not_call_intent_classifier(monkeypatch):
+async def test_simple_question_uses_free_form_path(monkeypatch):
     loop = AgentLoop(
         agent=SimpleNamespace(), llm=SimpleNamespace(),
         tool_registry=SimpleNamespace(), planner=None,
-        config={"enable_planning": True},
+        config={},
     )
-    async def fail_classifier(query):
-        raise AssertionError("unnecessary classifier called")
+
     async def fake_run(query):
         return {"success": True, "response": "answer"}
-    monkeypatch.setattr(loop, "_classify_intent", fail_classifier)
+
     monkeypatch.setattr(loop, "_run_free_form", fake_run)
     assert (await loop.run("What is Python?"))["success"]
     assert loop.context.intent == "unknown"
-    assert loop.context.metadata["intent_needs_plan"] is False
 
 
 @pytest.mark.asyncio
-async def test_coordinator_avoids_nested_build_planning():
+async def test_coordinator_executes_existing_plan_with_build_agent():
     from agent.agent.dual_agent import AgentCoordinator
 
-    loop = SimpleNamespace(enable_planning=True)
     observed = []
+
     async def execute(**kwargs):
-        observed.append(loop.enable_planning)
+        observed.append(kwargs)
         return {"success": True, "response": "completed", "tool_calls": 1}
 
     coordinator = AgentCoordinator(
         plan_agent=SimpleNamespace(),
-        build_agent=SimpleNamespace(loop=loop, process_query=execute),
+        build_agent=SimpleNamespace(process_query=execute),
         config={},
     )
     result = await coordinator._execute_plan_with_build("Already planned", {})
     assert result["success"] is True
-    assert observed == [False]
-    assert loop.enable_planning is True
+    assert len(observed) == 1

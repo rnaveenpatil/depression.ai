@@ -17,11 +17,9 @@ Falls back gracefully when Playwright is not installed.
 from __future__ import annotations
 
 import asyncio
-import os
 import platform
 import shutil
 import subprocess
-import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -29,6 +27,7 @@ from typing import Any, Dict, List, Optional
 
 from agent.tools.registry import BaseTool
 from agent.tools.path_guard import OutputPathError, resolve_output_path
+from agent.tools.web import BlockedRequestError, _assert_public_url
 from agent.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -184,6 +183,9 @@ class RealtimeBrowserTool(BaseTool):
         cfg = config or {}
         self.headless: bool = cfg.get("headless", True)
         self.allow_network: bool = cfg.get("allow_network", True)
+        self.allow_private: bool = bool(cfg.get("allow_private_network", False))
+        self.allow_eval: bool = bool(cfg.get("allow_eval", False))
+        self.allowlist: List[str] = list(cfg.get("allowlist") or [])
         self.session_mode: str = cfg.get("session_mode", "ephemeral")
         self.cdp_url: str = cfg.get("cdp_url", "http://localhost:9222")
         self.profile_dir: str = cfg.get(
@@ -213,6 +215,43 @@ class RealtimeBrowserTool(BaseTool):
 
         self._idle_task: Optional[asyncio.Task] = None
         self._lock = asyncio.Lock()
+
+    def _checked_url(self, raw: str, *, allow_blank: bool = False) -> str:
+        url = (raw or "").strip()
+        if allow_blank and url == "about:blank":
+            return url
+        if not url:
+            raise ValueError("URL is required")
+        if not url.startswith(("http://", "https://")):
+            if url.startswith(("file:", "javascript:", "data:", "about:")):
+                raise ValueError("URL scheme not allowed")
+            url = "https://" + url
+        if self.allow_private:
+            import urllib.parse
+            parsed = urllib.parse.urlsplit(url)
+            if parsed.scheme not in ("http", "https") or not parsed.hostname:
+                raise ValueError("only HTTP(S) URLs with a hostname are allowed")
+            if self.allowlist and parsed.hostname.lower() not in {
+                h.strip().lower() for h in self.allowlist
+            }:
+                raise ValueError(f"host not in allowlist: {parsed.hostname}")
+        else:
+            _assert_public_url(url, self.allowlist or None)
+        return url
+
+    async def _guard_route(self, route: Any) -> None:
+        try:
+            request_url = route.request.url
+            if request_url.startswith(("data:", "blob:", "about:")):
+                await route.continue_()
+                return
+            if self.allow_private:
+                await route.continue_()
+                return
+            self._checked_url(request_url)
+            await route.continue_()
+        except Exception:
+            await route.abort()
 
     # ------------------------------------------------------------------
     # LIFECYCLE
@@ -251,6 +290,7 @@ class RealtimeBrowserTool(BaseTool):
                     user_agent=self.user_agent,
                 )
 
+            await self._context.route("**/*", self._guard_route)
             self._context.on("page", lambda p: asyncio.create_task(self._wire_page(p)))
             for p in self._context.pages:
                 await self._wire_page(p)
@@ -259,6 +299,7 @@ class RealtimeBrowserTool(BaseTool):
             return None
         except Exception as e:
             logger.error("Failed to launch browser: %s", e, exc_info=True)
+            await self._close_context()
             return f"Failed to launch browser: {e}"
 
     async def _wire_page(self, page: Any) -> None:
@@ -370,6 +411,7 @@ class RealtimeBrowserTool(BaseTool):
         page = await self._context.new_page()
         await self._wire_page(page)
         if url and url != "about:blank":
+            url = self._checked_url(url)
             await page.goto(url, wait_until="domcontentloaded")
         tab = TabState(id=tab_id, page=page)
         self._tabs[tab_id] = tab
@@ -506,11 +548,15 @@ class RealtimeBrowserTool(BaseTool):
         # launch_and_show does NOT need Playwright at all — it just shells
         # out to the OS opener. Handle it before any browser setup.
         if action == "launch_and_show":
+            if not self.allow_network:
+                return {"success": False, "error": "Network access disabled"}
             url = params.get("url") or ""
             if not url:
                 return {"success": False, "error": "launch_and_show requires 'url'"}
-            if not url.startswith(("http://", "https://", "file://")):
-                url = "https://" + url
+            try:
+                url = self._checked_url(url)
+            except (ValueError, BlockedRequestError) as e:
+                return {"success": False, "error": str(e)}
             result = _open_in_default_browser(url)
             if result.get("opened"):
                 return {
@@ -548,7 +594,10 @@ class RealtimeBrowserTool(BaseTool):
                 return {"success": False, "error": str(e)}
 
     async def _dispatch(self, action: str, params: Dict[str, Any]) -> Dict[str, Any]:
-        timeout = int(params.get("timeout_ms", 15000))
+        try:
+            timeout = max(1000, min(int(params.get("timeout_ms", 15000)), 120000))
+        except (TypeError, ValueError):
+            return {"success": False, "error": "timeout_ms must be an integer"}
 
         if action == "tab_open":
             url = params.get("url", "about:blank")
@@ -590,19 +639,10 @@ class RealtimeBrowserTool(BaseTool):
             url = params.get("url", "")
             if not url:
                 return {"success": False, "error": "navigate requires 'url'"}
-            if url.startswith("file://"):
-                try:
-                    target = Path(url[len("file://"):].split("?")[0]).resolve(
-                        strict=False
-                    )
-                except (OSError, ValueError) as e:
-                    return {"success": False, "error": f"invalid file URL: {e}"}
-                try:
-                    resolve_output_path(str(target), self.sandbox_root)
-                except OutputPathError as e:
-                    return {"success": False, "error": str(e)}
-            elif not url.startswith(("http://", "https://", "about:")):
-                url = "https://" + url
+            try:
+                url = self._checked_url(url, allow_blank=True)
+            except (ValueError, BlockedRequestError) as e:
+                return {"success": False, "error": str(e)}
             await page.goto(
                 url, timeout=timeout, wait_until=params.get("wait_until", "domcontentloaded")
             )
@@ -684,6 +724,8 @@ class RealtimeBrowserTool(BaseTool):
             return {"success": True, "path": str(path)}
 
         if action == "eval":
+            if not self.allow_eval:
+                return {"success": False, "error": "eval is disabled by browser config"}
             script = params.get("script", "")
             if not script:
                 return {"success": False, "error": "eval requires 'script'"}

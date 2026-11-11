@@ -543,3 +543,28 @@ async def test_read_only_answer_stops_after_one_observation():
     assert result["success"] is True
     assert llm.calls == 2
     assert len(agent.executed) == 1
+
+
+@pytest.mark.asyncio
+async def test_no_progress_emits_warning_and_stopping_events():
+    calls = [
+        tool_response(ToolCall(id=f"same{i}", name="read",
+                               arguments={"filePath": "same.py"}))
+        for i in range(8)
+    ]
+    loop, _agent, _llm = make_loop(
+        calls,
+        no_progress_streak_cap=4,
+        no_progress_warn_at=2,
+        max_iterations=10,
+    )
+    events = []
+    loop.add_event_handler("on_loop_progress", events.append)
+
+    result = await loop.run("inspect the same file")
+
+    assert result["success"] is False
+    assert loop.context.metadata["stopped_on_no_progress"] is True
+    assert any(e["warning"] and e["streak"] >= 2 for e in events)
+    assert any(e["stopping"] for e in events)
+    assert {e["cap"] for e in events} == {4}

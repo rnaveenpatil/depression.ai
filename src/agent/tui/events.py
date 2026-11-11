@@ -28,6 +28,7 @@ _FORWARDED_EVENTS: tuple = (
     "on_token",
     "on_token_end",
     "on_phase",
+    "on_loop_progress",
     "on_plan_created",
     "on_plan_updated",
     "on_plan_rendered",

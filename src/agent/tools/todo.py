@@ -7,7 +7,7 @@ from __future__ import annotations
 import time
 import uuid
 from dataclasses import dataclass, field, asdict
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional
 
 from agent.tools.registry import BaseTool
 from agent.utils.logging import get_logger
@@ -38,7 +38,7 @@ class TodoTool(BaseTool):
             },
             "title": {"type": "string"},
             "todo_id": {"type": "string"},
-            "status": {"type": "string", "enum": ["pending", "in_progress", "done", "blocked", "cancelled"]},
+            "status": {"type": "string", "enum": ["pending", "in_progress", "done", "completed", "blocked", "cancelled"]},
             "notes": {"type": "string"},
             "priority": {"type": "integer", "minimum": 1, "maximum": 5},
         },
@@ -47,7 +47,7 @@ class TodoTool(BaseTool):
     timeout = 99999.0
 
     read_only = False
-    mutating = False
+    mutating = True
     category = "plan"
 
     # Shared store per session so `todo`, `todowrite`, and `todoread` see the
@@ -93,19 +93,46 @@ class TodoTool(BaseTool):
             return self._summary()
         return {"success": False, "error": f"Unknown action: {action}"}
 
+    @staticmethod
+    def _normalize_status(value: Any) -> Optional[str]:
+        status = str(value or "")
+        if status == "completed":
+            return "done"
+        if status in ("pending", "in_progress", "done", "blocked", "cancelled"):
+            return status
+        return None
+
+    @staticmethod
+    def _priority(value: Any) -> int:
+        try:
+            return max(1, min(int(value), 5))
+        except (TypeError, ValueError):
+            return 3
+
+    @staticmethod
+    def _public_item(item: TodoItem) -> Dict[str, Any]:
+        data = asdict(item)
+        if data.get("status") == "done":
+            data["status"] = "completed"
+        return data
+
     def _add(self, params: Dict[str, Any]) -> Dict[str, Any]:
         title = params.get("title")
-        if not title:
+        if not title or not isinstance(title, str):
             return {"success": False, "error": "add requires 'title'"}
+        status = self._normalize_status(params.get("status", "pending"))
+        if status is None:
+            return {"success": False, "error": "invalid status"}
         tid = str(uuid.uuid4())[:8]
         item = TodoItem(
             id=tid,
-            title=title,
-            priority=int(params.get("priority", 3)),
-            notes=params.get("notes", ""),
+            title=title[:2000],
+            status=status,
+            priority=self._priority(params.get("priority", 3)),
+            notes=str(params.get("notes", ""))[:4000],
         )
         self.items[tid] = item
-        return {"success": True, "todo_id": tid, "item": asdict(item)}
+        return {"success": True, "todo_id": tid, "item": self._public_item(item)}
 
     def _update(self, params: Dict[str, Any]) -> Dict[str, Any]:
         tid = params.get("todo_id")
@@ -113,15 +140,18 @@ class TodoTool(BaseTool):
         if not item:
             return {"success": False, "error": f"Todo {tid} not found"}
         if "title" in params and params["title"]:
-            item.title = params["title"]
+            item.title = str(params["title"])[:2000]
         if "status" in params and params["status"]:
-            item.status = params["status"]
+            status = self._normalize_status(params["status"])
+            if status is None:
+                return {"success": False, "error": "invalid status"}
+            item.status = status
         if "notes" in params:
-            item.notes = params["notes"]
+            item.notes = str(params["notes"])[:4000]
         if "priority" in params:
-            item.priority = int(params["priority"])
+            item.priority = self._priority(params["priority"])
         item.updated_at = time.time()
-        return {"success": True, "item": asdict(item)}
+        return {"success": True, "item": self._public_item(item)}
 
     def _complete(self, params: Dict[str, Any]) -> Dict[str, Any]:
         tid = params.get("todo_id")
@@ -144,7 +174,8 @@ class TodoTool(BaseTool):
             self.items.values(),
             key=lambda i: (i.status != "in_progress", i.priority, i.created_at),
         )
-        return {"success": True, "items": [asdict(i) for i in items], "count": len(items)}
+        out = [self._public_item(item) for item in items]
+        return {"success": True, "items": out, "count": len(items)}
 
     def _summary(self) -> Dict[str, Any]:
         stats: Dict[str, int] = {}
