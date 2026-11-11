@@ -295,8 +295,7 @@ class WebTool(BaseTool):
                                         raw += chunk[:remain]
                                     truncated = True
                                     break
-                            if truncated:
-                                break
+                            break
                     except BlockedRequestError:
                         raise
                     except Exception:

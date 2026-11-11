@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+import asyncio
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
+from agent.mcp.client import MCPClient
 from agent.permissions.aws import AWSPolicy
 from agent.permissions.manager import PermissionRequest
 from agent.tools.aws_helper import AWSHelperTool
@@ -22,6 +26,7 @@ from agent.tools.registry import BaseTool, ToolRegistry
 from agent.tools.search import SearchTool
 from agent.tools.task import TaskTool
 from agent.tools.todo import TodoTool
+from agent.tools.web import BlockedRequestError, WebTool
 from agent.tools import search as search_module
 from agent.tools import terminal as terminal_module
 
@@ -73,6 +78,25 @@ async def test_task_tool_refuses_parent_agent_without_manager():
     result = await tool.execute({"action": "spawn", "prompt": "work"})
     assert result["success"] is False
     assert "refusing" in result["error"].lower()
+
+
+@pytest.mark.asyncio
+async def test_task_tool_cancels_running_subagent():
+    release = asyncio.Event()
+
+    class Manager:
+        async def invoke_subagent(self, role, prompt, context):
+            await release.wait()
+            return {"success": True, "result": "late"}
+
+    tool = TaskTool(SimpleNamespace(subagent_manager=Manager()))
+    spawned = await tool.execute({"action": "spawn", "prompt": "wait forever"})
+    assert spawned["success"] is True
+    cancelled = await tool.execute({"action": "cancel", "task_id": spawned["task_id"]})
+    assert cancelled["success"] is True
+    run = tool.runs[spawned["task_id"]]
+    assert run.task is not None and run.task.cancelled()
+    await tool.shutdown()
 
 
 @pytest.mark.asyncio
@@ -245,6 +269,18 @@ async def test_apply_patch_refuses_overwrite_and_directory_delete(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_unified_patch_zero_count_hunk_inserts_at_offset(tmp_path):
+    (tmp_path / "d.txt").write_text("a\nb\n", encoding="utf-8")
+    tool = PatchTool(Workspace(tmp_path))
+    result = await tool.execute({
+        "action": "apply",
+        "diff": "--- a/d.txt\n+++ b/d.txt\n@@ -1,0 +2 @@\n+X\n",
+    })
+    assert result["success"] is True, result
+    assert (tmp_path / "d.txt").read_text() == "a\nX\nb\n"
+
+
+@pytest.mark.asyncio
 async def test_apply_patch_marker_batch_rolls_back_on_failure(tmp_path):
     (tmp_path / "a.txt").write_text("one\n", encoding="utf-8")
     (tmp_path / "b.txt").write_text("two\n", encoding="utf-8")
@@ -324,9 +360,99 @@ def test_browser_and_realtime_reject_file_and_private_urls(tmp_path):
     ):
         with pytest.raises(ValueError):
             tool._checked_url("file:///etc/passwd")
-        from agent.tools.web import BlockedRequestError
         with pytest.raises(BlockedRequestError):
             tool._checked_url("http://127.0.0.1:8080")
+
+
+@pytest.mark.asyncio
+async def test_mcp_annotations_drive_registry_metadata():
+    class Transport:
+        async def request(self, method):
+            if method == "tools/list":
+                return {
+                    "tools": [{
+                        "name": "read_thing",
+                        "description": "read-only",
+                        "inputSchema": {"type": "object", "properties": {}},
+                        "annotations": {"readOnlyHint": True},
+                    }]
+                }
+            return {}
+
+    client = MCPClient({"enabled": True, "servers": [{"name": "aws"}]})
+    await client._discover_server("aws", Transport())
+    assert client.tools["mcp__aws__read_thing"].annotations["readOnlyHint"] is True
+
+    registry = ToolRegistry()
+    assert client.register_tools_into(registry) == 1
+    assert registry.is_read_only("mcp__aws__read_thing") is True
+    assert registry.is_mutating("mcp__aws__read_thing") is False
+
+
+@pytest.mark.asyncio
+async def test_realtime_browser_shutdown_clears_tabs():
+    tool = RealtimeBrowserTool({"allow_network": True})
+    tool._tabs["tab"] = object()
+    tool._active_tab = "tab"
+    await tool.shutdown()
+    assert tool._tabs == {}
+    assert tool._active_tab is None
+
+
+@pytest.mark.asyncio
+async def test_web_http_streaming_redirects_and_byte_cap():
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            if self.path == "/redirect":
+                self.send_response(302)
+                self.send_header("Location", "/final")
+                self.end_headers()
+                return
+            if self.path == "/loop":
+                self.send_response(302)
+                self.send_header("Location", "/loop")
+                self.end_headers()
+                return
+            body = b"hello world" if self.path == "/final" else b"x" * 5000
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *_args):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        base = f"http://127.0.0.1:{server.server_port}"
+        tool = WebTool({"allow_private_network": True, "max_redirects": 1})
+
+        redirected = await tool._fetch_http(
+            f"{base}/redirect", "GET", {}, None, 1024, False,
+        )
+        assert redirected["success"] is True, redirected
+        assert redirected["content"] == "hello world"
+        assert redirected["url"].endswith("/final")
+
+        capped = await tool._fetch_http(
+            f"{base}/big", "GET", {}, None, 100, False,
+        )
+        assert capped["success"] is True, capped
+        assert capped["truncated"] is True
+        assert capped["content"] == "x" * 100
+
+        looped = await tool._fetch_http(
+            f"{base}/loop", "GET", {}, None, 1024, False,
+        )
+        assert looped["success"] is False
+        assert "too many redirects" in looped["error"]
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
 
 
 @pytest.mark.asyncio
@@ -422,6 +548,19 @@ async def test_process_drains_huge_lines_without_deadlock(tmp_path):
     finally:
         await tool.execute({"action": "stop", "process_id": started["process_id"]})
         await tool.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_process_shutdown_kills_live_process(tmp_path):
+    tool = ProcessTool(Workspace(tmp_path))
+    started = await tool.execute({
+        "action": "start",
+        "command": "python -c \"import time; time.sleep(30)\"",
+    })
+    assert started["success"] is True, started
+    await tool.shutdown()
+    assert tool.processes == {}
+    assert started["process_id"]
 
 
 @pytest.mark.asyncio
