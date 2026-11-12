@@ -20,7 +20,8 @@ def main() -> None:
         load_runtime_config,
     )
 
-    cli = CLIAgent()
+    # Textual owns Ctrl+C while the TUI is active.
+    cli = CLIAgent(install_signal_handlers=False)
     args = cli.parse_arguments()
     args.non_interactive = True
     args.query = None
@@ -35,10 +36,8 @@ def main() -> None:
             runtime["model"],
         )
 
-    async def boot() -> None:
+    async def run_app() -> None:
         loop = asyncio.get_running_loop()
-
-        await cli.initialize(args)
 
         from agent.tui.app import DepressionApp, PermissionModal
 
@@ -124,8 +123,14 @@ def main() -> None:
         # lands here, not in the legacy threading fallback.
         app.install_permission_callback(tui_confirm)
 
+        await app.run_async()
+
+    async def boot() -> None:
         try:
-            await app.run_async()
+            # Initialize and run under one cleanup scope so startup failures
+            # and Ctrl+C both release every resource that was created.
+            await cli.initialize(args)
+            await run_app()
         finally:
             await cli.shutdown()
 
