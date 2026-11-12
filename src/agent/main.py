@@ -80,7 +80,7 @@ APP_VERSION = get_version()
 class CLIAgent:
     """Top-level application orchestrator."""
 
-    def __init__(self):
+    def __init__(self, install_signal_handlers: bool = True):
         self.running = False
         self.interactive = True
 
@@ -106,27 +106,44 @@ class CLIAgent:
         self.args: Optional[argparse.Namespace] = None
         self.start_time = datetime.now()
 
-        # Signal handling
+        # Textual owns Ctrl+C while the TUI is active. The legacy CLI can
+        # still install handlers for its non-TUI execution path.
         self._signals = 0
-        signal.signal(signal.SIGINT, self._on_signal)
-        signal.signal(signal.SIGTERM, self._on_signal)
+        self._previous_signal_handlers = {}
+        self._shutdown_started = False
+        if install_signal_handlers:
+            for signum in (signal.SIGINT, signal.SIGTERM):
+                self._previous_signal_handlers[signum] = signal.getsignal(signum)
+                signal.signal(signum, self._on_signal)
+
+    def _restore_signal_handlers(self) -> None:
+        """Restore process handlers changed by this CLI instance."""
+        for signum, handler in self._previous_signal_handlers.items():
+            try:
+                signal.signal(signum, handler)
+            except (ValueError, OSError):
+                # signal.signal is only available from the main thread.
+                pass
+        self._previous_signal_handlers.clear()
 
     # ------------------------------------------------------------------
     # SIGNALS
     # ------------------------------------------------------------------
 
     def _on_signal(self, signum, frame):
-        self._signals += 1
-        if self._signals > 1:
-            # Hard escape hatch: a second ^C always gets us out.
-            os._exit(128 + signum)
-        if self.ui:
-            self.ui.print_warning(f"\nReceived signal {signum}, shutting down...")
+        # Ignore repeats while graceful cleanup is in progress. Never call
+        # os._exit(): it bypasses finally blocks and leaks terminal resources.
+        if self._signals:
+            return
+        self._signals = 1
         self.running = False
-        # Unwind the running coroutine so shutdown() runs along the normal
-        # exit path (run.py's boot().finally awaits cli.shutdown()). A custom
-        # SIGINT handler suppresses the default KeyboardInterrupt, so raise it
-        # explicitly instead of leaving a dangling coordinator.shutdown() task.
+        if self.ui:
+            try:
+                self.ui.print_warning(
+                    f"\nReceived signal {signum}, shutting down..."
+                )
+            except Exception:
+                pass
         raise KeyboardInterrupt
 
     # ------------------------------------------------------------------
@@ -693,49 +710,68 @@ Examples:
     # ------------------------------------------------------------------
 
     async def shutdown(self) -> None:
-        self.ui.print_info("Shutting down…")
+        """Release initialized resources once, including after partial startup."""
+        if self._shutdown_started:
+            return
+        self._shutdown_started = True
 
-        # Persist everything first
         try:
-            if self.session_manager:
-                await self.session_manager.save_current_session()
-        except Exception as e:
-            logger.debug(f"Session save failed during shutdown: {e}")
+            if self.ui:
+                try:
+                    self.ui.print_info("Shutting down…")
+                except Exception:
+                    pass
 
-        # Agent shutdown (own tools, MCP, plugins)
-        if self.agent_coordinator:
-            try:
-                await self.agent_coordinator.shutdown()
-            except Exception as e:
-                logger.debug(f"Agent coordinator shutdown failed: {e}")
+            # Persist session data before tearing down its dependencies.
+            session_manager = getattr(self, "session_manager", None)
+            if session_manager:
+                try:
+                    await session_manager.save_current_session()
+                except Exception as exc:
+                    logger.debug("Session save failed during shutdown: %s", exc)
 
-        # MCP
-        if self.mcp_client:
-            try:
-                await self.mcp_client.shutdown()
-            except Exception:
-                pass
+            # Stop agent-owned tools, plugins, and tasks first.
+            coordinator = getattr(self, "agent_coordinator", None)
+            if coordinator:
+                try:
+                    await coordinator.shutdown()
+                except Exception as exc:
+                    logger.debug("Agent coordinator shutdown failed: %s", exc)
 
-        # Database
-        if self.database:
-            try:
-                await self.database.close()
-            except Exception:
-                pass
+            # One failing component must not prevent the remaining cleanup.
+            mcp_client = getattr(self, "mcp_client", None)
+            if mcp_client:
+                try:
+                    await mcp_client.shutdown()
+                except Exception as exc:
+                    logger.debug("MCP shutdown failed: %s", exc)
 
-        # Cache GC (best effort)
-        if self.cache:
-            try:
-                await self.cache.gc_expired()
-            except Exception:
-                pass
+            database = getattr(self, "database", None)
+            if database:
+                try:
+                    await database.close()
+                except Exception as exc:
+                    logger.debug("Database close failed: %s", exc)
 
-        uptime = (datetime.now() - self.start_time).total_seconds()
-        self.ui.print_success(
-            f"Goodbye! Session: {self.session.id[:8] if self.session else '-'} • "
-            f"Uptime: {int(uptime)}s"
-        )
+            cache = getattr(self, "cache", None)
+            if cache:
+                try:
+                    await cache.gc_expired()
+                except Exception as exc:
+                    logger.debug("Cache cleanup failed: %s", exc)
 
+            uptime = (datetime.now() - self.start_time).total_seconds()
+            session = getattr(self, "session", None)
+            if self.ui:
+                try:
+                    self.ui.print_success(
+                        f"Goodbye! Session: {session.id[:8] if session else '-'} "
+                        f"• Uptime: {int(uptime)}s"
+                    )
+                except Exception:
+                    pass
+        finally:
+            self._restore_signal_handlers()
 
 
 # ======================================================================
