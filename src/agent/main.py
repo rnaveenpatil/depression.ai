@@ -132,7 +132,7 @@ class CLIAgent:
 
     def _on_signal(self, signum, frame):
         # Ignore repeats while graceful cleanup is in progress. Never call
-        # os._exit(): it bypasses finally blocks and leaks terminal resources.
+        # forced process exit would bypass finally blocks and leak terminal resources.
         if self._signals:
             return
         self._signals = 1
