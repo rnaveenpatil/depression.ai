@@ -19,13 +19,23 @@ class CountingTool:
         self.calls = 0
 
 
-def test_cli_signal_handler_stops_cleanly():
-    cli = CLIAgent()
+def test_cli_signal_handler_is_graceful_and_ignores_repeats():
+    cli = CLIAgent(install_signal_handlers=False)
     cli.ui = None
     with pytest.raises(KeyboardInterrupt):
         cli._on_signal(signal.SIGINT, None)
+    # A repeated signal must not force-exit or interrupt cleanup again.
+    cli._on_signal(signal.SIGINT, None)
     assert cli.running is False
     assert cli._signals == 1
+
+
+@pytest.mark.asyncio
+async def test_cli_shutdown_is_safe_after_partial_initialization():
+    cli = CLIAgent(install_signal_handlers=False)
+    await cli.shutdown()
+    await cli.shutdown()
+    assert cli._shutdown_started is True
 
 
 @pytest.mark.asyncio
