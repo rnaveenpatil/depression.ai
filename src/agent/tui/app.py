@@ -4910,13 +4910,21 @@ class DepressionApp(App):
         self._refocus_prompt()
 
     def action_cancel(self) -> None:
+        """Ctrl+C cancels active work and exits the TUI cleanly."""
         if isinstance(self.screen, PermissionModal):
             self.screen.action_deny()
             return
-        if self.busy:
-            self.action_interrupt()
-            self._system("cancelled — press Ctrl+C again to quit")
-            return
+
+        # Stop active agent/shell workers before asking Textual to exit.
+        self.cancel_current_agent()
+        shell_worker = self._user_shell_worker
+        if shell_worker is not None and getattr(shell_worker, "is_running", False):
+            shell_worker.cancel()
+        self._user_shell_worker = None
+        self._prompt_queue.clear()
+        self.queue_depth = 0
+        self._draining = False
+
         self._is_shutting_down = True
         self.exit()
 
