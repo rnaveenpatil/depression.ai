@@ -4913,6 +4913,8 @@ class DepressionApp(App):
         """Ctrl+C cancels active work and exits the TUI cleanly."""
         if isinstance(self.screen, PermissionModal):
             self.screen.action_deny()
+            self._is_shutting_down = True
+            self.exit()
             return
 
         # Stop active agent/shell workers before asking Textual to exit.
