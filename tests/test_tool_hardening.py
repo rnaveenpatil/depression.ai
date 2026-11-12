@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -17,6 +18,7 @@ from agent.tools.aws_helper import AWSHelperTool
 from agent.tools.browser import BrowserTool
 from agent.tools.compat import ApplyPatchTool, EditTool, GlobTool, SkillTool, WebFetchTool, WebSearchTool
 from agent.tools.diagnostics import DiagnosticsTool
+from agent.tools.filesystem import FileSystemTool
 from agent.tools.git import GitTool
 from agent.tools.patch import PatchTool
 from agent.tools.path_guard import OutputPathError, resolve_output_path
@@ -27,6 +29,8 @@ from agent.tools.search import SearchTool
 from agent.tools.task import TaskTool
 from agent.tools.todo import TodoTool
 from agent.tools.web import BlockedRequestError, WebTool
+from agent.tools import diagnostics as diagnostics_module
+from agent.tools import filesystem as filesystem_module
 from agent.tools import search as search_module
 from agent.tools import terminal as terminal_module
 
@@ -370,12 +374,20 @@ async def test_mcp_annotations_drive_registry_metadata():
         async def request(self, method):
             if method == "tools/list":
                 return {
-                    "tools": [{
-                        "name": "read_thing",
-                        "description": "read-only",
-                        "inputSchema": {"type": "object", "properties": {}},
-                        "annotations": {"readOnlyHint": True},
-                    }]
+                    "tools": [
+                        {
+                            "name": "read_thing",
+                            "description": "read-only",
+                            "inputSchema": {"type": "object", "properties": {}},
+                            "annotations": {"readOnlyHint": True},
+                        },
+                        {
+                            "name": "delete_thing",
+                            "description": "destructive",
+                            "inputSchema": {"type": "object", "properties": {}},
+                            "annotations": {"destructiveHint": True},
+                        },
+                    ]
                 }
             return {}
 
@@ -384,9 +396,10 @@ async def test_mcp_annotations_drive_registry_metadata():
     assert client.tools["mcp__aws__read_thing"].annotations["readOnlyHint"] is True
 
     registry = ToolRegistry()
-    assert client.register_tools_into(registry) == 1
+    assert client.register_tools_into(registry) == 2
     assert registry.is_read_only("mcp__aws__read_thing") is True
     assert registry.is_mutating("mcp__aws__read_thing") is False
+    assert registry.is_destructive("mcp__aws__delete_thing") is True
 
 
 @pytest.mark.asyncio
@@ -413,16 +426,28 @@ async def test_web_http_streaming_redirects_and_byte_cap():
                 self.send_header("Location", "/loop")
                 self.end_headers()
                 return
-            body = b"hello world" if self.path == "/final" else b"x" * 5000
+            if self.path == "/drop":
+                counts["GET"] += 1
+                self.close_connection = True
+                return
+            if self.path == "/searchbig":
+                body = b"y" * 5000
+            else:
+                body = b"hello world" if self.path == "/final" else b"x" * 5000
             self.send_response(200)
             self.send_header("Content-Type", "text/plain")
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
 
+        def do_POST(self):
+            counts["POST"] += 1
+            self.close_connection = True
+
         def log_message(self, *_args):
             pass
 
+    counts = {"GET": 0, "POST": 0}
     server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -449,6 +474,14 @@ async def test_web_http_streaming_redirects_and_byte_cap():
         )
         assert looped["success"] is False
         assert "too many redirects" in looped["error"]
+
+        tool.max_search_bytes = 100
+        status, text, truncated = await tool._get_search_page(
+            f"{base}/searchbig", {},
+        )
+        assert status == 200
+        assert truncated is True
+        assert len(text) == tool.max_search_bytes
     finally:
         server.shutdown()
         server.server_close()
@@ -488,6 +521,8 @@ async def test_todo_accepts_completed_alias_and_is_mutating(tmp_path):
     assert updated["item"]["status"] == "completed"
     listed = await tool.execute({"action": "list"})
     assert listed["items"][0]["status"] == "completed"
+    summary = await tool.execute({"action": "summary"})
+    assert summary["stats"] == {"completed": 1}
     assert tool.mutating is True
 
 
@@ -574,6 +609,143 @@ async def test_webfetch_and_websearch_validate_numeric_params():
     search = WebSearchTool({})
     result = await search.execute({"query": "x", "count": "many"})
     assert result["success"] is False
+
+
+@pytest.mark.asyncio
+async def test_web_does_not_retry_non_idempotent_requests():
+    counts = {"GET": 0, "POST": 0}
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            counts["GET"] += 1
+            self.close_connection = True
+
+        def do_POST(self):
+            counts["POST"] += 1
+            self.close_connection = True
+
+        def log_message(self, *_args):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        base = f"http://127.0.0.1:{server.server_port}/drop"
+        tool = WebTool({"allow_private_network": True})
+        posted = await tool._fetch_http(
+            base, "POST", {}, "body", 1024, False,
+        )
+        assert posted["success"] is False
+        assert counts["POST"] == 1
+        got = await tool._fetch_http(base, "GET", {}, None, 1024, False)
+        assert got["success"] is False
+        assert counts["GET"] == 3
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
+@pytest.mark.asyncio
+async def test_diagnostics_cancellation_kills_child(tmp_path, monkeypatch):
+    script = tmp_path / "slow-diag"
+    pidfile = tmp_path / "pid"
+    script.write_text(
+        "#!/usr/bin/env python3\n"
+        "import os, pathlib, time\n"
+        "pathlib.Path(os.environ['PIDFILE']).write_text(str(os.getpid()))\n"
+        "time.sleep(30)\n",
+        encoding="utf-8",
+    )
+    script.chmod(0o755)
+    monkeypatch.setenv("PIDFILE", str(pidfile))
+    monkeypatch.setattr(diagnostics_module, "_find_executable", lambda _name: str(script))
+    tool = DiagnosticsTool(Workspace(tmp_path))
+    task = asyncio.create_task(tool.execute({"tool": "ruff"}))
+    for _ in range(100):
+        if pidfile.exists() and pidfile.read_text():
+            break
+        await asyncio.sleep(0.02)
+    pid = int(pidfile.read_text())
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    with pytest.raises(ProcessLookupError):
+        os.kill(pid, 0)
+
+
+@pytest.mark.asyncio
+async def test_filesystem_write_and_edit_are_atomic(tmp_path, monkeypatch):
+    tool = FileSystemTool(Workspace(tmp_path))
+    path = tmp_path / "a.txt"
+    path.write_text("original\n", encoding="utf-8")
+    path.chmod(0o640)
+
+    original_replace = filesystem_module.os.replace
+    monkeypatch.setattr(
+        filesystem_module.os,
+        "replace",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("replace failed")),
+    )
+    failed = await tool.execute({
+        "action": "write", "path": "a.txt", "content": "changed\n",
+    })
+    assert failed["success"] is False
+    assert path.read_text() == "original\n"
+    assert path.stat().st_mode & 0o777 == 0o640
+    assert not list(tmp_path.glob(".fs-*"))
+
+    monkeypatch.setattr(filesystem_module.os, "replace", original_replace)
+    edited = await tool.execute({
+        "action": "edit", "path": "a.txt", "old": "original", "new": "updated",
+    })
+    assert edited["success"] is True
+    assert path.read_text() == "updated\n"
+    assert path.stat().st_mode & 0o777 == 0o640
+
+    appended = await tool.execute({
+        "action": "append", "path": "a.txt", "content": "tail\n",
+    })
+    assert appended["success"] is True
+    assert path.read_text() == "updated\ntail\n"
+
+
+@pytest.mark.asyncio
+async def test_patch_preserves_no_newline_and_marker_crlf(tmp_path):
+    (tmp_path / "u.txt").write_bytes(b"hello")
+    unified = await PatchTool(Workspace(tmp_path)).execute({
+        "action": "apply",
+        "diff": (
+            "--- a/u.txt\n"
+            "+++ b/u.txt\n"
+            "@@ -1 +1 @@\n"
+            "-hello\n"
+            "\\ No newline at end of file\n"
+            "+HELLO\n"
+            "\\ No newline at end of file\n"
+        ),
+    })
+    assert unified["success"] is True, unified
+    assert (tmp_path / "u.txt").read_bytes() == b"HELLO"
+
+    (tmp_path / "m.txt").write_bytes(b"one\r\ntwo")
+    marker = await ApplyPatchTool(Workspace(tmp_path)).execute({
+        "patchText": (
+            "*** Begin Patch\n"
+            "*** Update File: m.txt\n"
+            "@@\n"
+            "-one\n"
+            "+ONE\n"
+            "@@\n"
+            "-two\n"
+            "+TWO\n"
+            "\\ No newline at end of file\n"
+            "*** End Patch\n"
+        ),
+    })
+    assert marker["success"] is True, marker
+    assert (tmp_path / "m.txt").read_bytes() == b"ONE\r\nTWO"
 
 
 async def _external_should_not_run(**_kwargs):

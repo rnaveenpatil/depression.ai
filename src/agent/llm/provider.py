@@ -476,7 +476,30 @@ class LLMProvider(ABC):
             "vision": False,
             "json_mode": False,
             "system_prompt": True,
+            "prompt_cache": False,
+            "prompt_cache_explicit": False,
+            "prompt_cache_automatic": False,
         }
+
+    def prompt_cache_enabled(self, override: Optional[bool] = None) -> bool:
+        """
+        Resolve whether prompt caching should be used for this request.
+
+        An explicit per-call value wins, then the provider config's
+        ``prompt_cache`` extra, then the provider's advertised capability.
+        Automatic-cache providers need no request markers, but this keeps
+        the decision in one place.
+        """
+        if override is not None:
+            return bool(override)
+        configured = self.config.extra.get("prompt_cache")
+        if configured is not None:
+            return bool(configured)
+        caps = self.capabilities()
+        return bool(
+            caps.get("prompt_cache_explicit")
+            or caps.get("prompt_cache_automatic")
+        )
 
     def is_configured(self) -> bool:
         """

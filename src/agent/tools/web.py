@@ -129,6 +129,12 @@ class WebTool(BaseTool):
         self.allowlist: List[str] = list(cfg.get("allowlist") or [])
         self.allow_private: bool = bool(cfg.get("allow_private_network", False))
         self.max_redirects: int = int(cfg.get("max_redirects", 5))
+        try:
+            self.max_search_bytes = max(
+                4096, min(int(cfg.get("max_search_bytes", 1_000_000)), 5_000_000)
+            )
+        except (TypeError, ValueError):
+            self.max_search_bytes = 1_000_000
         self.browser_enabled: bool = bool(cfg.get("browser_fallback", True))
         self.browser_timeout_ms: int = int(cfg.get("browser_timeout_ms", 25000))
 
@@ -300,7 +306,12 @@ class WebTool(BaseTool):
                         raise
                     except Exception:
                         attempts += 1
-                        if hops > 0 or response is not None or attempts >= 3:
+                        if (
+                            req_method not in {"GET", "HEAD", "OPTIONS"}
+                            or hops > 0
+                            or response is not None
+                            or attempts >= 3
+                        ):
                             raise
                         await asyncio.sleep(0.35)
                         continue
@@ -441,26 +452,28 @@ class WebTool(BaseTool):
         # Keep DuckDuckGo as the primary search backend.
         ddg_url = "https://html.duckduckgo.com/html/?" + urllib.parse.urlencode({"q": query})
         try:
-            async with httpx.AsyncClient(timeout=20, follow_redirects=True) as client:
-                response = await client.get(ddg_url, headers=headers)
-            if response.status_code == 200:
-                results = self._parse_ddg(response.text, limit)
+            status, text, truncated = await self._get_search_page(ddg_url, headers)
+            if status == 200:
+                results = self._parse_ddg(text, limit)
                 if results:
                     return self._search_result(query, results, "duckduckgo")
-            errors.append(f"duckduckgo HTTP {response.status_code} or no parseable results")
+            suffix = " (truncated)" if truncated else ""
+            errors.append(
+                f"duckduckgo HTTP {status} or no parseable results{suffix}"
+            )
         except Exception as exc:
             errors.append(f"duckduckgo: {exc}")
 
         # Preserve Bing as the second search backend.
         bing_url = "https://www.bing.com/search?" + urllib.parse.urlencode({"q": query})
         try:
-            async with httpx.AsyncClient(timeout=20, follow_redirects=True) as client:
-                response = await client.get(bing_url, headers=headers)
-            if response.status_code == 200:
-                results = self._parse_bing(response.text, limit)
+            status, text, truncated = await self._get_search_page(bing_url, headers)
+            if status == 200:
+                results = self._parse_bing(text, limit)
                 if results:
                     return self._search_result(query, results, "bing")
-            errors.append(f"bing HTTP {response.status_code} or no parseable results")
+            suffix = " (truncated)" if truncated else ""
+            errors.append(f"bing HTTP {status} or no parseable results{suffix}")
         except Exception as exc:
             errors.append(f"bing: {exc}")
 
@@ -479,6 +492,28 @@ class WebTool(BaseTool):
             "results": [],
             "count": 0,
         }
+
+    async def _get_search_page(
+        self, url: str, headers: Dict[str, str]
+    ) -> tuple[int, str, bool]:
+        """Fetch a search result page with a hard response-size cap."""
+        async with httpx.AsyncClient(timeout=20, follow_redirects=True) as client:
+            async with client.stream("GET", url, headers=headers) as response:
+                chunks: List[bytes] = []
+                total = 0
+                truncated = False
+                async for chunk in response.aiter_bytes():
+                    total += len(chunk)
+                    if total > self.max_search_bytes:
+                        remain = self.max_search_bytes - (total - len(chunk))
+                        if remain > 0:
+                            chunks.append(chunk[:remain])
+                        truncated = True
+                        break
+                    chunks.append(chunk)
+                charset = response.encoding or "utf-8"
+                text = b"".join(chunks).decode(charset, errors="replace")
+                return response.status_code, text, truncated
 
     @staticmethod
     def _search_result(query: str, results: List[Dict[str, str]], backend: str) -> Dict[str, Any]:

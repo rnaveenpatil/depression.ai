@@ -55,6 +55,9 @@ class AgentContext:
     tokens_used: int = 0
     input_tokens: int = 0
     output_tokens: int = 0
+    cached_tokens: int = 0
+    cache_creation_tokens: int = 0
+    cache_savings: float = 0.0
     llm_calls: int = 0
     cost: float = 0.0
     tool_calls: int = 0
@@ -352,12 +355,20 @@ class Agent:
                 tokens = ctx_summary.get("tokens_used", 0) or 0
                 input_tokens = ctx_summary.get("input_tokens", 0) or 0
                 output_tokens = ctx_summary.get("output_tokens", 0) or 0
+                cached_tokens = ctx_summary.get("cached_tokens", 0) or 0
+                cache_creation_tokens = (
+                    ctx_summary.get("cache_creation_tokens", 0) or 0
+                )
+                cache_savings = ctx_summary.get("cache_savings", 0.0) or 0.0
                 llm_calls = ctx_summary.get("llm_calls", 0) or 0
                 cost = ctx_summary.get("cost", 0.0) or 0.0
 
                 self.context.tokens_used += tokens
                 self.context.input_tokens += input_tokens
                 self.context.output_tokens += output_tokens
+                self.context.cached_tokens += cached_tokens
+                self.context.cache_creation_tokens += cache_creation_tokens
+                self.context.cache_savings += cache_savings
                 self.context.llm_calls += llm_calls
                 self.context.cost += cost
                 self.metrics["total_tokens"] += tokens
@@ -418,25 +429,29 @@ class Agent:
             "scout": SubAgentRole.SCOUT,
         }
 
-        for agent_name, sub_query in subagent_calls:
+        async def run_invocation(agent_name: str, sub_query: str) -> Dict[str, Any]:
             role = role_map.get(agent_name.lower())
             if not role:
-                results.append(
-                    {
-                        "subagent": agent_name,
-                        "success": False,
-                        "error": (
-                            f"Unknown subagent: {agent_name}. "
-                            f"Available: {', '.join(role_map.keys())}"
-                        ),
-                    }
-                )
-                continue
-
-            result = await self.subagent_manager.invoke_subagent(
+                return {
+                    "subagent": agent_name,
+                    "success": False,
+                    "error": (
+                        f"Unknown subagent: {agent_name}. "
+                        f"Available: {', '.join(role_map.keys())}"
+                    ),
+                }
+            return await self.subagent_manager.invoke_subagent(
                 role=role, query=sub_query, context=context,
             )
-            results.append(result)
+
+        if self.subagent_manager.enable_parallel and len(subagent_calls) > 1:
+            results = list(await asyncio.gather(*(
+                run_invocation(name, query)
+                for name, query in subagent_calls
+            )))
+        else:
+            for agent_name, sub_query in subagent_calls:
+                results.append(await run_invocation(agent_name, sub_query))
 
         remaining_query = self.subagent_manager.strip_subagent_invocations(original_query)
 
@@ -649,6 +664,9 @@ class Agent:
             "tokens_used": self.context.tokens_used,
             "input_tokens": self.context.input_tokens,
             "output_tokens": self.context.output_tokens,
+            "cached_tokens": self.context.cached_tokens,
+            "cache_creation_tokens": self.context.cache_creation_tokens,
+            "cache_savings": self.context.cache_savings,
             "llm_calls": self.context.llm_calls,
             "cost": self.context.cost,
             "uptime": time.time() - self.context.start_time,

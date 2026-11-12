@@ -1,4 +1,4 @@
-"""Auto mode: one plan call, then one build loop."""
+"""Auto mode: the main LLM decides how to handle each request."""
 from __future__ import annotations
 
 from types import SimpleNamespace
@@ -53,7 +53,7 @@ def make_coordinator(planner, build_calls, build_response="done"):
 
 
 @pytest.mark.asyncio
-async def test_auto_mode_plans_once_then_runs_a_single_build_loop():
+async def test_auto_mode_does_not_force_planning_for_complex_requests():
     planner_calls = []
     build_calls = []
 
@@ -70,17 +70,16 @@ async def test_auto_mode_plans_once_then_runs_a_single_build_loop():
         auto_execute=True,
     )
 
-    assert len(planner_calls) == 1
+    assert planner_calls == []
     assert len(build_calls) == 1
-    assert build_calls[0]["initial_plan"] is not None
-    assert build_calls[0]["record_user"] is False
+    assert build_calls[0]["initial_plan"] is None
+    assert build_calls[0]["record_user"] is True
     assert result["success"] is True
-    assert "Add the parser" in result["plan"]
     assert result["execution"] == "done"
 
 
 @pytest.mark.asyncio
-async def test_auto_mode_always_plans_without_keyword_classification():
+async def test_auto_mode_answers_simple_questions_without_planning():
     planner_calls = []
     build_calls = []
 
@@ -95,10 +94,10 @@ async def test_auto_mode_always_plans_without_keyword_classification():
         "What is Python?", mode="auto", auto_execute=True,
     )
 
-    assert planner_calls == ["What is Python?"]
-    assert build_calls[0]["initial_plan"] is not None
-    assert result["plan"] is not None
+    assert planner_calls == []
+    assert build_calls[0]["initial_plan"] is None
     assert result["success"] is True
+    assert result["mode"] == "auto"
 
 
 @pytest.mark.asyncio

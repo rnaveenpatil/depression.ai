@@ -58,7 +58,7 @@ BUILTIN_SUBAGENTS: Dict[SubAgentRole, SubAgentConfig] = {
         role=SubAgentRole.GENERAL,
         name="general",
         description="General-purpose multi-step task agent. Full access minus todowrite.",
-        model="nvidia/nemotron-3.5-lightning-30b-a3b",
+        model="",
         allowed_tools=[
             "terminal", "filesystem", "search", "git", "patch", "process",
             "web", "browser", "diagnostics", "mcp",
@@ -71,14 +71,14 @@ BUILTIN_SUBAGENTS: Dict[SubAgentRole, SubAgentConfig] = {
             "Read-only codebase exploration. Only grep, glob, list, read, "
             "webfetch, websearch, read-only git allowed."
         ),
-        model="nvidia/nemotron-3.5-lightning-30b-a3b",
+        model="",
         allowed_tools=["search", "git", "web"],
     ),
     SubAgentRole.SCOUT: SubAgentConfig(
         role=SubAgentRole.SCOUT,
         name="scout",
         description="Experimental docs and dependency-source research agent.",
-        model="nvidia/nemotron-3.5-lightning-30b-a3b",
+        model="",
         allowed_tools=["search", "web"],
     ),
 }
@@ -110,7 +110,7 @@ class SubAgentManager:
 
     def __init__(self, agent: Any, config: Dict[str, Any]):
         self.agent = agent
-        self.config = config
+        self.config = config or {}
 
         self.subagents: Dict[str, SubAgent] = {}
         self.subagent_configs: Dict[SubAgentRole, SubAgentConfig] = {
@@ -118,12 +118,34 @@ class SubAgentManager:
         }
 
         for role, cfg in self.subagent_configs.items():
-            user_cfg = config.get(role.value) or {}
+            user_cfg = self.config.get(role.value) or {}
             if "model" in user_cfg:
-                cfg.model = user_cfg["model"]
+                cfg.model = str(user_cfg["model"] or "")
             if "allowed_tools" in user_cfg:
                 cfg.allowed_tools = list(user_cfg["allowed_tools"])
 
+        # Subagents default to the active runtime model, so they share the
+        # exact provider/API the user already connected. An explicit
+        # `subagent_model` or per-role model remains optional.
+        self.subagent_model = str(self.config.get("subagent_model") or "").strip()
+        self.subagent_model = self.subagent_model or None
+
+        try:
+            self.max_subagents = max(1, int(self.config.get("max_subagents", 10)))
+        except (TypeError, ValueError):
+            self.max_subagents = 10
+        try:
+            self.default_timeout = float(self.config.get("default_timeout", 0) or 0)
+        except (TypeError, ValueError):
+            self.default_timeout = 0.0
+        self.enable_parallel = bool(self.config.get("enable_parallel", True))
+        try:
+            self.max_turns = max(1, int(self.config.get("max_turns", 10)))
+        except (TypeError, ValueError):
+            self.max_turns = 10
+
+        self._slots = asyncio.Semaphore(self.max_subagents)
+        self._active_tasks: set[asyncio.Task[Any]] = set()
         self.llm_registry: Optional[LLMProviderRegistry] = None
 
         logger.info("SubAgentManager initialized with roles: %s", list(self.subagent_configs.keys()))
@@ -137,6 +159,30 @@ class SubAgentManager:
         for provider_name, key in keys.items():
             if key:
                 self.llm_registry.set_api_key(provider_name, key)
+
+    def _resolve_model(self, cfg: SubAgentConfig) -> Optional[str]:
+        """Pick the same runtime model/API unless explicitly overridden."""
+        current = None
+        if self.llm_registry is not None:
+            getter = getattr(self.llm_registry, "get_current_model", None)
+            if callable(getter):
+                current = getter()
+
+        explicit = (cfg.model or self.subagent_model or "").strip()
+        if not explicit:
+            return current
+
+        get_info = getattr(self.llm_registry, "get_model_info", None)
+        if callable(get_info):
+            info = get_info(explicit)
+            if info is None or not info.get("available", True):
+                logger.warning(
+                    "Subagent model %s is not available; using active model %s",
+                    explicit,
+                    current or "(none)",
+                )
+                return current
+        return explicit
 
     def get_subagent_names(self) -> List[str]:
         return [cfg.name for cfg in self.subagent_configs.values()]
@@ -197,44 +243,73 @@ class SubAgentManager:
             parent_agent=self.agent,
             context=context or {},
         )
+        current_task = asyncio.current_task()
+        if current_task is not None:
+            self._active_tasks.add(current_task)
 
         try:
-            if self.llm_registry is None:
-                await self.initialize()
-            subagent.llm = self.llm_registry
-            subagent.tool_registry = await self._create_subagent_tools(cfg, subagent)
-            self.subagents[subagent_id] = subagent
-            subagent.status = "working"
+            async with self._slots:
+                if self.llm_registry is None:
+                    await self.initialize()
+                subagent.llm = self.llm_registry
+                subagent.tool_registry = await self._create_subagent_tools(cfg, subagent)
+                self.subagents[subagent_id] = subagent
+                subagent.status = "working"
 
-            try:
-                system_prompt = self._build_subagent_system_prompt(cfg, context)
-                messages = [
-                    Message(role="system", content=system_prompt),
-                    Message(role="user", content=query),
-                ]
-                result_text = await self._run_subagent_loop(
-                    subagent, messages, model=cfg.model or None
-                )
-                subagent.status = "completed"
-                return {
-                    "success": True,
-                    "subagent": cfg.name,
-                    "result": result_text,
-                    "subagent_id": subagent_id,
-                }
-            except asyncio.CancelledError:
-                subagent.status = "cancelled"
-                raise
-            except Exception as e:
-                subagent.status = "failed"
-                logger.error("Subagent %s failed: %s", subagent_id, e, exc_info=True)
-                return {
-                    "success": False,
-                    "subagent": cfg.name,
-                    "error": str(e),
-                    "subagent_id": subagent_id,
-                }
+                try:
+                    system_prompt = self._build_subagent_system_prompt(cfg, context)
+                    messages = [
+                        Message(role="system", content=system_prompt),
+                        Message(role="user", content=query),
+                    ]
+                    model = self._resolve_model(cfg)
+                    runner = self._run_subagent_loop(
+                        subagent, messages, model=model
+                    )
+                    if self.default_timeout > 0:
+                        result_text = await asyncio.wait_for(
+                            runner, timeout=self.default_timeout
+                        )
+                    else:
+                        result_text = await runner
+                    subagent.status = "completed"
+                    return {
+                        "success": True,
+                        "subagent": cfg.name,
+                        "result": result_text,
+                        "subagent_id": subagent_id,
+                        "model": model,
+                    }
+                except asyncio.CancelledError:
+                    subagent.status = "cancelled"
+                    raise
+                except asyncio.TimeoutError:
+                    subagent.status = "failed"
+                    logger.error(
+                        "Subagent %s timed out after %.1fs",
+                        subagent_id,
+                        self.default_timeout,
+                    )
+                    return {
+                        "success": False,
+                        "subagent": cfg.name,
+                        "error": (
+                            f"subagent timed out after {self.default_timeout:.1f}s"
+                        ),
+                        "subagent_id": subagent_id,
+                    }
+                except Exception as e:
+                    subagent.status = "failed"
+                    logger.error("Subagent %s failed: %s", subagent_id, e, exc_info=True)
+                    return {
+                        "success": False,
+                        "subagent": cfg.name,
+                        "error": str(e),
+                        "subagent_id": subagent_id,
+                    }
         finally:
+            if current_task is not None:
+                self._active_tasks.discard(current_task)
             self.subagents.pop(subagent_id, None)
 
     async def _create_subagent_tools(
@@ -348,7 +423,7 @@ class SubAgentManager:
         messages: List[Message],
         model: Optional[str] = None,
     ) -> str:
-        max_turns = int(self.config.get("max_turns", 10))
+        max_turns = self.max_turns
         final_response = ""
         registry = subagent.tool_registry
         schemas = registry.get_schemas() if registry else []
@@ -389,7 +464,7 @@ class SubAgentManager:
             )
 
             if not tool_calls:
-                break
+                return final_response
 
             for tc in tool_calls:
                 params = tc.arguments if isinstance(tc.arguments, dict) else {}
@@ -416,7 +491,9 @@ class SubAgentManager:
                     Message(role="tool", content=payload, tool_call_id=tc.id)
                 )
 
-        return final_response
+        raise SubAgentError(
+            f"subagent exceeded max turns ({max_turns}) without a final response"
+        )
 
     async def _tool_allowed(self, tool_name: str, params: Dict[str, Any]) -> bool:
         """Run subagent tool calls through the same permission gate as the parent.
@@ -446,6 +523,16 @@ class SubAgentManager:
         return bool(allowed)
 
     async def shutdown(self) -> None:
+        current = asyncio.current_task()
+        pending = [
+            task for task in self._active_tasks
+            if task is not current and not task.done()
+        ]
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+        self._active_tasks.clear()
         self.subagents.clear()
         logger.info("SubAgentManager shutdown complete")
 

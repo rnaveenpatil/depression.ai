@@ -155,8 +155,10 @@ def test_anthropic_body_uses_tool_use_and_tool_result_blocks():
         _tool_history(), "m", 100, [SPEC], None, False
     )
 
-    # System turns are hoisted out of `messages`.
-    assert body.get("system") == "be terse"
+    # System turns are hoisted out of `messages` into cacheable blocks.
+    system = body.get("system")
+    assert system[0]["text"] == "be terse"
+    assert system[0]["cache_control"] == {"type": "ephemeral"}
     msgs = body["messages"]
 
     assert msgs[0] == {"role": "user", "content": "store a note"}

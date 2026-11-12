@@ -180,7 +180,8 @@ class TodoTool(BaseTool):
     def _summary(self) -> Dict[str, Any]:
         stats: Dict[str, int] = {}
         for i in self.items.values():
-            stats[i.status] = stats.get(i.status, 0) + 1
+            status = "completed" if i.status == "done" else i.status
+            stats[status] = stats.get(status, 0) + 1
         return {"success": True, "stats": stats, "total": len(self.items)}
 
     @classmethod

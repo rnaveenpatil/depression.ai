@@ -423,6 +423,9 @@ class LoopContext:
     tokens_used: int = 0
     input_tokens: int = 0
     output_tokens: int = 0
+    cached_tokens: int = 0
+    cache_creation_tokens: int = 0
+    cache_savings: float = 0.0
     llm_calls: int = 0
     cost: float = 0.0
     errors: List[str] = field(default_factory=list)
@@ -455,6 +458,9 @@ class LoopContext:
             "tokens_used": self.tokens_used,
             "input_tokens": self.input_tokens,
             "output_tokens": self.output_tokens,
+            "cached_tokens": self.cached_tokens,
+            "cache_creation_tokens": self.cache_creation_tokens,
+            "cache_savings": self.cache_savings,
             "llm_calls": self.llm_calls,
             "cost": self.cost,
             "errors": len(self.errors),
@@ -990,12 +996,21 @@ class AgentLoop:
                 u = getattr(chunk, "usage", None)
                 if u:
                     if isinstance(u, dict):
-                        final_usage = u
+                        final_usage = dict(u)
+                    elif callable(getattr(u, "to_dict", None)):
+                        final_usage = u.to_dict()
                     else:
                         final_usage = {
                             "prompt_tokens": getattr(u, "prompt_tokens", 0),
                             "completion_tokens": getattr(u, "completion_tokens", 0),
                             "total_tokens": getattr(u, "total_tokens", 0),
+                            "cached_tokens": getattr(u, "cached_tokens", 0),
+                            "cache_creation_tokens": getattr(
+                                u, "cache_creation_tokens", 0
+                            ),
+                            "reasoning_tokens": getattr(
+                                u, "reasoning_tokens", 0
+                            ),
                         }
 
                 m = getattr(chunk, "model", None)
@@ -2229,7 +2244,7 @@ class AgentLoop:
             instructions_fp = ""
         return (
             tools, perms, env_gen, ws_path, model, mcp_count,
-            self.context.intent, instructions_fp,
+            instructions_fp,
         )
 
     def _workspace_root(self) -> str:
@@ -2803,7 +2818,14 @@ Achieve the user's actual goal with minimal tokens, tool calls, and unnecessary 
     @staticmethod
     def _normalize_usage(usage: Any) -> Dict[str, int]:
         if usage is None:
-            return {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+            return {
+                "prompt_tokens": 0,
+                "completion_tokens": 0,
+                "total_tokens": 0,
+                "cached_tokens": 0,
+                "cache_creation_tokens": 0,
+                "reasoning_tokens": 0,
+            }
         if isinstance(usage, dict):
             d = usage
         else:
@@ -2813,6 +2835,11 @@ Achieve the user's actual goal with minimal tokens, tool calls, and unnecessary 
                     "prompt_tokens": getattr(usage, "prompt_tokens", 0),
                     "completion_tokens": getattr(usage, "completion_tokens", 0),
                     "total_tokens": getattr(usage, "total_tokens", 0),
+                    "cached_tokens": getattr(usage, "cached_tokens", 0),
+                    "cache_creation_tokens": getattr(
+                        usage, "cache_creation_tokens", 0
+                    ),
+                    "reasoning_tokens": getattr(usage, "reasoning_tokens", 0),
                 }
         prompt = int(d.get("prompt_tokens", 0) or 0)
         completion = int(d.get("completion_tokens", 0) or 0)
@@ -2821,6 +2848,11 @@ Achieve the user's actual goal with minimal tokens, tool calls, and unnecessary 
             "prompt_tokens": prompt,
             "completion_tokens": completion,
             "total_tokens": total,
+            "cached_tokens": int(d.get("cached_tokens", 0) or 0),
+            "cache_creation_tokens": int(
+                d.get("cache_creation_tokens", 0) or 0
+            ),
+            "reasoning_tokens": int(d.get("reasoning_tokens", 0) or 0),
         }
 
     def _record_usage(self, usage: Any) -> None:
@@ -2828,6 +2860,9 @@ Achieve the user's actual goal with minimal tokens, tool calls, and unnecessary 
         self.context.tokens_used += u["total_tokens"]
         self.context.input_tokens += u["prompt_tokens"]
         self.context.output_tokens += u["completion_tokens"]
+        self.context.cached_tokens += u["cached_tokens"]
+        self.context.cache_creation_tokens += u["cache_creation_tokens"]
+        self.context.cache_savings += self._compute_cache_savings(u)
         self.context.cost += self._compute_cost(u)
 
     def _compute_cost(self, usage: Dict[str, int]) -> float:
@@ -2840,10 +2875,26 @@ Achieve the user's actual goal with minimal tokens, tool calls, and unnecessary 
         output_rate = meta.get("cost_output", 0.0) or 0.0
         if not input_rate and not output_rate:
             return 0.0
+        cached = int(usage.get("cached_tokens", 0) or 0)
+        billable_input = max(0, int(usage.get("prompt_tokens", 0) or 0) - cached)
         return (
-            (usage.get("prompt_tokens", 0) / 1_000_000) * input_rate
+            (billable_input / 1_000_000) * input_rate
             + (usage.get("completion_tokens", 0) / 1_000_000) * output_rate
         )
+
+    def _compute_cache_savings(self, usage: Dict[str, int]) -> float:
+        cached = int(usage.get("cached_tokens", 0) or 0)
+        if cached <= 0:
+            return 0.0
+        try:
+            model = self.llm.get_current_model()
+        except Exception:
+            model = None
+        meta = MODEL_METADATA.get(model, {}) if model else {}
+        input_rate = meta.get("cost_input", 0.0) or 0.0
+        if not input_rate:
+            return 0.0
+        return (cached / 1_000_000) * input_rate
 
     # ==================================================================
     # TOOL EXPOSURE

@@ -530,7 +530,7 @@ Examples:
                 self.agent_coordinator.process_query(
                     query,
                     mode="auto",
-                    auto_execute=True,  # Execute plan automatically in auto mode
+                    auto_execute=True,
                     max_iterations=self.args.max_iterations,
                 ),
                 timeout=self.args.timeout,
@@ -606,7 +606,7 @@ Examples:
                 continue
             elif text == "/auto":
                 self.agent_coordinator.set_mode("auto")
-                self.ui.print_info("Switched to Auto mode (Plan -> Build loop)")
+                self.ui.print_info("Switched to Auto mode (LLM decides how to proceed)")
                 self._refresh_status_bar()
                 continue
 
@@ -638,8 +638,8 @@ Examples:
         start = time.time()
         try:
             # Use current mode for processing.
-            # Plan mode is planning-only: never auto-execute the plan.
-            # Build/auto modes may auto-execute (plan -> build hand-off).
+            # Plan mode is planning-only. Build/auto run the main loop;
+            # auto mode lets the model decide whether to plan or answer directly.
             mode = self.agent_coordinator.current_mode
             result = await asyncio.wait_for(
                 self.agent_coordinator.process_query(

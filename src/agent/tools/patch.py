@@ -281,6 +281,8 @@ class PatchTool(BaseTool):
                         start = found
 
                     replacement = [self._line_body(l) + newline for l in new_lines]
+                    if hunk.get("new_no_newline") and replacement:
+                        replacement[-1] = self._line_body(new_lines[-1])
                     lines[start:start + len(old_lines)] = replacement
 
                 updated = "".join(lines)
@@ -331,20 +333,32 @@ class PatchTool(BaseTool):
                     "new_count": int(m.group(4) or 1),
                     "old_lines": [],
                     "new_lines": [],
+                    "old_no_newline": False,
+                    "new_no_newline": False,
+                    "last_side": None,
                 }
                 current["hunks"].append(current_hunk)
                 continue
             if current_hunk is None:
                 continue
             if line.startswith("\\"):
+                side = current_hunk.get("last_side")
+                if side in ("old", "both"):
+                    current_hunk["old_no_newline"] = True
+                if side in ("new", "both"):
+                    current_hunk["new_no_newline"] = True
+                current_hunk["last_side"] = None
                 continue
             if line.startswith(" "):
                 current_hunk["old_lines"].append(line[1:])
                 current_hunk["new_lines"].append(line[1:])
+                current_hunk["last_side"] = "both"
             elif line.startswith("-"):
                 current_hunk["old_lines"].append(line[1:])
+                current_hunk["last_side"] = "old"
             elif line.startswith("+"):
                 current_hunk["new_lines"].append(line[1:])
+                current_hunk["last_side"] = "new"
         return files
 
     @staticmethod
@@ -355,12 +369,12 @@ class PatchTool(BaseTool):
         self, lines: List[str], old: List[str], start: int
     ) -> Optional[int]:
         window = 20
-        expected = [l.rstrip("\n") for l in old]
+        expected = [self._line_body(l) for l in old]
         for offset in range(1, window):
             for delta in (start + offset, start - offset):
                 if 0 <= delta <= len(lines) - len(old):
                     candidate = [
-                        l.rstrip("\n") for l in lines[delta:delta + len(old)]
+                        self._line_body(l) for l in lines[delta:delta + len(old)]
                     ]
                     if candidate == expected:
                         return delta

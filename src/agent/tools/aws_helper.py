@@ -26,6 +26,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from agent.tools.registry import BaseTool
 from agent.utils.logging import get_logger
 from agent.utils.env_manager import EnvManager
+from agent.utils.shell import terminate_process
 
 logger = get_logger(__name__)
 
@@ -496,17 +497,14 @@ class AWSHelperTool(BaseTool):
                 stderr=asyncio.subprocess.PIPE,
                 cwd=self.cwd,
                 env=env,
+                start_new_session=True,
             )
             stdout, stderr = await asyncio.wait_for(
                 proc.communicate(), timeout=self.timeout
             )
         except asyncio.TimeoutError:
             if proc is not None:
-                try:
-                    proc.kill()
-                    await asyncio.wait_for(proc.wait(), timeout=2)
-                except Exception:
-                    pass
+                await terminate_process(proc, force=True)
             return {
                 "success": False,
                 "_source": "cli",
@@ -514,6 +512,10 @@ class AWSHelperTool(BaseTool):
                 "command": " ".join(cmd),
                 "credentials_source": source,
             }
+        except asyncio.CancelledError:
+            if proc is not None:
+                await terminate_process(proc, force=True)
+            raise
 
         out = stdout.decode(errors="replace")
         err = stderr.decode(errors="replace")

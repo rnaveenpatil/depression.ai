@@ -257,6 +257,9 @@ class GeminiProvider(LLMProvider):
             "json_mode": True,        # responseMimeType: "application/json"
             "system_prompt": True,
             "parallel_tool_calls": True,
+            "prompt_cache": True,
+            "prompt_cache_explicit": False,
+            "prompt_cache_automatic": True,
         }
 
     # ------------------------------------------------------------------
@@ -270,8 +273,9 @@ class GeminiProvider(LLMProvider):
         Split incoming messages into (system_instruction, contents).
 
         Rules:
-            * Every role="system" is joined into a single top-level
-              `system_instruction` object. It is removed from `contents`.
+            * Every role="system" becomes an ordered part of the top-level
+              `system_instruction`. The stable part stays first so implicit
+              prefix caching can reuse it. It is removed from `contents`.
             * role="user" or "tool" → contents entry with role="user".
             * role="assistant"      → contents entry with role="model".
             * role="tool" becomes a user turn with a `functionResponse`
@@ -361,7 +365,7 @@ class GeminiProvider(LLMProvider):
         system_instruction: Dict[str, Any] = {}
         if system_parts:
             system_instruction = {
-                "parts": [{"text": "\n\n".join(system_parts)}],
+                "parts": [{"text": part} for part in system_parts],
             }
 
         return system_instruction, contents
@@ -411,6 +415,7 @@ class GeminiProvider(LLMProvider):
                 code=ProviderErrorCode.UNSUPPORTED,
                 provider="gemini",
             )
+        decls.sort(key=lambda item: str(item.get("name") or ""))
         return [{"function_declarations": decls}] if decls else []
 
     # ------------------------------------------------------------------
@@ -431,6 +436,16 @@ class GeminiProvider(LLMProvider):
 
         if system_instruction:
             body["system_instruction"] = system_instruction
+
+        # Optional explicit cache reference. Gemini's implicit caching is
+        # automatic; this only forwards a caller-created cachedContents name.
+        cached_content = (
+            kwargs.get("cached_content")
+            or kwargs.get("cachedContent")
+            or self.config.extra.get("cached_content")
+        )
+        if cached_content:
+            body["cachedContent"] = str(cached_content)
 
         generation_config: Dict[str, Any] = {
             "maxOutputTokens": int(max_tokens) if max_tokens and max_tokens > 0 else 4096,

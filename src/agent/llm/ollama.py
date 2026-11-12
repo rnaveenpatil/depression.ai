@@ -223,6 +223,9 @@ class OllamaProvider(LLMProvider):
             "json_mode": True,     # via format:"json"
             "system_prompt": True,
             "parallel_tool_calls": False,
+            "prompt_cache": False,
+            "prompt_cache_explicit": False,
+            "prompt_cache_automatic": False,
         }
 
     # ------------------------------------------------------------------
@@ -319,6 +322,9 @@ class OllamaProvider(LLMProvider):
                 code=ProviderErrorCode.UNSUPPORTED,
                 provider="ollama",
             )
+        out.sort(key=lambda item: str(
+            (item.get("function") or {}).get("name") or ""
+        ))
         return out
 
     # ------------------------------------------------------------------

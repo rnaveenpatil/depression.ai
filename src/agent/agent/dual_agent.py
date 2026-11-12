@@ -107,6 +107,9 @@ class BaseAgent:
             "tokens_used": 0,
             "input_tokens": 0,
             "output_tokens": 0,
+            "cached_tokens": 0,
+            "cache_creation_tokens": 0,
+            "cache_savings": 0.0,
             "llm_calls": 0,
             "cost": 0.0,
             "duration": 0.0,
@@ -231,6 +234,11 @@ class BaseAgent:
             "tokens_used": self.context.get("tokens_used", 0),
             "input_tokens": self.context.get("input_tokens", 0),
             "output_tokens": self.context.get("output_tokens", 0),
+            "cached_tokens": self.context.get("cached_tokens", 0),
+            "cache_creation_tokens": self.context.get(
+                "cache_creation_tokens", 0
+            ),
+            "cache_savings": self.context.get("cache_savings", 0.0),
             "llm_calls": self.context.get("llm_calls", 0),
             "cost": self.context.get("cost", 0.0),
             "duration": self.context.get("duration", 0.0),
@@ -554,12 +562,27 @@ class BaseAgent:
             tokens = int(ctx_summary.get("tokens_used", 0) or 0)
             input_tokens = int(ctx_summary.get("input_tokens", 0) or 0)
             output_tokens = int(ctx_summary.get("output_tokens", 0) or 0)
+            cached_tokens = int(ctx_summary.get("cached_tokens", 0) or 0)
+            cache_creation_tokens = int(
+                ctx_summary.get("cache_creation_tokens", 0) or 0
+            )
+            cache_savings = float(ctx_summary.get("cache_savings", 0.0) or 0.0)
             llm_calls = int(ctx_summary.get("llm_calls", 0) or 0)
             cost = float(ctx_summary.get("cost", 0.0) or 0.0)
 
             self.context["tokens_used"] = self.context.get("tokens_used", 0) + tokens
             self.context["input_tokens"] = self.context.get("input_tokens", 0) + input_tokens
             self.context["output_tokens"] = self.context.get("output_tokens", 0) + output_tokens
+            self.context["cached_tokens"] = (
+                self.context.get("cached_tokens", 0) + cached_tokens
+            )
+            self.context["cache_creation_tokens"] = (
+                self.context.get("cache_creation_tokens", 0)
+                + cache_creation_tokens
+            )
+            self.context["cache_savings"] = (
+                self.context.get("cache_savings", 0.0) + cache_savings
+            )
             self.context["llm_calls"] = self.context.get("llm_calls", 0) + llm_calls
             self.context["cost"] = self.context.get("cost", 0.0) + cost
             self.context["duration"] = self.context.get("duration", 0.0) + elapsed
@@ -613,22 +636,29 @@ class BaseAgent:
             "scout": SubAgentRole.SCOUT,
         }
 
-        for agent_name, sub_query in subagent_calls:
+        async def run_invocation(agent_name: str, sub_query: str) -> Dict[str, Any]:
             role = role_map.get(agent_name.lower())
             if not role:
-                results.append({
+                return {
                     "subagent": agent_name,
                     "success": False,
                     "error": (
                         f"Unknown subagent: {agent_name}. "
                         f"Available: {', '.join(role_map.keys())}"
                     ),
-                })
-                continue
-            result = await self.subagent_manager.invoke_subagent(
+                }
+            return await self.subagent_manager.invoke_subagent(
                 role=role, query=sub_query, context=context,
             )
-            results.append(result)
+
+        if self.subagent_manager.enable_parallel and len(subagent_calls) > 1:
+            results = list(await asyncio.gather(*(
+                run_invocation(name, query)
+                for name, query in subagent_calls
+            )))
+        else:
+            for agent_name, sub_query in subagent_calls:
+                results.append(await run_invocation(agent_name, sub_query))
 
         remaining_query = self.subagent_manager.strip_subagent_invocations(original_query)
 
@@ -817,6 +847,9 @@ class AgentCoordinator:
         tokens_used = _get_int("tokens_used", "total_tokens")
         input_tokens = _get_int("input_tokens", "prompt_tokens")
         output_tokens = _get_int("output_tokens", "completion_tokens")
+        cached_tokens = _get_int("cached_tokens")
+        cache_creation_tokens = _get_int("cache_creation_tokens")
+        cache_savings = _get_float("cache_savings")
         llm_calls = _get_int("llm_calls", "api_calls")
         cost = _get_float("cost", "total_cost")
         turn_count = _get_int("turn_count")
@@ -872,6 +905,9 @@ class AgentCoordinator:
             "tokens_used": tokens_used,
             "input_tokens": input_tokens,
             "output_tokens": output_tokens,
+            "cached_tokens": cached_tokens,
+            "cache_creation_tokens": cache_creation_tokens,
+            "cache_savings": cache_savings,
             "llm_calls": llm_calls,
             "cost": cost,
             "tools_used": tools_used,
@@ -1061,100 +1097,26 @@ class AgentCoordinator:
         auto_execute: bool = True,
         max_iterations: int = 3,
     ) -> Dict[str, Any]:
-        """Auto mode: one plan call, then one build loop.
+        """Auto mode: the main build loop decides what the request needs.
 
-        The old design ran a full Plan-agent loop and then a full Build-agent
-        loop up to ``max_iterations`` times, which spent several model calls
-        re-planning the same work. Now planning happens once via the
-        deterministic Planner and the Build loop executes the plan.
+        There is no forced planning pass. The model may answer directly,
+        investigate with tools, use subagents, maintain a todo list for
+        multi-step work, or execute changes. Permission and security checks
+        remain deterministic in the tool registry and permission manager.
         """
         logger.info(
             "Processing query (auto mode): %s (max_iterations=%d)",
             query[:100], max_iterations,
         )
 
-        # Record the real user turn exactly once.
-        if self.build_agent.context_manager:
-            try:
-                await self.build_agent.context_manager.add_user_message(query, context)
-            except Exception as exc:
-                logger.debug("auto-mode record user failed: %s", exc)
-        if self.build_agent.session:
-            try:
-                self.build_agent.session.add_user_message(query)
-            except Exception:
-                pass
-
-        current_context = dict(context or {})
-        planner = getattr(self.plan_agent, "planner", None)
-        build_loop = getattr(self.build_agent, "loop", None)
-
-        plan = None
-        plan_text = ""
-        if planner is not None:
-            try:
-                plan = await planner.create_plan(
-                    goal=query, context=current_context,
-                )
-                if not getattr(plan, "tasks", None):
-                    plan = None
-                plan_text = self._format_plan(plan)
-                logger.info(
-                    "Auto plan created: %d task(s)",
-                    len(getattr(plan, "tasks", []) or []),
-                )
-            except Exception as exc:
-                logger.warning(
-                    "Auto-mode planning failed; running free-form: %s", exc
-                )
-                plan = None
-                plan_text = ""
-
-        if plan is not None:
-            if build_loop is not None and getattr(build_loop, "planner", None) is None:
-                build_loop.planner = planner
-            await self._emit_plan_events(build_loop, plan)
-
-        if not auto_execute:
-            return {
-                "success": True,
-                "plan": plan_text or None,
-                "execution": None,
-                "iterations": 0,
-                "tool_calls": 0,
-                "mode": "auto",
-                "message": "Plan created. Call again with auto_execute=True to run it.",
-            }
-
-        build_result = await self.build_agent.process_query(
+        result = await self.build_agent.process_query(
             query=query,
             context=context,
-            record_user=False,
-            initial_plan=plan,
+            record_user=True,
         )
-
-        execution = build_result.get("response", "")
-        if execution:
-            try:
-                if self.build_agent.context_manager:
-                    await self.build_agent.context_manager.add_assistant_message(
-                        execution
-                    )
-                if self.build_agent.session:
-                    self.build_agent.session.add_assistant_message(execution)
-            except Exception as exc:
-                logger.debug("auto-mode store final answer failed: %s", exc)
-
-        result: Dict[str, Any] = {
-            "success": build_result.get("success", True),
-            "plan": plan_text or None,
-            "execution": execution,
-            "iterations": 1 if plan is not None else 0,
-            "tool_calls": int(build_result.get("tool_calls", 0) or 0),
-            "mode": "auto",
-        }
-        if not result["success"] and build_result.get("error"):
-            result["error"] = str(build_result.get("error"))
+        result["mode"] = "auto"
+        result.setdefault("execution", result.get("response", ""))
+        result.setdefault("plan", None)
         return result
 
     async def execute_plan(

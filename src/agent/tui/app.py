@@ -1272,7 +1272,7 @@ def _probe_loop_context(coordinator: Any) -> Any:
     currently active on the coordinator.
 
     Probes, in order:
-      0. auto mode: the most recently started plan/build loop
+      0. auto mode: the active build loop
       1. coordinator.current_agent            (attribute)
       2. coordinator.get_current_agent()      (method)
       3. coordinator.build_agent              (attribute)
@@ -1283,9 +1283,8 @@ def _probe_loop_context(coordinator: Any) -> Any:
     if coordinator is None:
         return None
 
-    # Auto mode runs plan and build in sequence. `get_current_agent()`
-    # always returns the build agent there, which is stale while the plan
-    # phase is running. Pick the loop that started most recently instead.
+    # Auto mode runs the build loop directly; prefer whichever loop
+    # started most recently if a stale plan loop is still around.
     if getattr(coordinator, "current_mode", None) == "auto":
         best_ctx = None
         best_start = float("-inf")
@@ -1352,6 +1351,9 @@ def _usage_empty() -> Dict[str, Any]:
         "input_tokens": 0,
         "output_tokens": 0,
         "tokens_used": 0,
+        "cached_tokens": 0,
+        "cache_creation_tokens": 0,
+        "cache_savings": 0.0,
         "llm_calls": 0,
         "tool_calls": 0,
         "cost": 0.0,
@@ -1400,6 +1402,9 @@ def _usage_snapshot(obj: Any, *, now: Optional[float] = None) -> Dict[str, Any]:
         _usage_int(obj, "tokens_used", "total_tokens")
         or snap["input_tokens"] + snap["output_tokens"]
     )
+    snap["cached_tokens"] = _usage_int(obj, "cached_tokens")
+    snap["cache_creation_tokens"] = _usage_int(obj, "cache_creation_tokens")
+    snap["cache_savings"] = _usage_float(obj, "cache_savings")
     snap["llm_calls"] = _usage_int(obj, "llm_calls", "api_calls")
     snap["cost"] = _usage_float(obj, "cost", "total_cost")
 
@@ -1429,7 +1434,7 @@ def _usage_snapshot(obj: Any, *, now: Optional[float] = None) -> Dict[str, Any]:
 
 def _usage_add(total: Dict[str, Any], part: Dict[str, Any]) -> None:
     for key in total:
-        if key == "cost" or key == "duration":
+        if key in ("cost", "duration", "cache_savings"):
             total[key] += float(part.get(key, 0.0) or 0.0)
         else:
             total[key] += int(part.get(key, 0) or 0)
@@ -1575,6 +1580,7 @@ class LLMCostPanel(Vertical):
         yield Static("", id="cost-q-in",    classes="value")
         yield Static("", id="cost-q-out",   classes="value")
         yield Static("", id="cost-q-total", classes="accent")
+        yield Static("", id="cost-q-cache", classes="value")
         yield Static("", id="cost-q-calls", classes="value")
         yield Static("", id="cost-q-tools", classes="value")
         yield Static("", id="cost-q-dur",   classes="value")
@@ -1583,6 +1589,7 @@ class LLMCostPanel(Vertical):
         yield Static("", id="cost-s-in",    classes="value")
         yield Static("", id="cost-s-out",   classes="value")
         yield Static("", id="cost-s-total", classes="accent")
+        yield Static("", id="cost-s-cache", classes="value")
         yield Static("", id="cost-s-calls", classes="value")
         yield Static("", id="cost-s-tools", classes="value")
         yield Static("", id="cost-s-turns", classes="value")
@@ -1705,6 +1712,7 @@ class LLMCostPanel(Vertical):
         qi = int(query["input_tokens"])
         qo = int(query["output_tokens"])
         qt = int(query["tokens_used"])
+        qcached = int(query["cached_tokens"])
         qc = int(query["llm_calls"])
         qtools = int(query["tool_calls"])
         qdur = _query_elapsed(
@@ -1715,6 +1723,10 @@ class LLMCostPanel(Vertical):
         self._update("#cost-q-in", f"[{MUTED}]in[/]      [{TEXT}]{_fmt(qi)}[/]")
         self._update("#cost-q-out", f"[{MUTED}]out[/]     [{TEXT}]{_fmt(qo)}[/]")
         self._update("#cost-q-total", f"[{MUTED}]total[/]   [{GREEN}]{_fmt(qt)}[/]")
+        self._update(
+            "#cost-q-cache",
+            f"[{MUTED}]cached[/]    [{GREEN}]{_fmt(qcached)}[/]",
+        )
         self._update("#cost-q-calls", f"[{MUTED}]api calls[/]  [{AMBER}]{_fmt(qc)}[/]")
         self._update("#cost-q-tools", f"[{MUTED}]tool calls[/] [{TEXT}]{_fmt(qtools)}[/]")
         self._update("#cost-q-dur", f"[{MUTED}]duration[/]  [{TEXT}]{qdur:.1f}s[/]")
@@ -1730,6 +1742,7 @@ class LLMCostPanel(Vertical):
         st = int(session["tokens_used"])
         sc = int(session["llm_calls"])
         stools = int(session["tool_calls"])
+        scached = int(session["cached_tokens"])
         sdur = float(session["duration"])
 
         if not _usage_agents(coordinator) and status:
@@ -1738,6 +1751,7 @@ class LLMCostPanel(Vertical):
             so = self._num(status, "output_tokens", "completion_tokens",
                            "total_output_tokens")
             st = self._num(status, "tokens_used", "total_tokens") or (si + so)
+            scached = scached or self._num(status, "cached_tokens")
             sc = self._num(status, "llm_calls", "api_calls",
                            "total_llm_calls")
             tools_used = status.get("tools_used") or status.get("tool_calls")
@@ -1753,8 +1767,7 @@ class LLMCostPanel(Vertical):
             si = si or int(getattr(self._app, "live_input_tokens", 0) or 0)
             so = so or int(getattr(self._app, "live_output_tokens", 0) or 0)
 
-        # User turns come from the TUI, not from plan/build agent turn
-        # counters (auto mode counts internal phases as turns).
+        # User turns come from the TUI, not per-agent turn counters.
         sturns = int(getattr(self._app, "message_count", 0) or 0)
         if not sturns and status:
             sturns = self._num(status, "user_turns", "message_count")
@@ -1764,6 +1777,10 @@ class LLMCostPanel(Vertical):
         self._update("#cost-s-in", f"[{MUTED}]in[/]      [{TEXT}]{_fmt(si)}[/]")
         self._update("#cost-s-out", f"[{MUTED}]out[/]     [{TEXT}]{_fmt(so)}[/]")
         self._update("#cost-s-total", f"[{MUTED}]total[/]   [{GREEN}]{_fmt(st)}[/]")
+        self._update(
+            "#cost-s-cache",
+            f"[{MUTED}]cached[/]    [{GREEN}]{_fmt(scached)}[/]",
+        )
         self._update("#cost-s-calls", f"[{MUTED}]api calls[/]  [{AMBER}]{_fmt(sc)}[/]")
         self._update("#cost-s-tools", f"[{MUTED}]tool calls[/] [{TEXT}]{_fmt(stools)}[/]")
         self._update("#cost-s-turns", f"[{MUTED}]turns[/]     [{TEXT}]{_fmt(sturns)}[/]")
@@ -1816,7 +1833,7 @@ class HelpPanel(Vertical):
         yield Static("/shot PATH open a screenshot with the OS viewer", classes="help-row")
         yield Static("/plan      switch mode → plan", classes="help-row")
         yield Static("/build     switch mode → build", classes="help-row")
-        yield Static("/auto      switch mode → auto (plan → build loop)", classes="help-row")
+        yield Static("/auto      switch mode → auto (LLM decides)", classes="help-row")
         yield Static("/clear     clear transcript", classes="help-row")
         yield Static("/quit      exit", classes="help-row")
         yield Static("CLI Flags", classes="help-section")

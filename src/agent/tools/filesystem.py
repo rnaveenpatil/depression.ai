@@ -20,6 +20,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import os
+import secrets
 import shutil
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -131,6 +132,40 @@ class FileSystemTool(BaseTool):
     read_only = False
     mutating = True
     category = "inspect"
+
+    @staticmethod
+    def _atomic_write_bytes(target: Path, data: bytes, append: bool = False) -> None:
+        """Atomically replace *target* while preserving its mode.
+
+        Append is implemented as copy-existing + append into a temp file so a
+        crash can never leave the original truncated or half-written.
+        """
+        target.parent.mkdir(parents=True, exist_ok=True)
+        mode: Optional[int] = None
+        if target.exists():
+            try:
+                mode = target.stat().st_mode & 0o7777
+            except OSError:
+                mode = None
+        tmp = target.parent / f".fs-{secrets.token_hex(8)}"
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666)
+        try:
+            with os.fdopen(fd, "wb") as out:
+                if append and target.exists():
+                    with open(target, "rb") as src:
+                        shutil.copyfileobj(src, out, 1024 * 1024)
+                out.write(data)
+                out.flush()
+                os.fsync(out.fileno())
+            if mode is not None:
+                os.chmod(tmp, mode)
+            os.replace(tmp, target)
+        except Exception:
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+            raise
 
     def __init__(self, workspace: Any = None):
         self.workspace = workspace
@@ -459,12 +494,10 @@ class FileSystemTool(BaseTool):
 
         data = content.encode("utf-8")
 
-        def _do_write() -> None:
-            with open(target, f"{mode}b") as f:
-                f.write(data)
-
         try:
-            await asyncio.to_thread(_do_write)
+            await asyncio.to_thread(
+                self._atomic_write_bytes, target, data, mode == "a"
+            )
         except PermissionError:
             return _err(f"Permission denied writing {target}", recoverable=False)
         except Exception as e:
@@ -576,7 +609,7 @@ class FileSystemTool(BaseTool):
         new_bytes = updated.encode(encoding or "utf-8")
 
         try:
-            target.write_bytes(new_bytes)
+            await asyncio.to_thread(self._atomic_write_bytes, target, new_bytes)
         except PermissionError:
             return _err(f"Permission denied writing {target}", recoverable=False)
         except Exception as e:

@@ -117,6 +117,59 @@ _PASSTHROUGH_BODY_KEYS = (
     "metadata",
 )
 
+_CACHE_CONTROL = {"type": "ephemeral"}
+
+
+def _with_cache_control(block: Dict[str, Any]) -> Dict[str, Any]:
+    """Return a copy of a content/tool block with an ephemeral marker."""
+    out = dict(block)
+    if "cache_control" not in out:
+        out["cache_control"] = dict(_CACHE_CONTROL)
+    return out
+
+
+def _build_system_field(
+    system_parts: Sequence[str], cache_enabled: bool
+) -> Any:
+    """Build Anthropic's `system` field, caching only the stable prefix."""
+    parts = [p for p in system_parts if p]
+    if not parts:
+        return None
+    if not cache_enabled:
+        return "\n\n".join(parts)
+
+    blocks: List[Dict[str, Any]] = [
+        {"type": "text", "text": part} for part in parts
+    ]
+    # Cache the tools + first (stable) system block. Later system blocks
+    # are transient execution/verification notes and must not invalidate it.
+    blocks[0]["cache_control"] = dict(_CACHE_CONTROL)
+    return blocks
+
+
+def _mark_last_message_cache(messages: List[Dict[str, Any]]) -> None:
+    """Add a conversation-prefix cache breakpoint to the final message."""
+    if not messages:
+        return
+    last = messages[-1]
+    content = last.get("content")
+    if isinstance(content, str):
+        if content:
+            last["content"] = [{
+                "type": "text",
+                "text": content,
+                "cache_control": dict(_CACHE_CONTROL),
+            }]
+        return
+    if not isinstance(content, list) or not content:
+        return
+    block = content[-1]
+    if not isinstance(block, dict):
+        return
+    if block.get("type") == "text" and not block.get("text"):
+        return
+    content[-1] = _with_cache_control(block)
+
 
 # ======================================================================
 # PROVIDER
@@ -223,6 +276,9 @@ class AnthropicProvider(LLMProvider):
             "json_mode": False,       # no response_format; we use tool_choice
             "system_prompt": True,
             "parallel_tool_calls": True,   # Anthropic supports multiple tool_use blocks
+            "prompt_cache": True,
+            "prompt_cache_explicit": True,
+            "prompt_cache_automatic": False,
         }
 
     # ------------------------------------------------------------------
@@ -231,13 +287,14 @@ class AnthropicProvider(LLMProvider):
 
     def _convert_messages(
         self, messages: Sequence[Any]
-    ) -> Tuple[str, List[Dict[str, Any]]]:
+    ) -> Tuple[List[str], List[Dict[str, Any]]]:
         """
-        Split incoming messages into (system_prompt, anthropic_messages).
+        Split incoming messages into (system_parts, anthropic_messages).
 
         Rules:
-            * Every role="system" becomes part of the top-level `system`
-              string, joined by blank lines. It is removed from `messages`.
+            * Every role="system" becomes a top-level `system` part. It is
+              removed from `messages`. The first part is the stable prefix
+              used for explicit prompt caching; later parts are transient.
             * role="user" with str content      → {"role":"user", "content": str}
             * role="assistant" with str content → {"role":"assistant", "content": str}
             * role="assistant" with tool_calls  → {"role":"assistant",
@@ -304,8 +361,7 @@ class AnthropicProvider(LLMProvider):
         if converted and converted[0]["role"] != "user":
             converted.insert(0, {"role": "user", "content": [{"type": "text", "text": ""}]})
 
-        system = "\n\n".join(system_parts)
-        return system, converted
+        return system_parts, converted
 
     # ------------------------------------------------------------------
     # TOOL CONVERSION (framework → Anthropic)
@@ -354,6 +410,9 @@ class AnthropicProvider(LLMProvider):
                 code=ProviderErrorCode.UNSUPPORTED,
                 provider="anthropic",
             )
+        # Stable ordering keeps the cacheable tool prefix identical across
+        # requests even if the registry's insertion order changes.
+        out.sort(key=lambda item: str(item.get("name") or ""))
         return out
 
     # ------------------------------------------------------------------
@@ -368,9 +427,11 @@ class AnthropicProvider(LLMProvider):
         tools: Optional[Sequence[Any]],
         tool_choice: Optional[str],
         stream: bool,
+        prompt_cache: Optional[bool] = None,
         **kwargs: Any,
     ) -> Dict[str, Any]:
-        system, converted = self._convert_messages(messages)
+        system_parts, converted = self._convert_messages(messages)
+        cache_enabled = self.prompt_cache_enabled(prompt_cache)
 
         body: Dict[str, Any] = {
             "model": model,
@@ -379,11 +440,14 @@ class AnthropicProvider(LLMProvider):
             "max_tokens": int(max_tokens) if max_tokens and max_tokens > 0
                           else self.default_max_tokens,
         }
+        system = _build_system_field(system_parts, cache_enabled)
         if system:
             body["system"] = system
 
         anthropic_tools = self._convert_tools(tools)
         if anthropic_tools:
+            if cache_enabled:
+                anthropic_tools[-1] = _with_cache_control(anthropic_tools[-1])
             body["tools"] = anthropic_tools
             # tool_choice mapping: our framework uses "auto"/"none"/"required".
             if tool_choice == "required":
@@ -398,6 +462,9 @@ class AnthropicProvider(LLMProvider):
             else:
                 # Caller supplied a specific tool name.
                 body["tool_choice"] = {"type": "tool", "name": str(tool_choice)}
+
+        if cache_enabled:
+            _mark_last_message_cache(converted)
 
         if stream:
             body["stream"] = True
@@ -441,15 +508,32 @@ class AnthropicProvider(LLMProvider):
         # `stop` maps to Anthropic's `stop_sequences`.
         if stop:
             kwargs.setdefault("stop_sequences", list(stop))
+        prompt_cache = kwargs.pop("prompt_cache", None)
 
         body = self._build_body(
             messages=messages, model=model,
             max_tokens=max_tokens,
             tools=tools, tool_choice=tool_choice, stream=False,
+            prompt_cache=prompt_cache,
             **kwargs,
         )
 
-        data = await self._post_json(client, "/v1/messages", body, model)
+        try:
+            data = await self._post_json(client, "/v1/messages", body, model)
+        except ProviderError as exc:
+            if not (self.prompt_cache_enabled(prompt_cache) and _cache_rejected(exc)):
+                raise
+            logger.warning(
+                "Anthropic gateway rejected prompt cache markers; retrying without them"
+            )
+            body = self._build_body(
+                messages=messages, model=model,
+                max_tokens=max_tokens,
+                tools=tools, tool_choice=tool_choice, stream=False,
+                prompt_cache=False,
+                **kwargs,
+            )
+            data = await self._post_json(client, "/v1/messages", body, model)
         return self._parse(data, model)
 
     # ------------------------------------------------------------------
@@ -497,11 +581,13 @@ class AnthropicProvider(LLMProvider):
         client = self._require_client()
         if stop:
             kwargs.setdefault("stop_sequences", list(stop))
+        prompt_cache = kwargs.pop("prompt_cache", None)
 
         body = self._build_body(
             messages=messages, model=model,
             max_tokens=max_tokens,
             tools=tools, tool_choice=tool_choice, stream=True,
+            prompt_cache=prompt_cache,
             **kwargs,
         )
 
@@ -1034,12 +1120,31 @@ def _assistant_to_blocks(m: Dict[str, Any]) -> List[Dict[str, Any]]:
     return blocks
 
 
+def _cache_rejected(exc: ProviderError) -> bool:
+    """True when a 4xx looks like the gateway refusing cache markers."""
+    if exc.status not in (400, 422):
+        return False
+    text = str(exc).lower()
+    return "cache" in text and (
+        "cache_control" in text
+        or "prompt caching" in text
+        or "cache control" in text
+    )
+
+
 def _merge_usage(existing: Dict[str, int], incoming: Dict[str, Any]) -> Dict[str, int]:
     """Anthropic reports usage twice (message_start and message_delta)."""
     out = dict(existing or {})
-    for k, v in _normalize_usage(incoming).items():
+    normalized = _normalize_usage(incoming)
+    for k, v in normalized.items():
+        if k == "total_tokens":
+            continue
         if v:
             out[k] = v
+    out["total_tokens"] = (
+        int(out.get("prompt_tokens", 0) or 0)
+        + int(out.get("completion_tokens", 0) or 0)
+    )
     return out
 
 
@@ -1049,10 +1154,13 @@ def _normalize_usage(usage: Dict[str, Any]) -> Dict[str, int]:
     output_tokens = int(usage.get("output_tokens", 0) or 0)
     cache_creation = int(usage.get("cache_creation_input_tokens", 0) or 0)
     cache_read = int(usage.get("cache_read_input_tokens", 0) or 0)
+    # Anthropic's input_tokens excludes cache reads/writes. Normalize to
+    # the OpenAI/Gemini convention where prompt_tokens is total input.
+    prompt = input_tokens + cache_creation + cache_read
     return {
-        "prompt_tokens": input_tokens,
+        "prompt_tokens": prompt,
         "completion_tokens": output_tokens,
-        "total_tokens": input_tokens + output_tokens,
+        "total_tokens": prompt + output_tokens,
         "cached_tokens": cache_read,
         "cache_creation_tokens": cache_creation,
         "reasoning_tokens": 0,

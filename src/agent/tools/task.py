@@ -37,6 +37,7 @@ class TaskTool(BaseTool):
             "action": {"type": "string", "enum": ["spawn", "list", "status", "wait", "cancel"]},
             "description": {"type": "string"},
             "prompt": {"type": "string"},
+            "role": {"type": "string", "enum": ["general", "explore", "scout"]},
             "capabilities": {"type": "array", "items": {"type": "string"}},
             "task_id": {"type": "string"},
             "timeout": {"type": "number", "default": 300},
@@ -95,7 +96,9 @@ class TaskTool(BaseTool):
                 "error": f"too many running tasks (max {self._MAX_RUNS})",
             }
 
-        from agent.agent.subagent import SubAgentRole
+        role, role_error = self._resolve_role(params)
+        if role_error:
+            return {"success": False, "error": role_error}
 
         tid = str(uuid.uuid4())[:8]
         run = TaskRun(id=tid, description=params.get("description", prompt[:60]))
@@ -104,7 +107,7 @@ class TaskTool(BaseTool):
         async def _run():
             try:
                 result = await manager.invoke_subagent(
-                    SubAgentRole.GENERAL,
+                    role,
                     prompt,
                     {"description": run.description, "task_id": tid},
                 )
@@ -122,7 +125,48 @@ class TaskTool(BaseTool):
 
         run.task = asyncio.create_task(_run(), name=f"task-{tid}")
         self.runs[tid] = run
-        return {"success": True, "task_id": tid, "description": run.description}
+        return {
+            "success": True,
+            "task_id": tid,
+            "description": run.description,
+            "role": role.value,
+        }
+
+    @staticmethod
+    def _resolve_role(params: Dict[str, Any]) -> tuple[Any, Optional[str]]:
+        from agent.agent.subagent import SubAgentRole
+
+        requested = str(params.get("role") or "").strip().lower()
+        if requested:
+            roles = {
+                "general": SubAgentRole.GENERAL,
+                "explore": SubAgentRole.EXPLORE,
+                "scout": SubAgentRole.SCOUT,
+            }
+            if requested not in roles:
+                return None, f"unknown subagent role: {requested}"
+            return roles[requested], None
+
+        raw = params.get("capabilities") or []
+        if isinstance(raw, str):
+            raw = [raw]
+        caps = {str(c).strip().lower() for c in raw if str(c).strip()}
+        if caps & {
+            "write", "edit", "patch", "terminal", "shell", "execute",
+            "process", "general", "filesystem",
+        }:
+            return SubAgentRole.GENERAL, None
+        if caps & {
+            "research", "docs", "documentation", "dependency", "web", "browser",
+            "scout",
+        }:
+            return SubAgentRole.SCOUT, None
+        if caps and caps <= {
+            "read", "readonly", "read-only", "search", "grep", "glob",
+            "explore", "git", "list",
+        }:
+            return SubAgentRole.EXPLORE, None
+        return SubAgentRole.GENERAL, None
 
     def _prune(self) -> None:
         completed = [

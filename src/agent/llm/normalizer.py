@@ -662,9 +662,24 @@ class ResponseNormalizer:
         if not isinstance(raw, dict):
             return NormalizedUsage()
 
+        cached = _first_int(raw,
+                            "cached_tokens", "cache_read_input_tokens",
+                            "cachedContentTokenCount")
+        cache_creation = _first_int(raw, "cache_creation_tokens",
+                                    "cache_creation_input_tokens")
+
         prompt = _first_int(raw,
                             "prompt_tokens", "input_tokens",
                             "prompt_eval_count", "promptTokenCount")
+        # Anthropic reports non-cached input_tokens separately from cache
+        # reads/writes. Normalize to total input, matching OpenAI/Gemini.
+        if (
+            "prompt_tokens" not in raw
+            and ("cache_read_input_tokens" in raw
+                 or "cache_creation_input_tokens" in raw)
+        ):
+            prompt += cached + cache_creation
+
         completion = _first_int(raw,
                                 "completion_tokens", "output_tokens",
                                 "eval_count", "candidatesTokenCount")
@@ -672,10 +687,6 @@ class ResponseNormalizer:
                            "total_tokens", "totalTokenCount")
         if total <= 0:
             total = prompt + completion
-
-        cached = _first_int(raw,
-                            "cached_tokens", "cache_read_input_tokens",
-                            "cachedContentTokenCount")
 
         # Reasoning tokens appear under different names.
         reasoning = _first_int(raw,
@@ -688,9 +699,6 @@ class ResponseNormalizer:
             details = raw.get("output_tokens_details")
             if isinstance(details, dict):
                 reasoning = _first_int(details, "reasoning_tokens")
-
-        cache_creation = _first_int(raw, "cache_creation_tokens",
-                                    "cache_creation_input_tokens")
 
         return NormalizedUsage(
             prompt_tokens=max(0, prompt),

@@ -1984,6 +1984,7 @@ class MCPClient:
                 return await self.call_tool(_name, kwargs)
 
             read_only = bool(tool.annotations.get("readOnlyHint", False))
+            destructive = bool(tool.annotations.get("destructiveHint", False))
             try:
                 tool_registry.register_external(
                     name=full_name,
@@ -1994,6 +1995,7 @@ class MCPClient:
                     },
                     read_only=read_only,
                     mutating=not read_only,
+                    destructive=destructive,
                     category="cloud" if full_name.startswith("mcp__aws__") else "misc",
                 )
                 count += 1

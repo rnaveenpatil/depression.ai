@@ -50,10 +50,12 @@ class BaseTool(ABC):
     # Subclasses should override:
     #   read_only   True  => safe to cache result indefinitely (within TTL)
     #   mutating    True  => successful run invalidates the loop's cache
+    #   destructive True  => may delete/overwrite user data
     #   category    one of: "inspect", "edit", "run", "proc", "vcs",
     #               "cloud", "net", "plan", "ui", "misc"
     read_only: bool = False
     mutating: bool = False
+    destructive: bool = False
     category: str = "misc"
 
     @abstractmethod
@@ -260,6 +262,7 @@ class ToolRegistry:
         read_only: bool = False,
         mutating: bool = False,
         category: str = "misc",
+        destructive: bool = False,
     ) -> None:
         with self._lock:
             self._external[name] = {
@@ -268,6 +271,7 @@ class ToolRegistry:
                 "parameters": parameters or {"type": "object", "properties": {}},
                 "read_only": bool(read_only),
                 "mutating": bool(mutating),
+                "destructive": bool(destructive),
                 "category": category or "misc",
             }
             self.stats.setdefault(name, ToolStats())
@@ -302,6 +306,13 @@ class ToolRegistry:
             return bool(getattr(t, "mutating", False))
         ext = self._external.get(name)
         return bool(ext.get("mutating")) if ext else False
+
+    def is_destructive(self, name: str) -> bool:
+        t = self.tools.get(name)
+        if t is not None:
+            return bool(getattr(t, "destructive", False))
+        ext = self._external.get(name)
+        return bool(ext.get("destructive")) if ext else False
 
     def get_category(self, name: str) -> str:
         t = self.tools.get(name)

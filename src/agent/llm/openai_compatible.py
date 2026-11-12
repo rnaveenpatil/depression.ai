@@ -232,6 +232,9 @@ class OpenAICompatibleProvider(LLMProvider):
             "json_mode": True,    # many gateways support response_format
             "system_prompt": True,
             "parallel_tool_calls": True,
+            "prompt_cache": True,
+            "prompt_cache_explicit": False,
+            "prompt_cache_automatic": True,
         }
 
     # ------------------------------------------------------------------
@@ -413,10 +416,24 @@ class OpenAICompatibleProvider(LLMProvider):
             body.setdefault("stream_options", {"include_usage": True})
 
         if tools:
-            body["tools"] = [_tool_to_dict(t) for t in tools]
+            converted_tools = [_tool_to_dict(t) for t in tools]
+            # Stable tool ordering keeps automatic prefix caching effective.
+            converted_tools.sort(
+                key=lambda item: str(
+                    (item.get("function") or {}).get("name") or ""
+                )
+            )
+            body["tools"] = converted_tools
             body["tool_choice"] = tool_choice or "auto"
         elif tool_choice == "none":
             body["tool_choice"] = "none"
+
+        cache_key = (
+            kwargs.get("prompt_cache_key")
+            or self.config.extra.get("prompt_cache_key")
+        )
+        if cache_key:
+            body["prompt_cache_key"] = str(cache_key)
 
         for key in _PASSTHROUGH_BODY_KEYS:
             v = kwargs.get(key)

@@ -511,46 +511,60 @@ class ApplyPatchTool(BaseTool):
 
     def _apply_update_hunks(self, original: str, hunk_lines: List[str]) -> str:
         src_lines = original.splitlines(keepends=True)
+        newline = "\r\n" if "\r\n" in original else "\n"
 
-        chunks: List[List[str]] = []
+        chunks: List[tuple[List[str], bool]] = []
         current: List[str] = []
+        current_new_no_newline = False
+        last_kind = ""
+
+        def flush() -> None:
+            nonlocal current, current_new_no_newline
+            if current:
+                chunks.append((current, current_new_no_newline))
+            current = []
+            current_new_no_newline = False
+
         for line in hunk_lines:
             # Standard apply_patch hunk headers are metadata, not context.
             if line.startswith("@@"):
-                if current:
-                    chunks.append(current)
-                    current = []
+                flush()
+                last_kind = ""
                 continue
             if line.startswith("\\"):
+                if current and last_kind in ("+", " "):
+                    current_new_no_newline = True
+                last_kind = ""
                 continue
             if line.startswith(("+", "-", " ")):
                 current.append(line)
+                last_kind = line[0]
             else:
-                if current:
-                    chunks.append(current)
-                    current = []
+                flush()
                 current.append(" " + line)
-        if current:
-            chunks.append(current)
+                last_kind = " "
+        flush()
 
-        for chunk in chunks:
+        for chunk, new_no_newline in chunks:
             old_lines = [c[1:] for c in chunk if c.startswith((" ", "-"))]
             new_lines = [c[1:] for c in chunk if c.startswith((" ", "+"))]
+            replacement = [self._inner._line_body(l) + newline for l in new_lines]
+            if new_no_newline and replacement:
+                replacement[-1] = self._inner._line_body(new_lines[-1])
             if not old_lines:
-                src_lines.extend(l + "\n" for l in new_lines if not l.endswith("\n"))
+                src_lines.extend(replacement)
                 continue
             start = self._find_chunk(src_lines, old_lines)
             if start is None:
                 raise ValueError(f"could not find hunk anchor: {old_lines[:1]!r}")
-            replacement = [(l if l.endswith("\n") else l + "\n") for l in new_lines]
             src_lines[start:start + len(old_lines)] = replacement
         return "".join(src_lines)
 
     def _find_chunk(self, src_lines: List[str], old_lines: List[str]) -> Optional[int]:
-        target = [l.rstrip("\n") for l in old_lines]
+        target = [self._inner._line_body(l) for l in old_lines]
         n = len(target)
         for i in range(0, len(src_lines) - n + 1):
-            window = [l.rstrip("\n") for l in src_lines[i:i + n]]
+            window = [self._inner._line_body(l) for l in src_lines[i:i + n]]
             if window == target:
                 return i
         return None

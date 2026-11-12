@@ -10,6 +10,7 @@ from typing import Any, Dict, List, Optional
 
 from agent.tools.registry import BaseTool
 from agent.utils.logging import get_logger
+from agent.utils.shell import terminate_process
 
 logger = get_logger(__name__)
 
@@ -127,6 +128,7 @@ class GitTool(BaseTool):
                 env=env,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
+                start_new_session=True,
             )
         except FileNotFoundError:
             return {"success": False, "error": "git executable not found"}
@@ -134,12 +136,11 @@ class GitTool(BaseTool):
         try:
             stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
         except asyncio.TimeoutError:
-            try:
-                proc.kill()
-                await asyncio.wait_for(proc.wait(), timeout=2)
-            except Exception:
-                pass
+            await terminate_process(proc, force=True)
             return {"success": False, "error": "git command timed out"}
+        except asyncio.CancelledError:
+            await terminate_process(proc, force=True)
+            raise
 
         return {
             "success": proc.returncode == 0,
