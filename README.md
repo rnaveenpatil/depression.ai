@@ -1957,3 +1957,4 @@ See the complete setup and agent workflow in the official `depression.ai` demo â
 # ðŸ“œ License
 
 This project is released under the **MIT License** (see [LICENSE](LICENSE)). Developed as an academic project at **Moodlakatte Institute of Technology, Kundapura**.
+[![Architecture diagram](https://gitdiagram.com/diagram-badge.svg)](https://gitdiagram.com/rnaveenpatil/depression.ai?utm_source=readme&utm_medium=badge)
